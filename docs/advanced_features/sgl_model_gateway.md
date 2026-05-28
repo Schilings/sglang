@@ -24,6 +24,7 @@ SGLang Model Gateway is a high-performance model-routing gateway for large-scale
    - [Inference Endpoints](#inference-endpoints)
    - [Tokenization Endpoints](#tokenization-endpoints)
    - [Parser Endpoints](#parser-endpoints)
+   - [Classification API](#classification-api)
    - [Conversation and Response APIs](#conversation-and-response-apis)
    - [Worker Management APIs](#worker-management-apis)
    - [Admin and Health Endpoints](#admin-and-health-endpoints)
@@ -76,7 +77,7 @@ SGLang Model Gateway is a high-performance model-routing gateway for large-scale
 
 ### Control Plane
 
-- **Worker Manager** discovers capabilities (`/get_server_info`, `/get_model_info`), tracks load, and registers/removes workers in the shared registry.
+- **Worker Manager** discovers capabilities (`/server_info`, `/get_model_info`), tracks load, and registers/removes workers in the shared registry.
 - **Job Queue** serializes add/remove requests and exposes status (`/workers/{worker_id}`) so clients can track onboarding progress.
 - **Load Monitor** feeds cache-aware and power-of-two policies with live worker load statistics.
 - **Health Checker** continuously probes workers and updates readiness, circuit breaker state, and router metrics.
@@ -85,7 +86,7 @@ SGLang Model Gateway is a high-performance model-routing gateway for large-scale
 ### Data Plane
 
 - **HTTP routers** (regular & PD) implement `/generate`, `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/embeddings`, `/v1/rerank`, `/v1/classify`, `/v1/tokenize`, `/v1/detokenize`, and associated admin endpoints.
-- **gRPC router** streams tokenized requests directly to SRT gRPC workers, running fully in Rust—tokenizer, reasoning parser, and tool parser all reside in-process. Supports both single-stage and PD routing, including embeddings.
+- **gRPC router** streams tokenized requests directly to SRT gRPC workers, running fully in Rust—tokenizer, reasoning parser, and tool parser all reside in-process. Supports both single-stage and PD routing, including embeddings and classification.
 - **OpenAI router** proxies OpenAI-compatible endpoints to external vendors (OpenAI, xAI, etc.) while keeping chat history and multi-turn orchestration local.
 
 ### Storage and Privacy
@@ -420,6 +421,59 @@ The gateway provides admin endpoints for parsing reasoning content and function 
 }
 ```
 
+### Classification API
+
+The `/v1/classify` endpoint provides text classification using sequence classification models (e.g., `Qwen2ForSequenceClassification`, `BertForSequenceClassification`).
+
+#### Request
+
+```bash
+curl http://localhost:30000/v1/classify \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "jason9693/Qwen2.5-1.5B-apeach",
+    "input": "I love this product!"
+  }'
+```
+
+#### Response
+
+```json
+{
+  "id": "classify-a1b2c3d4-5678-90ab-cdef-1234567890ab",
+  "object": "list",
+  "created": 1767034308,
+  "model": "jason9693/Qwen2.5-1.5B-apeach",
+  "data": [
+    {
+      "index": 0,
+      "label": "positive",
+      "probs": [0.12, 0.88],
+      "num_classes": 2
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 6,
+    "completion_tokens": 0,
+    "total_tokens": 6
+  }
+}
+```
+
+#### Response Fields
+
+| Field | Description |
+|-------|-------------|
+| `label` | Predicted class label (from model's `id2label` config, or `LABEL_N` fallback) |
+| `probs` | Probability distribution over all classes (softmax of logits) |
+| `num_classes` | Number of classification classes |
+
+#### Notes
+
+- Classification reuses the embedding backend—the scheduler returns logits which are converted to probabilities via softmax
+- Labels come from the model's HuggingFace config (`id2label` field); models without this mapping use generic labels (`LABEL_0`, `LABEL_1`, etc.)
+- Both HTTP and gRPC routers support classification
+
 ### Conversation and Response APIs
 
 | Method | Path | Description |
@@ -498,7 +552,7 @@ Response:
 | `GET` | `/engine_metrics` | Engine-level metrics from workers |
 | `GET` | `/v1/models` | List available models |
 | `GET` | `/get_model_info` | Get model information |
-| `GET` | `/get_server_info` | Get server information |
+| `GET` | `/server_info` | Get server information |
 | `POST` | `/flush_cache` | Clear all caches |
 | `GET` | `/get_loads` | Get all worker loads |
 | `POST` | `/wasm` | Upload WASM module |
@@ -538,6 +592,17 @@ Response:
 ---
 
 ## Reliability and Flow Control
+
+### HTTP Client
+
+Configure upstream HTTP client connection settings:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--pool-idle-timeout-secs` | 50 | Idle timeout in seconds for pooled upstream HTTP connections. Can also be set with `SMG_POOL_IDLE_TIMEOUT_SECS`. |
+| `--connect-timeout-secs` | 10 | Timeout in seconds for new upstream HTTP connections. Can also be set with `SMG_CONNECT_TIMEOUT_SECS`. |
+| `--pool-max-idle-per-host` | 500 | Maximum idle upstream HTTP connections to keep per host. Can also be set with `SMG_POOL_MAX_IDLE_PER_HOST`. |
+| `--tcp-keepalive-secs` | 30 | TCP keepalive idle time in seconds for upstream HTTP connections. Can also be set with `SMG_TCP_KEEPALIVE_SECS`. |
 
 ### Retries
 
@@ -804,6 +869,7 @@ Prefill pods can expose bootstrap ports via the `sglang.ai/bootstrap-port` annot
 | `none` | No persistence | `--history-backend none` |
 | `oracle` | Oracle Autonomous Database | `--history-backend oracle` |
 | `postgres` | PostgreSQL Database | `--history-backend postgres` |
+| `redis` | Redis | `--history-backend redis` |
 
 ### Oracle Configuration
 
@@ -837,6 +903,22 @@ python -m sglang_router.launch_router \
   --worker-urls https://api.openai.com \
   --history-backend postgres
 ```
+
+### Redis Configuration
+
+```bash
+export REDIS_URL="redis://localhost:6379"
+export REDIS_POOL_MAX=16
+export REDIS_RETENTION_DAYS=30
+
+python -m sglang_router.launch_router \
+  --backend openai \
+  --worker-urls https://api.openai.com \
+  --history-backend redis \
+  --redis-retention-days 30
+```
+
+Use `--redis-retention-days -1` for persistent storage (default is 30 days).
 
 ---
 
@@ -1574,7 +1656,7 @@ groups:
 | `--policy` | str | cache_aware | Routing policy |
 | `--max-concurrent-requests` | int | -1 | Concurrency limit (-1 disables) |
 | `--request-timeout-secs` | int | 600 | Request timeout |
-| `--max-payload-size` | int | 256MB | Maximum request payload |
+| `--max-payload-size` | int | 512MB | Maximum request payload |
 
 ### Prefill/Decode
 

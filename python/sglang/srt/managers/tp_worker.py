@@ -12,22 +12,22 @@
 # limitations under the License.
 # ==============================================================================
 """A tensor parallel worker."""
+
 from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import get_pp_group, get_world_group
-from sglang.srt.dllm.algorithm.base import DllmAlgorithm
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
+    LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
@@ -41,7 +41,7 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
 from sglang.srt.utils.hf_transformers_utils import (
@@ -50,9 +50,12 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer_from_processor,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
+    from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +67,7 @@ class BaseTpWorker(ABC):
 
     @property
     @abstractmethod
-    def model_runner(self) -> ModelRunner:
+    def model_runner(self) -> "ModelRunner":
         pass
 
     @property
@@ -73,7 +76,7 @@ class BaseTpWorker(ABC):
 
     @property
     def is_hybrid_swa(self) -> bool:
-        return self.model_runner.is_hybrid_swa is not None
+        return self.model_runner.is_hybrid_swa
 
     def get_tokens_per_layer_info(self):
         return (
@@ -84,16 +87,7 @@ class BaseTpWorker(ABC):
     def get_pad_input_ids_func(self):
         return getattr(self.model_runner.model, "pad_input_ids", None)
 
-    def get_tp_group(self):
-        return self.model_runner.tp_group
-
-    def get_attention_tp_group(self):
-        return self.model_runner.attention_tp_group
-
-    def get_attention_tp_cpu_group(self):
-        return getattr(self.model_runner.attention_tp_group, "cpu_group", None)
-
-    def get_memory_pool(self):
+    def get_memory_pool(self) -> Tuple[ReqToTokenPool, BaseTokenToKVPoolAllocator]:
         return (
             self.model_runner.req_to_token_pool,
             self.model_runner.token_to_kv_pool_allocator,
@@ -191,15 +185,34 @@ class BaseTpWorker(ABC):
         result = self.model_runner.unload_lora_adapter(recv_req.to_ref())
         return result
 
-    def can_run_lora_batch(self, lora_ids: list[str]) -> bool:
-        lora_ids_set = set(lora_ids) if isinstance(lora_ids, list) else lora_ids
-        return self.model_runner.lora_manager.validate_lora_batch(lora_ids_set)
+    def load_lora_adapter_from_tensors(
+        self, recv_req: LoadLoRAAdapterFromTensorsReqInput
+    ):
+        # The LoRA code handles TP sharding internally using slice_lora_a_weights
+        # and slice_lora_b_weights methods (see lora/layers.py:46-49, mem_pool.py:437-440).
+        if recv_req.load_format == "flattened_bucket":
+            flattened_data = MultiprocessingSerializer.deserialize(
+                recv_req.serialized_tensors
+            )
+            bucket = FlattenedTensorBucket(
+                flattened_tensor=flattened_data["flattened_tensor"],
+                metadata=flattened_data["metadata"],
+            )
+            tensors = dict(bucket.reconstruct_tensors())
+        else:
+            tensors = MultiprocessingSerializer.deserialize(recv_req.serialized_tensors)
+        result = self.model_runner.load_lora_adapter_from_tensors(
+            recv_req.to_ref(),
+            tensors,
+            recv_req.config_dict,
+            recv_req.added_tokens_config,
+        )
+        return result
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
-        logits_output = self.model_runner.forward(forward_batch).logits_output
-        embeddings = logits_output.embeddings
-        return embeddings
+        output = self.model_runner.forward(forward_batch).logits_output
+        return output  # Returns EmbeddingPoolerOutput
 
 
 class TpModelWorker(BaseTpWorker):
@@ -212,85 +225,47 @@ class TpModelWorker(BaseTpWorker):
         tp_rank: int,
         moe_ep_rank: int,
         pp_rank: int,
+        attn_cp_rank: int,
+        moe_dp_rank: int,
         dp_rank: Optional[int],
         nccl_port: int,
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
+        memory_pool_config: Optional[MemoryPoolConfig] = None,
         is_multi_layer_eagle: bool = False,
     ):
         # Parse args
+        self.server_args = server_args
         self.tp_size = server_args.tp_size
+        self.ep_size = server_args.ep_size
+        self.pp_size = server_args.pp_size
         self.tp_rank = tp_rank
         self.moe_ep_rank = moe_ep_rank
         self.pp_rank = pp_rank
+        self.dp_rank = dp_rank
+        self.gpu_id = gpu_id
+        self.nccl_port = nccl_port
+        self.is_draft_worker = is_draft_worker
+        self.is_multi_layer_eagle = is_multi_layer_eagle
+        self.req_to_token_pool = req_to_token_pool
+        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.attn_cp_rank = attn_cp_rank
+        self.moe_dp_rank = moe_dp_rank
+        # Draft worker: target's resolved MemoryPoolConfig (forwarded to ModelRunner).
+        self.memory_pool_config = memory_pool_config
 
         # MTP model runners
-        self.model_runner_list = []
+        self.model_runner_list: List[ModelRunner] = []
 
-        # Init model and tokenizer
-        self.model_config = ModelConfig.from_server_args(
-            server_args,
-            model_path=(
-                server_args.model_path
-                if not is_draft_worker
-                else server_args.speculative_draft_model_path
-            ),
-            model_revision=(
-                server_args.revision
-                if not is_draft_worker
-                else server_args.speculative_draft_model_revision
-            ),
-            is_draft_model=is_draft_worker,
-        )
+        self._init_model_config()
+        self._init_model_runner()
 
-        # Init DLLM algorithm
-        if server_args.dllm_algorithm is not None:
-            self.dllm_algorithm = DllmAlgorithm.from_server_args(server_args)
-        else:
-            self.dllm_algorithm = None
-
-        self._model_runner = ModelRunner(
-            model_config=self.model_config,
-            mem_fraction_static=server_args.mem_fraction_static,
-            gpu_id=gpu_id,
-            tp_rank=tp_rank,
-            tp_size=server_args.tp_size,
-            moe_ep_rank=moe_ep_rank,
-            moe_ep_size=server_args.ep_size,
-            pp_rank=pp_rank,
-            pp_size=server_args.pp_size,
-            nccl_port=nccl_port,
-            dp_rank=dp_rank,
-            server_args=server_args,
-            is_draft_worker=is_draft_worker,
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-            draft_model_idx=0 if is_multi_layer_eagle else None,
-        )
         if is_multi_layer_eagle:
-            self.model_runner_list.append(self.model_runner)
-            for i in range(1, server_args.speculative_num_steps):
-                self.model_runner_list.append(
-                    ModelRunner(
-                        model_config=self.model_config,
-                        mem_fraction_static=server_args.mem_fraction_static,
-                        gpu_id=gpu_id,
-                        tp_rank=tp_rank,
-                        tp_size=server_args.tp_size,
-                        moe_ep_rank=moe_ep_rank,
-                        moe_ep_size=server_args.ep_size,
-                        pp_rank=pp_rank,
-                        pp_size=server_args.pp_size,
-                        nccl_port=nccl_port,
-                        dp_rank=dp_rank,
-                        server_args=server_args,
-                        is_draft_worker=is_draft_worker,
-                        req_to_token_pool=req_to_token_pool,
-                        token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-                        draft_model_idx=i,
-                    )
-                )
+            self._init_multi_layer_eagle_model_runners()
+
+        self._init_dllm_algorithm()
+
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
         else:
@@ -300,6 +275,7 @@ class TpModelWorker(BaseTpWorker):
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
+                    tokenizer_backend=server_args.tokenizer_backend,
                 )
                 self.tokenizer = get_tokenizer_from_processor(self.processor)
             else:
@@ -308,6 +284,7 @@ class TpModelWorker(BaseTpWorker):
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
+                    tokenizer_backend=server_args.tokenizer_backend,
                 )
         self.device = self.model_runner.device
 
@@ -346,8 +323,84 @@ class TpModelWorker(BaseTpWorker):
         self.enable_spec = server_args.speculative_algorithm is not None
         self.hicache_layer_transfer_counter = None
 
+    def _init_model_config(self):
+        from sglang.srt.configs.model_config import ModelConfig
+
+        self.model_config = ModelConfig.from_server_args(
+            self.server_args,
+            model_path=(
+                self.server_args.model_path
+                if not self.is_draft_worker
+                else self.server_args.speculative_draft_model_path
+            ),
+            model_revision=(
+                self.server_args.revision
+                if not self.is_draft_worker
+                else self.server_args.speculative_draft_model_revision
+            ),
+            is_draft_model=self.is_draft_worker,
+        )
+
+    def _init_model_runner(self):
+        from sglang.srt.model_executor.model_runner import ModelRunner
+
+        self._model_runner = ModelRunner(
+            model_config=self.model_config,
+            mem_fraction_static=self.server_args.mem_fraction_static,
+            gpu_id=self.gpu_id,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            moe_ep_rank=self.moe_ep_rank,
+            moe_ep_size=self.ep_size,
+            pp_rank=self.pp_rank,
+            pp_size=self.pp_size,
+            nccl_port=self.nccl_port,
+            dp_rank=self.dp_rank,
+            server_args=self.server_args,
+            is_draft_worker=self.is_draft_worker,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            memory_pool_config=self.memory_pool_config,
+            draft_model_idx=0 if self.is_multi_layer_eagle else None,
+        )
+
+    def _init_multi_layer_eagle_model_runners(self):
+        from sglang.srt.model_executor.model_runner import ModelRunner
+
+        self.model_runner_list.append(self.model_runner)
+        for i in range(1, self.server_args.speculative_num_steps):
+            self.model_runner_list.append(
+                ModelRunner(
+                    model_config=self.model_config,
+                    mem_fraction_static=self.server_args.mem_fraction_static,
+                    gpu_id=self.gpu_id,
+                    tp_rank=self.tp_rank,
+                    tp_size=self.tp_size,
+                    moe_ep_rank=self.moe_ep_rank,
+                    moe_ep_size=self.ep_size,
+                    pp_rank=self.pp_rank,
+                    pp_size=self.pp_size,
+                    nccl_port=self.nccl_port,
+                    dp_rank=self.dp_rank,
+                    server_args=self.server_args,
+                    is_draft_worker=self.is_draft_worker,
+                    req_to_token_pool=self.req_to_token_pool,
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    memory_pool_config=self.memory_pool_config,
+                    draft_model_idx=i,
+                )
+            )
+
+    def _init_dllm_algorithm(self):
+        from sglang.srt.dllm.algorithm.base import DllmAlgorithm
+
+        if self.server_args.dllm_algorithm is not None:
+            self.dllm_algorithm = DllmAlgorithm.from_server_args(self.server_args)
+        else:
+            self.dllm_algorithm = None
+
     @property
-    def model_runner(self) -> ModelRunner:
+    def model_runner(self) -> "ModelRunner":
         return self._model_runner
 
     def register_hicache_layer_transfer_counter(self, counter: LayerDoneCounter):
@@ -356,6 +409,9 @@ class TpModelWorker(BaseTpWorker):
     def set_hicache_consumer(self, consumer_index: int):
         if self.hicache_layer_transfer_counter is not None:
             self.hicache_layer_transfer_counter.set_consumer(consumer_index)
+
+    def register_hisparse_coordinator(self, coordinator):
+        self.model_runner.hisparse_coordinator = coordinator
 
     def get_worker_info(self):
         return (
@@ -367,6 +423,7 @@ class TpModelWorker(BaseTpWorker):
             self.max_req_input_len,
             self.random_seed,
             self.device,
+            self.model_runner.forward_stream,
             self.model_runner.req_to_token_pool.size,
             self.model_runner.req_to_token_pool.max_context_len,
             self.model_runner.token_to_kv_pool.size,
@@ -385,12 +442,6 @@ class TpModelWorker(BaseTpWorker):
             logits_output=logits_output,
             next_token_ids=next_token_ids,
             can_run_cuda_graph=can_run_cuda_graph,
-        )
-
-    def get_remote_instance_transfer_engine_info(self):
-        return (
-            self.model_runner.remote_instance_transfer_engine_session_id,
-            self.model_runner.remote_instance_transfer_engine_weight_info,
         )
 
     def forward_batch_generation(
@@ -428,6 +479,8 @@ class TpModelWorker(BaseTpWorker):
                 logits_output=logits_output,
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
+                routed_experts_output=out.routed_experts_output,
+                indexer_topk_output=out.indexer_topk_output,
             )
 
             if is_verify:

@@ -5,7 +5,7 @@ Mixin class providing multiplexing scheduling logic
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.distributed as dist
@@ -23,6 +23,7 @@ from sglang.srt.multiplex.pdmux_context import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.managers.scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,9 @@ logger = logging.getLogger(__name__)
 class SchedulerMultiplexMixin:
 
     def init_pdmux(self: Scheduler):
+        # The current split prefill batch
+        self.split_prefill_batch: Optional[ScheduleBatch] = None
+
         # for pd_multiplexing, Init stream_groups, exclude normal stream for prefill only and decode only
         self.pdmux_config = load_pdmux_config(self.server_args.pdmux_config_path)
         initialize_stream_groups(self.gpu_id, self.pdmux_config)
@@ -124,10 +128,7 @@ class SchedulerMultiplexMixin:
                     stream_idx > 0 and self.running_batch.is_empty()
                 )
                 if self.running_batch.is_empty() and self.split_prefill_batch is None:
-                    self.check_memory()
-                    self.check_tree_cache()
-                    self.new_token_ratio = self.init_new_token_ratio
-                    self.maybe_sleep_on_idle()
+                    self.on_idle()
 
             if adjust_stream_group:
                 prefill_stream.synchronize()

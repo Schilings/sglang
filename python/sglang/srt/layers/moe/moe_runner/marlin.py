@@ -80,9 +80,7 @@ def fused_experts_none_to_marlin(
     runner_config: MoeRunnerConfig,
 ) -> StandardCombineInput:
     global MARLIN_MOE_WORKSPACE
-    from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (  # noqa
-        fused_marlin_moe,
-    )
+    from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
 
@@ -99,8 +97,26 @@ def fused_experts_none_to_marlin(
             hidden_states.device, max_blocks_per_sm=4
         )
 
-    output = torch.ops.sglang.fused_marlin_moe(
-        hidden_states=hidden_states,
+    marlin_hidden_states = hidden_states
+    # Avoid aliasing the MoE input buffer until Marlin output semantics are
+    # fully validated across shared-expert and overlap paths.
+    marlin_inplace = False
+    if (
+        quant_info.weight_bits == 4
+        and quant_info.w13_qzeros is None
+        and quant_info.w2_qzeros is None
+        and quant_info.w13_scales.dtype == torch.float8_e8m0fnu
+        and quant_info.w2_scales.dtype == torch.float8_e8m0fnu
+        and hidden_states.dtype == torch.float16
+    ):
+        # MXFP4(E8M0) Marlin kernels are only numerically valid on the bf16
+        # activation path. The fp16 + E8M0 path is intentionally not generated
+        # in sgl-kernel, so upcast activations here and cast the result back.
+        marlin_hidden_states = hidden_states.to(torch.bfloat16)
+        marlin_inplace = False
+
+    output = fused_marlin_moe(
+        hidden_states=marlin_hidden_states,
         w1=quant_info.w13_qweight,
         w2=quant_info.w2_qweight,
         w1_scale=quant_info.w13_scales,
@@ -118,8 +134,9 @@ def fused_experts_none_to_marlin(
         workspace=MARLIN_MOE_WORKSPACE,
         num_bits=quant_info.weight_bits,
         is_k_full=quant_info.is_k_full,
-        inplace=runner_config.inplace,
+        inplace=marlin_inplace,
         routed_scaling_factor=runner_config.routed_scaling_factor,
+        clamp_limit=runner_config.swiglu_limit,
     ).to(hidden_states.dtype)
 
     return StandardCombineInput(
