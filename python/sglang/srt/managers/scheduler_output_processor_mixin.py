@@ -284,8 +284,8 @@ class SchedulerOutputProcessorMixin:
                         logprob_pt += num_input_logprobs
 
                     if (
-                        req.return_hidden_states
-                        and logits_output.hidden_states is not None
+                            req.return_hidden_states
+                            and logits_output.hidden_states is not None
                     ):
                         req.hidden_states.append(
                             logits_output.hidden_states[

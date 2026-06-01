@@ -96,7 +96,7 @@ class DPBudget:
         """Update the budget."""
         for load in load_update.loads:
             self.total_requests[load.dp_rank] = (
-                load.num_running_reqs + load.num_waiting_reqs
+                    load.num_running_reqs + load.num_waiting_reqs
             )
             self.total_tokens[load.dp_rank] = load.num_total_tokens
 

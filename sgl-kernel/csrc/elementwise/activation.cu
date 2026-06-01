@@ -82,6 +82,7 @@ __device__ __forceinline__ T gelu_tanh(const T& x) {
   return detail::from_f32<T>(f32_val * cdf);
 }
 
+
 void silu_and_mul(at::Tensor& out, at::Tensor& input) {
   int d = input.size(-1) / 2;
   int64_t num_tokens = input.numel() / input.size(-1);

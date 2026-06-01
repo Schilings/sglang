@@ -325,12 +325,12 @@ def alloc_extend_kernel(
 
 @triton.jit
 def alloc_decode_kernel(
-    seq_lens_ptr,
-    last_loc_ptr,
-    free_page_ptr,
-    out_indices,
-    bs_upper: tl.constexpr,
-    page_size: tl.constexpr,
+        seq_lens_ptr,
+        last_loc_ptr,
+        free_page_ptr,
+        out_indices,
+        bs_upper: tl.constexpr,
+        page_size: tl.constexpr,
 ):
     pid = tl.program_id(0)
 

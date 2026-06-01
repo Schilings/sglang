@@ -8,6 +8,7 @@
 
 #include "utils.h"
 
+
 template <typename scalar_t, int TOPK>
 __global__ void moe_sum_kernel(
     scalar_t* __restrict__ out,          // [..., d]

@@ -105,6 +105,7 @@ __global__ void merge_attn_states_kernel(
   }
 }
 
+
 // The following macro is used to dispatch the conversion function based on
 // the output data type. The FN is a macro that calls a function with
 // template<typename scalar_t>.
@@ -120,6 +121,7 @@ __global__ void merge_attn_states_kernel(
       TORCH_CHECK(false, "Unsupported data type of O: ", scalar_dtype); \
     }                                                                   \
   }
+
 
 #define LAUNCH_MERGE_ATTN_STATES(scalar_t, NUM_THREADS)                          \
   {                                                                              \

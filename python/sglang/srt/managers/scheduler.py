@@ -2657,7 +2657,7 @@ class Scheduler(
         if (
             self.get_num_allocatable_reqs(running_bs) <= 0
             and self.chunked_req is None
-            and not self.enable_priority_preemption
+                and not self.enable_priority_preemption
         ):
             self.running_batch.batch_is_full = True
             return None
@@ -2732,8 +2732,8 @@ class Scheduler(
 
             if self.running_batch.batch_is_full:
                 if (
-                    not self.enable_priority_preemption
-                    or not adder.preempt_to_schedule(req, self.server_args)
+                        not self.enable_priority_preemption
+                        or not adder.preempt_to_schedule(req, self.server_args)
                 ):
                     break
 
@@ -3125,7 +3125,7 @@ class Scheduler(
                 )
 
         if (
-            self.server_args.enable_dp_attention
+                self.server_args.enable_dp_attention
             and self.server_args.elastic_ep_backend is not None
         ):
             # Get the tensors indicating rank activeness

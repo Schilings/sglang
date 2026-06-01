@@ -533,8 +533,8 @@ def _select_top_k_tokens_later(
 def select_top_k_tokens(
     i: int,
     topk_p: torch.Tensor,
-    topk_index: torch.Tensor,
-    hidden_states: torch.Tensor,
+        topk_index: torch.Tensor,
+        hidden_states: torch.Tensor,
     scores: torch.Tensor,
     topk: int,
 ):
@@ -548,9 +548,9 @@ def select_top_k_tokens(
 def generate_simulated_accept_index(
     accept_index,
     predict,
-    num_correct_drafts,
-    bs,
-    spec_steps,
+        num_correct_drafts,
+        bs,
+        spec_steps,
     simulate_acc_len: float = SIMULATE_ACC_LEN,
     simulate_acc_method: str = SIMULATE_ACC_METHOD,
 ):

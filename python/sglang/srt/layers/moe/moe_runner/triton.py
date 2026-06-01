@@ -231,12 +231,11 @@ def pre_permute_standard_to_triton(
 
 @register_post_permute("triton", "standard")
 def post_permute_triton_to_standard(
-    runner_output: TritonRunnerOutput,
-    quant_info: TritonMoeQuantInfo,
-    runner_config: MoeRunnerConfig,
-    running_state: dict,
+        runner_output: TritonRunnerOutput,
+        quant_info: TritonMoeQuantInfo,
+        runner_config: MoeRunnerConfig,
+        running_state: dict,
 ) -> StandardCombineInput:
-
     # NOTE: this is dead code as a fused func for standard format is registered.
     # This is left here for testing and examples.
 
