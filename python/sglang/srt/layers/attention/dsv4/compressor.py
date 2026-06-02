@@ -5,31 +5,35 @@ from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional, Union
 import torch
 import torch.nn as nn
 
-from sglang.jit_kernel.deepseek_v4 import (
+from sglang.jit_kernel.dsv4 import linear_bf16_fp32, triton_create_paged_compress_data
+from sglang.jit_kernel.dsv4.compress_old import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
     compress_forward,
     compress_fused_norm_rope_inplace,
-    linear_bf16_fp32,
-    triton_create_paged_compress_data,
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
+from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.attention.dsv4.quant_k_cache import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
-from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
-from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
 from sglang.srt.layers.dp_attention import get_attention_cp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
-from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
+from sglang.srt.mem_cache.deepseek_v4_compress_state import (
+    CompressStatePool,
+)
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.models.deepseek_v2 import _is_hip
 from sglang.srt.utils import add_prefix
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
     from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
+    from sglang.srt.layers.rotary_embedding import RotaryEmbedding
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -52,6 +56,9 @@ class CompressorBackendMixin:
         metadata = getattr(self.forward_metadata, attr_name)
         assert isinstance(metadata, FusedCompressMetadata)
         return metadata
+
+    def _maybe_upgrade_forward_metadata(self) -> None:
+        pass
 
     def forward_compress(
         self,
@@ -121,7 +128,7 @@ class CompressorBackendMixin:
         # 必须在此处完成（例如 1.6T layer 0 的 compress_ratio=128
         # 需要 cX_compress_metadata）。
         self._maybe_upgrade_forward_metadata()
-        token_to_kv_pool = forward_batch.token_to_kv_pool
+        token_to_kv_pool = self.token_to_kv_pool
         if TYPE_CHECKING:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
@@ -152,7 +159,7 @@ class CompressorBackendMixin:
         assert is_overlap_compress(compressor.ratio)
         # PREP_IN_CG 延迟升级（原因见 forward_core_compressor）。
         self._maybe_upgrade_forward_metadata()
-        token_to_kv_pool = forward_batch.token_to_kv_pool
+        token_to_kv_pool = self.token_to_kv_pool
         if TYPE_CHECKING:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
@@ -302,6 +309,7 @@ class Compressor(nn.Module):
         head_dim: int,
         rotate: bool = False,
         prefix: str = "",
+        rotary_emb: Optional[RotaryEmbedding] = None,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -335,6 +343,7 @@ class Compressor(nn.Module):
         self.norm = RMSNorm(
             self.head_dim, eps=config.rms_norm_eps, weight_dtype=torch.float32
         )
+        self.rotary_emb = rotary_emb
         self.freqs_cis = freqs_cis
 
         self.ape_converted = False
@@ -358,9 +367,7 @@ class Compressor(nn.Module):
             ret = token_to_kv_pool.get_indexer_compress_states(self.layer_id)
         else:
             ret = token_to_kv_pool.get_attention_compress_states(self.layer_id)
-
         assert isinstance(ret, CompressStatePool)
-
         return ret
 
     # 注意：供 v2 compressor backend 使用
@@ -394,7 +401,6 @@ class Compressor(nn.Module):
 
         kv_score = self.compute_kv_score(x, forward_batch)     # [T, 2*coff*head_dim]
 
-        backend = forward_batch.attn_backend
         if TYPE_CHECKING:
             assert isinstance(backend, DeepseekV4AttnBackend)
         kv_score_buffer = self.get_state_pool(forward_batch)

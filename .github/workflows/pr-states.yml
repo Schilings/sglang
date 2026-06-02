@@ -7,13 +7,24 @@ name: PR States
 on:
   pull_request_target:
     types: [opened, synchronize, reopened, labeled, unlabeled]
+  workflow_run:
+    workflows: ["PR Test Base", "PR Test Extra"]
+    types: [requested, completed]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number whose CI-states block should be refreshed.'
+        required: true
+        type: string
 
 permissions:
   pull-requests: write
   actions: read
 
 concurrency:
-  group: pr-states-${{ github.event.pull_request.number }}
+  # Per-SHA dedupe (PR number for workflow_dispatch). Queues concurrent
+  # fires across the three triggers so they don't race on the body PATCH.
+  group: pr-states-${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha || inputs.pr_number }}
   cancel-in-progress: false
 
 jobs:
@@ -29,7 +40,11 @@ jobs:
             const hasCI = labels.includes('run-ci');
             const hasExtra = labels.includes('run-ci-extra');
 
-            // Retry briefly: pr-test* may not be API-visible yet when we start.
+            // Pre-sleep below only matters when a label was just removed;
+            // other no-label fires don't race against fresh indexing.
+            const justRemovedLabel = context.eventName === 'pull_request_target'
+                                     && context.payload.action === 'unlabeled';
+
             async function findRunBySha(workflowFile) {
               const { data } = await github.rest.actions.listWorkflowRuns({
                 owner: context.repo.owner,
@@ -40,11 +55,12 @@ jobs:
               });
               return data.workflow_runs[0] || null;
             }
-            async function findRunWithRetry(workflowFile, maxAttempts = 6, delayMs = 5000) {
-              for (let i = 0; i < maxAttempts; i++) {
+            async function findRun(workflowFile, { preSleepMs = 0, attempts = 1, delayMs = 0 }) {
+              if (preSleepMs > 0) await sleep(preSleepMs);
+              for (let i = 0; i < attempts; i++) {
                 const run = await findRunBySha(workflowFile);
                 if (run) return run;
-                if (i < maxAttempts - 1) await new Promise(r => setTimeout(r, delayMs));
+                if (i < attempts - 1) await sleep(delayMs);
               }
               return null;
             }
@@ -55,9 +71,8 @@ jobs:
             // run-ci the extra workflow doesn't run either.
             const peRun = (hasCI && hasExtra) ? await findRunWithRetry('pr-test-extra.yml') : null;
 
-            // Treat a fully-skipped run as "no real run" — happens when the PR
-            // was opened without the label and label was added later (GHA does
-            // not retrigger on `labeled`).
+            // Skipped run = "no real run" -- happens when a label is added
+            // after a commit, because GHA doesn't retrigger on `labeled`.
             const isReal = (run) => run && run.conclusion !== 'skipped';
 
             const missingCIText = ':x: **Missing `run-ci` label** — add it to run CI tests.';
@@ -85,16 +100,11 @@ jobs:
               '---',
               '### CI States',
               '',
-              `Latest PR Test: ${ptStart}${ptText}${ptEnd}`,
+              `Latest PR Test (Base): ${ptStart}${ptText}${ptEnd}`,
               `Latest PR Test (Extra): ${peStart}${peText}${peEnd}`,
               outerEnd,
             ].join('\n');
 
-            const { data: pr } = await github.rest.pulls.get({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: context.issue.number,
-            });
             const body = pr.body || '';
 
             const blockRe = new RegExp(`(?:\\n+---\\n+)?${outerStart}[\\s\\S]*?${outerEnd}`);
@@ -112,7 +122,7 @@ jobs:
               await github.rest.pulls.update({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                pull_number: context.issue.number,
+                pull_number: prNumber,
                 body: newBody,
               });
             }
