@@ -184,6 +184,7 @@ def _select_top_k_tokens_later(
     expand_scores = scores.unsqueeze(2) * topk_p.view(-1, topk, topk)
     # (b, topk, 1) * (b, topk, topk) -> (b, topk, topk)
 
+    # topk_cs_index的元素的值在 0 ~ topk*topk-1
     topk_cs_p, topk_cs_index = fast_topk(
         expand_scores.flatten(start_dim=1), topk, dim=-1
     )  # (b, topk)

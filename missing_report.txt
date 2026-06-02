@@ -1,0 +1,280 @@
+
+============================================================
+FILE: managers\scheduler.py (39 missing)
+============================================================
+[SKIP] L289: # 负责 UpdateWeights
+  code: SchedulerUpdateWeightsMixin,
+[SKIP] L716: # PULL，只负责接受，没有发送响应的能力
+  code: self.recv_from_tokenizer = get_zmq_socket(
+[SKIP] L1053: # 若disable_radix_cache
+  code: self.tree_cache = ChunkCache(params)
+[SKIP] L1554: # distributed方式更新权重，根据model的并行策略，建立多个1对1的nccl组进行通信，传递对应权重进行更新
+  code: (InitWeightsUpdateGroupReqInput, self.init_weights_update_group),
+[SKIP] L1556: # distributed方式更新权重，点对点建立的nccl组需要销毁
+  code: (DestroyWeightsUpdateGroupReqInput, self.destroy_weights_update_group),
+[SKIP] L1558: # 将权重发送给remote instance，需要建立点对点通信nccl组
+  code: (InitWeightsSendGroupForRemoteInstanceReqInput,self.init_weights_send_group_for_remote_instance,),
+[SKIP] L1560: # 将权重发送给remote instance
+  code: (SendWeightsToRemoteInstanceReqInput,self.send_weights_to_remote_instance,),
+[SKIP] L1562: # distributed方式更新权重
+  code: (UpdateWeightsFromDistributedReqInput,self.update_weights_from_distributed,),
+[SKIP] L1564: # 适用于同一个GPU内（不一定同个进程）的权重更新，直接传递tensor ipc handle进行更新
+  code: (UpdateWeightsFromTensorReqInput, self.update_weights_from_tensor),
+[SKIP] L1571: # Offload权重weights、kv cache、cuda graph等
+  code: (ReleaseMemoryOccupationReqInput, self.release_memory_occupation),
+[SKIP] L1573: # Onload权重weights、kv cache、cuda graph等
+  code: (ResumeMemoryOccupationReqInput, self.resume_memory_occupation),
+[SKIP] L1603: # Controller 根据负载数据生成budget_queue，queue 元素为可接收请求的 DP rank 序号，
+  code: (GetLoadReqInput, self.get_load),
+[SKIP] L1604: # 元素生成思路：通过逐步提升最小负载的 DP rank，最终让所有 DP rank 的请求数都相等（都达到负载最高的 DP rank）。
+  code: (GetLoadReqInput, self.get_load),
+[SKIP] L1605: # 注：当前的负载更新只支持"最短请求队列策略"，负载指标统计的是"未完成的请求数"。
+  code: (GetLoadReqInput, self.get_load),
+[SKIP] L1864: # 接收到的请求数量是否达到限制数量，达到了就不再继续recv，返回收到的请求
+  code: if self.recv_limit_reached(len(recv_reqs)):
+[SKIP] L1867: # 接受来自 TokenizerManager进程的请求
+  code: recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+[SKIP] L1868: # 注意是 noblock
+  code: recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+[SKIP] L1876: # 接收到的请求数量是否达到限制数量，达到了就不再继续recv，返回收到的请求
+  code: if self.recv_limit_reached(len(recv_reqs)):
+[SKIP] L1879: # 接受RPC 请求，RPC请求一般就是远程调用函数
+  code: recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
+[SKIP] L1880: # 注意是 noblock
+  code: recv_rpc = self.recv_from_rpc.recv_pyobj(zmq.NOBLOCK)
+[SKIP] L1901: # noblock接受请求，是否要阻塞
+  code: if self.input_blocker is not None:
+[SKIP] L1905: # 好像不同的是，开启DP attention话，会多出一类控制请求control_reqs
+  code: if self.server_args.enable_dp_attention:
+[SKIP] L1906: # attn_tp_rank == 0 需要把 work_reqs请求 广播给其余 attn_tp_rank
+  code: if self.server_args.enable_dp_attention:
+[SKIP] L1907: # tp_rank == 0 需要把 control_reqs请求 广播给其余 tp_rank
+  code: if self.server_args.enable_dp_attention:
+[SKIP] L1908: # 是因为要DP需要负载均衡吗？？
+  code: if self.server_args.enable_dp_attention:
+[SKIP] L1932: # 如果没开启DP attention，则由tp_rank == 0广播给其余tp_rank
+  code: elif self.tp_size != 1:
+[SKIP] L2323: # 如果return_logprob，默认只计算生成的token的logprob
+  code: req.logprob_start_len = len(req.origin_input_ids) - 1
+[SKIP] L2695: # Req角度：暂时释放该请求资源索引，为什么要释放呢？prefill没执行完，下次调度难道不是继续prefill吗？
+  code: if self.tp_worker.model_runner.mambaish_config is not None:
+[SKIP] L2698: # 针对 Mamba/SSM 架构的特殊处理：保留内部状态
+  code: self.req_to_token_pool.free(
+[SKIP] L2745: # sglang的running队列只负责decode
+  code: if not self.last_batch.is_empty() and not self.last_batch.is_prefill_only:
+[SKIP] L2746: # 若过滤完  1️⃣chunked请求(没有完成prefill) 或 2️⃣只需要prefill的请求(如果max_sample_num_token=0) 或 3️⃣被用户中断的请求 等这类finished的请求后，
+  code: if not self.last_batch.is_empty() and not self.last_batch.is_prefill_only:
+[SKIP] L2747: # 还有请求在，且该batch内有请求不止prefill需要decode时,则将prefill请求合并到decode running队列内
+  code: if not self.last_batch.is_empty() and not self.last_batch.is_prefill_only:
+[SKIP] L2748: # 状态流转：这是请求生命周期的关键一步：Prefill -> Decode。
+  code: if not self.last_batch.is_empty() and not self.last_batch.is_prefill_only:
+[CAN_ADD] L3469: # 将ModelWorkerBatch提交给TpModelWorker执行
+  code: batch_result = self.model_worker.forward_batch_generation(
+[CAN_ADD] L4412: # 2.1 不PD分离
+  code: if disaggregation_mode == DisaggregationMode.NULL:
+[CAN_ADD] L4418: # PP size > 1的情况
+  code: scheduler.event_loop_pp()
+[CAN_ADD] L4422: # overlap模式
+  code: scheduler.event_loop_overlap()
+[CAN_ADD] L4428: # 2.2 PD分离之Prefill
+  code: elif disaggregation_mode == DisaggregationMode.PREFILL:
+[CAN_ADD] L4437: # 2.3 PD分离之Decode
+  code: elif disaggregation_mode == DisaggregationMode.DECODE:
+
+============================================================
+FILE: mem_cache\memory_pool.py (7 missing)
+============================================================
+[SKIP] L2474: # 装着indices
+  code: tgt_loc_ptr,
+[SKIP] L2476: # 装着indices
+  code: src_loc_ptr,
+[SKIP] L2478: # 一次加载几个index
+  code: num_locs,
+[SKIP] L2480: # num_locs的上界
+  code: num_locs_upper: tl.constexpr,
+[SKIP] L2495: # 每个tid处理[num_locs, BYTES_PER_TILE]数据
+  code: byte_off = tid * BYTES_PER_TILE + tl.arange(0, BYTES_PER_TILE)
+[SKIP] L2502: # 一次加载几个index
+  code: mask_loc = loc_idx < num_locs
+[SKIP] L2510: # 每个tid处理[num_locs, BYTES_PER_TILE]数据
+  code: src_ptr = base_ptr + src[:, None] * stride + byte_off[None, :]
+
+============================================================
+FILE: mem_cache\radix_cache.py (11 missing)
+============================================================
+[SKIP] L368: # 分页计算哈希值
+  code: for start in range(0, len(node.key), page_size):
+[SKIP] L598: # 插入，# 返回匹配的总prefix长度
+  code: return self._insert_helper(self.root_node, key, value, priority)
+[SKIP] L1121: # 计算哈希值
+  code: if node.hash_value is None:
+[SKIP] L1122: # 分页计算，一页一个哈希值
+  code: if node.hash_value is None:
+[SKIP] L1127: # parent节点的最后一页的哈希值，是其第一个child节点的hash值计算用的parent_block_hash
+  code: parent_block_hash = None
+[SKIP] L1138: # 分页存储
+  code: for start in range(0, len(node.key), self.page_size):
+[SKIP] L1150: # parent节点的最后一页的哈希值，是其第一个child节点的hash值计算用的parent_block_hash
+  code: parent_block_hash=parent_block_hash,
+[SKIP] L1151: # 非第一个child的用的是前一个child的hash值作为parent_block_hash
+  code: parent_block_hash=parent_block_hash,
+[SKIP] L1158: # 非第一个child的用的是前一个child的hash值作为parent_block_hash
+  code: parent_block_hash = block_hash
+[SKIP] L1165: # lazy计算哈希值
+  code: if node.hash_value is None:
+[SKIP] L1177: # 通过hash值定位要删除的page
+  code: self.kv_event_queue.append(BlockRemoved(block_hashes=[block_hash]))
+
+============================================================
+FILE: speculative\spec_utils.py (13 missing)
+============================================================
+[SKIP] L222: # 该req需要verify的extend_lens
+  code: copy_len = tl.load(extend_lens + pid)
+[SKIP] L224: # 该req前面的其他req的extend_lens前缀和，不包括自己
+  code: cum_copy_len = tl.sum(tl.load(extend_lens + bs_offset, mask=bs_offset < pid))
+[SKIP] L226: # 就是该req即将缓存的kv indices的起始位置
+  code: out_cache_ptr = out_cache_loc + cum_copy_len
+[SKIP] L230: # Part 1: out_cache_loc记录的kv indices复制到req_to_token中
+  code: kv_start = tl.load(seq_lens + pid)
+[SKIP] L237: # out_cache_loc记录的kv indices复制到req_to_token中
+  code: data = tl.load(out_cache_ptr + copy_offset, mask=mask)
+[SKIP] L251: # 该req除去最后未满page的部分token，即截断成page size倍数后的token数量
+  code: prefix_base = token_pool + prefix_len - last_page_len
+[SKIP] L253: # 针对该req最后未满page的部分token，在后面topk-1个组分配的kv indices，这些token是冗余的
+  code: src_indices = tl.load(prefix_base + offsets, mask=mask)
+[SKIP] L254: # src_indices -> 这部分token在原始seq_len中的正常kv indices
+  code: src_indices = tl.load(prefix_base + offsets, mask=mask)
+[SKIP] L255: # 放到source_cache_loc中，这些token的kv值是已经存在，直接用的
+  code: src_indices = tl.load(prefix_base + offsets, mask=mask)
+[CAN_ADD] L630: # topk_cs_index的元素的值在 0 ~ topk*topk-1
+  code: topk_cs_p, topk_cs_index = fast_topk(
+[SKIP] L638: # topk_cs_index: 从这topk组每组topk个token 选出下一轮draft输入的 topk个token
+  code: """ 从logits得到的topk index的值其实就是token id """
+[SKIP] L655: # i=0,topk个token
+  code: topk_cs_index + (topk**2 * (i - 1) + topk),  # shape: (b, topk)
+[SKIP] L656: # i>0,topk*topk个token
+  code: topk_cs_index + (topk**2 * (i - 1) + topk),  # shape: (b, topk)
+
+============================================================
+FILE: managers\schedule_batch.py (7 missing)
+============================================================
+[CAN_ADD] L2629: # 遍历这个bacth中的每一个请求，如果 这个请求没有完成 且 这个请求不在chunked_req_to_exclude中，
+  code: """
+[CAN_ADD] L2630: # 说明该请求要继续decode或者进入decode截断！！
+  code: """
+[CAN_ADD] L2631: # 则保留这个请求，记录该请求的索引
+  code: """
+[SKIP] L2764: # 如果是decode请求，则extend的len属性全为None
+  code: extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
+[SKIP] L2817: # 不输出hidden states / 只输出最后一个token的 / 输出所有token的
+  code: capture_hidden_mode=(
+[SKIP] L2990: # 所有 requests 对应的 out_cache_loc 的索引
+  code: req_pool_indices: torch.Tensor
+[SKIP] L2996: # 这个 batch 的所有 requests 新增的 KV cache slots 索引
+  code: out_cache_loc: torch.Tensor
+
+============================================================
+FILE: model_executor\model_runner_kv_cache_mixin.py (9 missing)
+============================================================
+[SKIP] L128: # total_gpu_memory指的是 建立完分布式环境后 没有创建Model的 最小GPU内存
+  code: available_gpu_memory = get_available_gpu_memory(
+[SKIP] L129: # available_gpu_memory指的是 建立完分布式环境后 创建了Model的 最小GPU内存
+  code: available_gpu_memory = get_available_gpu_memory(
+[SKIP] L152: # 一个token占据多少内存,考虑kv，kv num head, kv cache dtype, head_dim
+  code: cell_size = self.get_cell_size_per_token(num_layers)
+[SKIP] L155: # 这是什么鸟算法，为什么
+  code: rest_memory = available_gpu_memory - total_gpu_memory * (
+[SKIP] L156: # 意思是？保留 mem_fraction_static * total_gpu_memory的显存，其余都用去加载模型、kv cache等等(不包括分布式环境)
+  code: rest_memory = available_gpu_memory - total_gpu_memory * (
+[SKIP] L292: # 在这里，min_per_gpu_memory 被命名为 total_gpu_memory
+  code: self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
+[SKIP] L293: # total_gpu_memory指的是 在创建Model前建立完分布式环境后的 最小GPU内存
+  code: self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
+[SKIP] L294: # 计算KV Cache大小，即能容纳多少个Token
+  code: self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
+[SKIP] L332: # max_total_num_tokens向下取整为页大小的倍数
+  code: self.max_total_num_tokens = (
+
+============================================================
+FILE: speculative\eagle_worker.py (3 missing)
+============================================================
+[SKIP] L234: # 为什么这里用 TP
+  code: self.draft_model_runner.tp_group
+[SKIP] L911: # 只要 last hidden states
+  code: assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
+[SKIP] L1327: # 沿用 Target Model执行该Batch的 seq_lens
+  code: seq_lens_cpu_cache=seq_lens_cpu
+
+============================================================
+FILE: managers\overlap_utils.py (5 missing)
+============================================================
+[SKIP] L22: # 用途：将表示future tokens的负数ID替换为真实的token值
+  code: input_ids[:] = torch.where(
+[SKIP] L23: # 1. 将负数input_ids取反得到正索
+  code: input_ids[:] = torch.where(
+[SKIP] L24: # 2. 使用clamp确保索引不小于0
+  code: input_ids[:] = torch.where(
+[SKIP] L25: # 3. 从future_token_ids_map中检索对应的实际token ID
+  code: input_ids[:] = torch.where(
+[SKIP] L72: # 循环缓冲区设计 - 节省内存
+  code: self.future_buffer_len = self.future_limit + 2 * max_running_requests
+
+============================================================
+FILE: managers\data_parallel_controller.py (2 missing)
+============================================================
+[SKIP] L169: # 暂未实现，回退简单轮询
+  code: LoadBalanceMethod.MINIMUM_TOKENS: self.minimum_tokens_scheduler,
+[CAN_ADD] L629: # 轮询分发
+  code: self.workers[self.round_robin_counter].send_pyobj(req)
+
+============================================================
+FILE: managers\schedule_policy.py (1 missing)
+============================================================
+[SKIP] L635: # cur按照实际情况算，需要的token空间为：此次prefill的token数extend_input_len
+  code: self.cur_rem_token_offset += extend_input_len
+
+============================================================
+FILE: mem_cache\common.py (3 missing)
+============================================================
+[SKIP] L73: # 将prefix的kv indices写入req_to_token
+  code: num_loop = tl.cdiv(pre_len, BLOCK_SIZE)
+[SKIP] L90: # 将prefill的kv indices写入req_to_token
+  code: num_loop = tl.cdiv(seq_len - pre_len, BLOCK_SIZE)
+[SKIP] L96: # 写入req_to_token
+  code: tl.store(
+
+============================================================
+FILE: layers\moe\moe_runner\triton.py (3 missing)
+============================================================
+[SKIP] L258: # 这里topk=1是因为在算子内，会token_offset // topk来定位A的行索引
+  code: 1,
+[SKIP] L259: # 而这是第二次Gemm, 其输入A的每个token仅被一个expert计算
+  code: 1,
+[SKIP] L260: # 不像第一次Gemm，其输入A的每个token被多个expert计算
+  code: 1,
+
+============================================================
+FILE: speculative\eagle_info.py (2 missing)
+============================================================
+[SKIP] L728: # 将原先input_ids中每个请求的token id替换成 input_ids[1:]+ [verified_id]
+  code: pt = 0
+[SKIP] L729: # 即拼接了接受的认证过的token，剔除前面的token，防止长度变化影响结构
+  code: pt = 0
+
+============================================================
+FILE: layers\attention\nsa_backend.py (1 missing)
+============================================================
+[SKIP] L1057: # 存入KV cache
+  code: if k is not None:
+
+============================================================
+FILE: managers\tp_worker.py (1 missing)
+============================================================
+[SKIP] L306: # 如果下面俩为None，那么ModelRunner 初始化memory pool会创建，否则用这两个
+  code: req_to_token_pool=req_to_token_pool,
+
+============================================================
+FILE: managers\utils.py (1 missing)
+============================================================
+[SKIP] L37: # speculative decoding 中被接受的 token 数量
+  code: num_accepted_tokens: int = 0

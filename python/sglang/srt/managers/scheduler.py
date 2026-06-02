@@ -3143,6 +3143,7 @@ class Scheduler(
                     else {}
                 )
                 resolve_forward_inputs(batch, self.future_map)
+                # 将ModelWorkerBatch提交给TpModelWorker执行
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )
@@ -3945,17 +3946,21 @@ def dispatch_event_loop(scheduler: Scheduler):
     # Dispatch to the appropriate event loop based on the disaggregation mode
     server_args = scheduler.server_args
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
+    # 2.1 不PD分离
     if disaggregation_mode == DisaggregationMode.NULL:
         if scheduler.enable_pdmux:
             scheduler.event_loop_pdmux()
         elif server_args.pp_size > 1:
+            # PP size > 1的情况
             scheduler.event_loop_pp()
         elif scheduler.enable_overlap_mlx:
             scheduler.event_loop_overlap_mlx()
         elif scheduler.enable_overlap:
+            # overlap模式
             scheduler.event_loop_overlap()
         else:
             scheduler.event_loop_normal()
+    # 2.2 PD分离之Prefill
     elif disaggregation_mode == DisaggregationMode.PREFILL:
         if server_args.pp_size > 1:
             scheduler.event_loop_pp_disagg_prefill()
@@ -3963,6 +3968,7 @@ def dispatch_event_loop(scheduler: Scheduler):
             scheduler.event_loop_overlap_disagg_prefill()
         else:
             scheduler.event_loop_normal_disagg_prefill()
+    # 2.3 PD分离之Decode
     elif disaggregation_mode == DisaggregationMode.DECODE:
         if server_args.pp_size > 1:
             scheduler.event_loop_pp_disagg_decode()
@@ -4083,7 +4089,7 @@ def run_scheduler_process(
 
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
-# 2 根据模式运行scheduler
+        # 2 根据模式运行scheduler
 
         # Run the event loop (blocks until shutdown)
         scheduler.run_event_loop()
