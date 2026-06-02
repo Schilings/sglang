@@ -1,13 +1,5 @@
 from __future__ import annotations
 
-from sglang.srt.dllm.config import DllmConfig
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils.common import (
-    ceil_align,
-    flatten_arrays_to_pinned_cpu,
-    is_pin_memory_available,
-)
-
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.

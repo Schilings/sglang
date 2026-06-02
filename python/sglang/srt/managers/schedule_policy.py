@@ -1,15 +1,3 @@
-from __future__ import annotations
-
-import logging
-from array import array
-
-from sglang.srt.environ import envs
-from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
-from sglang.srt.utils import get_bool_env_var
-
-_ROUTING_KEY_POLICY_DEBUG_LOG = get_bool_env_var("SGLANG_ROUTING_KEY_POLICY_DEBUG_LOG")
-logger = logging.getLogger(__name__)
-
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,6 +12,18 @@ logger = logging.getLogger(__name__)
 # limitations under the License.
 # ==============================================================================
 """Request scheduler policy"""
+
+from __future__ import annotations
+
+import logging
+from array import array
+
+from sglang.srt.environ import envs
+from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
+from sglang.srt.utils import get_bool_env_var
+
+_ROUTING_KEY_POLICY_DEBUG_LOG = get_bool_env_var("SGLANG_ROUTING_KEY_POLICY_DEBUG_LOG")
+logger = logging.getLogger(__name__)
 
 import os
 import random
