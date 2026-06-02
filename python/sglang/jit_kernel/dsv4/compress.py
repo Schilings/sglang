@@ -296,16 +296,16 @@ class CompressorPrefillPlan(NamedTuple):
 
 
 def compress_forward(
-    kv_score_buffer: torch.Tensor,
-    kv_score_input: torch.Tensor,
-    ape: torch.Tensor,
+    kv_score_buffer: torch.Tensor,  # offline: [num_groups, compress_ratio, 2*coff*head_dim]; online: [num_groups, 1, 3*head_dim]
+    kv_score_input: torch.Tensor,   # [T, 2*coff*head_dim], coff=2 if c4 else 1
+    ape: torch.Tensor,              # [compress_ratio*coff, head_dim], absolute position encoding bias
     plan: Union[CompressorDecodePlan, CompressorPrefillPlan],
     *,
     head_dim: int,
     compress_ratio: Literal[4, 128],
-    out: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,  # [num_q_tokens, head_dim]
     is_online: bool = False,
-) -> torch.Tensor:
+) -> torch.Tensor:  # [num_q_tokens, head_dim]
     if out is None:
         num_q_tokens = plan[1].shape[0]  # NOTE: decode = bs, prefill = dynamic
         out = kv_score_input.new_empty((num_q_tokens, head_dim))
@@ -322,14 +322,14 @@ def compress_forward(
 
 
 def compress_norm_rope_store(
-    kv: torch.Tensor,
+    kv: torch.Tensor,          # [num_compressed_tokens, head_dim]
     plan: Union[CompressorDecodePlan, CompressorPrefillPlan],
     *,
-    norm_weight: torch.Tensor,
+    norm_weight: torch.Tensor,  # [head_dim], RMSNorm weight
     norm_eps: float,
-    freq_cis: torch.Tensor,
-    out_loc: torch.Tensor,
-    kvcache: torch.Tensor,
+    freq_cis: torch.Tensor,    # [max_seq_len, head_dim//2, 2], RoPE frequencies (complex view)
+    out_loc: torch.Tensor,     # [num_compressed_tokens], page cache write locations
+    kvcache: torch.Tensor,     # uint8 paged KV cache view
     page_size: int,
 ) -> None:
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)

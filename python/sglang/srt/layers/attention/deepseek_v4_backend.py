@@ -331,6 +331,7 @@ class _GraphBucket(enum.Enum):
 class DeepseekV4AttnBackend(
     AttentionBackend, C4IndexerBackendMixin, CompressorBackendMixin
 ):
+
     def __init__(
         self,
         model_runner: ModelRunner,

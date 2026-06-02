@@ -21,12 +21,12 @@ if TYPE_CHECKING:
 
 
 CompressMetadata: TypeAlias = Union[CompressorDecodePlan, CompressorPrefillPlan]
-# NOTE: alias for backward compatibility
+# 注意：为向后兼容而保留的别名
 FusedCompressMetadata: TypeAlias = CompressMetadata
 
 
 def _use_online_compress(compress_ratio: int) -> bool:
-    """Online state-pool path is c128-only."""
+    """Online state-pool 路径仅用于 c128。"""
     return compress_ratio == 128 and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
 
 
@@ -35,7 +35,7 @@ class CompressorBackendMixin:
         super().__init__()
         self.forward_metadata: DSV4Metadata
 
-    # NOTE: Will be overridden
+    # 注意：将被覆写
     def _maybe_upgrade_forward_metadata(self): ...
 
     def _get_paged_compress_metadata(self, compress_ratio: int) -> CompressMetadata:
@@ -49,18 +49,18 @@ class CompressorBackendMixin:
     def _forward_compress_all_in_one(
         self,
         *,
-        kv_score_buffer: torch.Tensor,
-        kv_score_input: torch.Tensor,
-        ape: torch.Tensor,
+        kv_score_buffer: torch.Tensor,  # offline: [pool_size, 2*(1+overlap)*head_dim]; online(c128): [pool_size, 3*head_dim]
+        kv_score_input: torch.Tensor,    # [T, 2*coff*head_dim] — wkv_gate 输出（c4 的 coff=2，c128 的 coff=1）
+        ape: torch.Tensor,               # [compress_ratio, coff*head_dim] — 绝对位置编码
         head_dim: int,
         norm: RMSNorm,
         freqs_cis_cache: torch.Tensor,
-        kv_cache: torch.Tensor,
+        kv_cache: torch.Tensor,          # 压缩 KV 分页缓存的 uint8 视图
         is_indexer: bool,
         rotate: bool,
-        compress_ratio: int,
+        compress_ratio: int,             # 4 or 128
         page_size: int,
-        out_loc: torch.Tensor,
+        out_loc: torch.Tensor,           # [num_compressed_tokens] — 分页缓存中的输出槽位索引
     ) -> None:
         assert compress_ratio == 4 or compress_ratio == 128
         assert rotate == is_indexer == (head_dim == 128)
@@ -68,39 +68,39 @@ class CompressorBackendMixin:
         plan = self._get_paged_compress_metadata(compress_ratio)
         is_online = _use_online_compress(compress_ratio)
         if is_online:
-            kv_score_buffer = kv_score_buffer.view(-1, 1, head_dim * 3)
+            kv_score_buffer = kv_score_buffer.view(-1, 1, head_dim * 3)      # [pool_size, 1, 3*head_dim]
         else:
             coff = 2 if is_overlap_compress(compress_ratio) else 1
             last_dim = 2 * head_dim * coff
             assert kv_score_buffer.shape[-1] == last_dim
-            kv_score_buffer = kv_score_buffer.view(-1, compress_ratio, last_dim)
-        kv_compressed = compress_forward(
-            kv_score_buffer=kv_score_buffer,
-            kv_score_input=kv_score_input,
-            ape=ape.view(-1, head_dim),
+            kv_score_buffer = kv_score_buffer.view(-1, compress_ratio, last_dim)  # [pool_size/cr, cr, last_dim]
+        kv_compressed = compress_forward(   # [num_compressed_tokens, head_dim] — 评分 & 选择后的压缩 KV
+            kv_score_buffer=kv_score_buffer, # [pool_size/cr, cr, last_dim]
+            kv_score_input=kv_score_input,   # [T, 2*coff*head_dim]
+            ape=ape.view(-1, head_dim),      # [cr*coff, head_dim]
             plan=plan,
             compress_ratio=compress_ratio,
             head_dim=head_dim,
             is_online=is_online,
         )
-        # NOTE: we use some hack here...
-        compress_norm_rope_store(
-            kv_compressed,
+        # 注意：此处使用了一些 hack...
+        compress_norm_rope_store(            # 融合：RMSNorm + RoPE + 将压缩 KV 写入分页缓存
+            kv_compressed,                   # [num_compressed_tokens, head_dim]
             plan,
             norm_weight=norm.weight,
             norm_eps=norm.variance_epsilon,
             freq_cis=freqs_cis_cache,
-            out_loc=out_loc,
-            kvcache=kv_cache,
+            out_loc=out_loc,                 # [num_compressed_tokens]
+            kvcache=kv_cache,                # uint8 分页缓存
             page_size=page_size,
         )
 
     def forward_unified(
         self,
-        x: torch.Tensor,
+        x: torch.Tensor,            # [T, hidden_size] — 解码器层的隐藏状态
         forward_batch: ForwardBatch,
         layer_id: int,
-        compressor: Compressor,
+        compressor: Compressor,      # compress_ratio ∈ {4, 128}
     ) -> None:
         if forward_batch.forward_mode.is_idle():
             return
@@ -108,9 +108,9 @@ class CompressorBackendMixin:
         self._maybe_upgrade_forward_metadata()
         token_to_kv_pool = forward_batch.token_to_kv_pool
         token_to_kv_pool = cast("DeepSeekV4TokenToKVPool", token_to_kv_pool)
-        kv_score_input = compressor.compute_kv_score(x, forward_batch)
+        kv_score_input = compressor.compute_kv_score(x, forward_batch)  # [T, 2*coff*head_dim] — linear(x, wkv_gate)
         state_pool = compressor.get_state_pool(forward_batch)
-        out_loc = self._get_out_loc(compressor.ratio)
+        out_loc = self._get_out_loc(compressor.ratio)  # [num_compressed_tokens] — 输出槽位索引
         if compressor.is_in_indexer:
             kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)
             page_size = token_to_kv_pool.get_index_k_page_size()
@@ -123,10 +123,11 @@ class CompressorBackendMixin:
                 # The v2 compressor writes directly into the raw C4 KV tensor.
                 # HiSparse C4 therefore needs the physical C4 location here.
                 out_loc = compress_kv_pool.translate_loc_to_hisparse_device(out_loc)
+
         self._forward_compress_all_in_one(
-            kv_score_buffer=state_pool.kv_score_buffer.kv_score,
-            kv_score_input=kv_score_input,
-            ape=compressor.ape,
+            kv_score_buffer=state_pool.kv_score_buffer.kv_score,  # [pool_size, last_dim] — 历史 KV+score 的环形缓冲区
+            kv_score_input=kv_score_input,   # [T, 2*coff*head_dim]
+            ape=compressor.ape,              # [compress_ratio, coff*head_dim]
             head_dim=compressor.head_dim,
             norm=compressor.norm,
             freqs_cis_cache=compressor.freqs_cis,
@@ -135,10 +136,10 @@ class CompressorBackendMixin:
             rotate=compressor.rotate,
             compress_ratio=compressor.ratio,
             page_size=page_size,
-            out_loc=out_loc,
+            out_loc=out_loc,                 # [num_compressed_tokens]
         )
 
-    # NOTE: alias for backward compatibility
+    # 注意：为向后兼容而保留的别名
     forward_indexer_compressor = forward_unified
     forward_core_compressor = forward_unified
 
@@ -161,10 +162,10 @@ def create_paged_compressor_data(
     use_prefill_cuda_graph: bool = False,
     num_q_tokens: Optional[int] = None,
 ) -> CompressMetadata:
-    """Build the paged compress metadata (= the plan).
+    """构建分页压缩元数据（即计划 plan）。
 
-    State-pool slot translation is done inside the C++ planner; the
-    Python side just hands the relevant tensors over.
+    State-pool 槽位转换在 C++ planner 内部完成；
+    Python 端只需传递相关张量。
     """
     if _use_online_compress(compress_ratio):
         return _create_online_paged_compressor_data(
@@ -243,8 +244,8 @@ def _create_online_paged_compressor_data(
     req_pool_indices = req_pool_indices.to(torch.int64)
 
     if is_prefill:
-        # Sync-on-entry: catch IMA from a prior layer / kernel BEFORE we touch
-        # anything in this builder, so blame doesn't land on us spuriously.
+        # 入口同步：在接触此 builder 的任何内容之前，捕获前一层/内核的 IMA，
+        # 以免误将问题归咎于我们。
         assert extend_lens is not None
         if seq_lens_cpu is not None:
             assert extend_lens_cpu is not None

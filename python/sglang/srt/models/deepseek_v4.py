@@ -331,51 +331,51 @@ class MQALayer(nn.Module):
             prefix=add_prefix("attn_mqa", prefix),
         )
 
-        # KV cache write is always fused into the K kernel
-        # (`_compute_kv_to_cache`), so the legacy "overlap store cache" flag
-        # has no effect here -- the fused path is on by default.
+        # KV 缓存写入始终融合到 K 内核中
+        # (`_compute_kv_to_cache`)，旧的 "overlap store cache" 标志
+        # 在此处无效——融合路径默认启用
 
     def _compute_q_a(
         self,
-        x: torch.Tensor,
-        qkv_a: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        x: torch.Tensor,       # [T, hidden_size]
+        qkv_a: Optional[torch.Tensor] = None,  # [T, q_lora_rank + head_dim]（融合路径）
+    ) -> torch.Tensor:          # [T, q_lora_rank]
         if qkv_a is not None:
-            q = qkv_a[..., : self.q_lora_rank]
+            q = qkv_a[..., : self.q_lora_rank]  # [T, q_lora_rank]
         else:
-            q, _ = self.wq_a(x)
-        return self.q_norm(q)
+            q, _ = self.wq_a(x)                  # [T, q_lora_rank]
+        return self.q_norm(q)                     # [T, q_lora_rank]
 
     def _compute_q_b(
         self,
-        q: torch.Tensor,
-        positions: torch.Tensor,
-        q_out: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        q, _ = self.wq_b(q)
-        q = q.view(-1, self.n_local_heads, self.head_dim)
+        q: torch.Tensor,        # [T, q_lora_rank]
+        positions: torch.Tensor, # [T]
+        q_out: Optional[torch.Tensor] = None,  # [T, n_local_heads, head_dim]（TP 预分配）
+    ) -> torch.Tensor:           # [T, n_local_heads, head_dim]
+        q, _ = self.wq_b(q)                        # [T, n_local_heads * head_dim]
+        q = q.view(-1, self.n_local_heads, self.head_dim)  # [T, n_local_heads, head_dim]
         if q_out is None:
             q_out = torch.empty_like(q)
-        # Fused warp-per-(token, head) rmsnorm-self + RoPE + write to q_out.
+        # 融合操作：每个 (token, head) 的 rmsnorm + RoPE + 写入 q_out
         fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
-        return q_out
+        return q_out                                # [T, n_local_heads, head_dim]
 
     def _compute_kv_to_cache(
         self,
-        x: torch.Tensor,
-        positions: torch.Tensor,
+        x: torch.Tensor,        # [T, hidden_size]
+        positions: torch.Tensor, # [T]
         forward_batch: ForwardBatch,
-        qkv_a: Optional[torch.Tensor] = None,
+        qkv_a: Optional[torch.Tensor] = None,  # [T, q_lora_rank + head_dim]（融合路径）
     ) -> None:
-        """Fused: rmsnorm + RoPE + write directly to FlashMLA paged cache.
+        """融合操作：rmsnorm + RoPE + 直接写入 FlashMLA 分页缓存。
 
-        Replaces the bf16-kv-intermediate path. Used everywhere except the NSA
-        prefill-CP case (which needs bf16 kv for the cross-rank all-gather).
+        替代 bf16-kv 中间结果路径。除 NSA prefill-CP 场景外均使用此路径
+        （NSA prefill-CP 需要 bf16 kv 用于跨 rank 的 all-gather）。
         """
         if qkv_a is not None:
-            kv = qkv_a[..., self.q_lora_rank :]
+            kv = qkv_a[..., self.q_lora_rank :]   # [T, head_dim]
         else:
-            kv, _ = self.wkv(x)
+            kv, _ = self.wkv(x)                    # [T, head_dim]
         token_to_kv_pool = forward_batch.token_to_kv_pool
         if TYPE_CHECKING:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
@@ -391,16 +391,16 @@ class MQALayer(nn.Module):
 
     def _compute_kv_bf16(
         self,
-        x: torch.Tensor,
-        positions: torch.Tensor,
-        qkv_a: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Bf16-kv path used by the NSA prefill-CP case (needs all-gather)."""
+        x: torch.Tensor,        # [T, hidden_size]
+        positions: torch.Tensor, # [T]
+        qkv_a: Optional[torch.Tensor] = None,  # [T, q_lora_rank + head_dim]（融合路径）
+    ) -> torch.Tensor:           # [T, head_dim]
+        """bf16-kv 路径，用于 NSA prefill-CP 场景（需要 all-gather）。"""
         if qkv_a is not None:
-            kv = qkv_a[..., self.q_lora_rank :]
+            kv = qkv_a[..., self.q_lora_rank :]   # [T, head_dim]
         else:
-            kv, _ = self.wkv(x)
-        kv = kv.contiguous()
+            kv, _ = self.wkv(x)                    # [T, head_dim]
+        kv = kv.contiguous()                        # [T, head_dim]
         fused_norm_rope_inplace(
             kv,
             self.kv_norm.weight.data,
@@ -408,16 +408,16 @@ class MQALayer(nn.Module):
             self.freqs_cis,
             positions,
         )
-        return kv
+        return kv                                    # [T, head_dim]（已应用 norm+rope）
 
     def _forward_prepare_multi_stream(
         self,
-        x: torch.Tensor,
-        positions: torch.Tensor,
+        x: torch.Tensor,        # [T, hidden_size]
+        positions: torch.Tensor, # [T]
         forward_batch: ForwardBatch,
         attn_backend: DeepseekV4AttnBackend,
-        q_out: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        q_out: Optional[torch.Tensor] = None,  # [T, n_local_heads, head_dim]（TP 预分配）
+    ) -> torch.Tensor:           # [T, n_local_heads, head_dim]
         assert self.alt_streams is not None
         assert len(self.alt_streams) >= 3
 
@@ -430,13 +430,13 @@ class MQALayer(nn.Module):
         stream_compressor.wait_stream(current_stream)
         stream_indexer.wait_stream(current_stream)
 
-        qkv_a: Optional[torch.Tensor] = None
+        qkv_a: Optional[torch.Tensor] = None   # [T, q_lora_rank + head_dim]
         qkv_a_ready: Optional[torch.cuda.Event] = None
         if self.fuse_wqa_wkv:
-            qkv_a, _ = self.wqkv_a(x)
+            qkv_a, _ = self.wqkv_a(x)           # [T, q_lora_rank + head_dim]
             qkv_a_ready = current_stream.record_event()
 
-        q_lora = self._compute_q_a(x, qkv_a=qkv_a)
+        q_lora = self._compute_q_a(x, qkv_a=qkv_a)  # [T, q_lora_rank]
         q_lora_ready = current_stream.record_event()
 
         if self.indexer is not None:
@@ -452,7 +452,7 @@ class MQALayer(nn.Module):
         with torch.cuda.stream(stream_kv):
             if qkv_a_ready is not None:
                 stream_kv.wait_event(qkv_a_ready)
-            # Fused norm + rope + cache write -- no bf16 KV intermediate.
+            # 融合 norm + rope + 缓存写入——无 bf16 KV 中间结果
             self._compute_kv_to_cache(x, positions, forward_batch, qkv_a=qkv_a)
 
         del qkv_a
@@ -463,7 +463,7 @@ class MQALayer(nn.Module):
                     x, forward_batch, self.layer_id, self.compressor
                 )
 
-        q = self._compute_q_b(q_lora, positions, q_out)
+        q = self._compute_q_b(q_lora, positions, q_out)  # [T, n_local_heads, head_dim]
         current_stream.wait_stream(stream_kv)
         current_stream.wait_stream(stream_compressor)
         current_stream.wait_stream(stream_indexer)
@@ -472,27 +472,27 @@ class MQALayer(nn.Module):
 
     def _forward_prepare(
         self,
-        x: torch.Tensor,
-        positions: torch.Tensor,
+        x: torch.Tensor,        # [T, hidden_size]
+        positions: torch.Tensor, # [T]
         forward_batch: ForwardBatch,
         attn_backend: DeepseekV4AttnBackend,
-        q_out: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        q_out: Optional[torch.Tensor] = None,  # [T, n_local_heads, head_dim]（TP 预分配）
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:  # (q[T, n_local_heads, head_dim], kv[T, head_dim] | None)
         if self.fuse_wqa_wkv:
-            qkv_a, _ = self.wqkv_a(x)
-            q_lora = qkv_a[..., : self.q_lora_rank]
+            qkv_a, _ = self.wqkv_a(x)              # [T, q_lora_rank + head_dim]
+            q_lora = qkv_a[..., : self.q_lora_rank]  # [T, q_lora_rank]
         else:
-            q_lora, _ = self.wq_a(x)
+            q_lora, _ = self.wq_a(x)                # [T, q_lora_rank]
             qkv_a = None
-        q_lora = self.q_norm(q_lora)
-        q = self._compute_q_b(q_lora, positions, q_out)
+        q_lora = self.q_norm(q_lora)                # [T, q_lora_rank]
+        q = self._compute_q_b(q_lora, positions, q_out)  # [T, n_local_heads, head_dim]  # [T, n_local_heads, head_dim]
 
         use_cp = self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch)
         kv: Optional[torch.Tensor]
         if use_cp:
-            # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
-            # write to the FlashMLA cache after gather.
-            kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
+            # NSA CP: 保留 bf16 kv 用于跨 rank 的 all-gather，
+            # all-gather 完成后再写入 FlashMLA 缓存
+            kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)  # [T, head_dim]
             kv = cp_all_gather_rerange_output(
                 kv.contiguous(),
                 self.cp_size,
@@ -514,20 +514,20 @@ class MQALayer(nn.Module):
             self.indexer(x=x, q_lora=q_lora, forward_batch=forward_batch)
         if self.compressor is not None:
             attn_backend.forward_core_compressor(
-                x,
+                x,                      # [T, hidden_size] — compressor 的 wkv_gate 使用的隐藏状态
                 forward_batch,
                 self.layer_id,
-                self.compressor,
+                self.compressor,        # compress_ratio ∈ {4, 128}
             )
 
         return q, kv
 
     def forward(
         self,
-        x: torch.Tensor,
-        positions: torch.Tensor,
+        x: torch.Tensor,        # [T, hidden_size]  — T = token 数量
+        positions: torch.Tensor, # [T]
         forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor:           # [T, hidden_size]
         if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
             assert (
                 not self.wo_b.reduce_results
@@ -548,30 +548,30 @@ class MQALayer(nn.Module):
 
         tp_slice, q_padded, q_out = slice(None), None, None
         if self.tp_size > 1:
-            q_padded = x.new_empty(x.shape[0], self.n_heads, self.head_dim)
+            q_padded = x.new_empty(x.shape[0], self.n_heads, self.head_dim)  # [T, n_heads, head_dim] — 完整 TP 形状
             rank = self.tp_rank
             tp_slice = slice(rank * self.n_local_heads, (rank + 1) * self.n_local_heads)
-            q_out = q_padded[:, tp_slice, :]
+            q_out = q_padded[:, tp_slice, :]  # [T, n_local_heads, head_dim] — q_padded 的视图
 
         if enable_multi_stream:
-            # Multi-stream path always fuses cache write into the K kernel,
-            # so the bf16 KV intermediate is gone.
-            q = self._forward_prepare_multi_stream(
+            # 多流路径始终将缓存写入融合到 K 内核中，
+            # 因此不存在 bf16 KV 中间结果。
+            q = self._forward_prepare_multi_stream(  # [T, n_local_heads, head_dim]
                 x, positions, forward_batch, attn_backend, q_out
             )
-            kv = None
+            kv = None                                 # 无 bf16 KV 中间结果
         else:
-            q, kv = self._forward_prepare(
+            q, kv = self._forward_prepare(            # q: [T, n_local_heads, head_dim], kv: [T, head_dim] | None
                 x, positions, forward_batch, attn_backend, q_out
             )
 
-        # The cache write is always fused / already done by _forward_prepare* --
-        # tell the backend to skip its own store_cache. When `kv is None`
-        # (no NSA-CP), pass `q` as a sentinel for the `k is v` assert; the
-        # attention path doesn't read it once `save_kv_cache=False`.
-        attn_k = kv if kv is not None else q
-        o = attn_backend.forward(
-            q=q_padded if q_padded is not None else q,
+        # 缓存写入始终融合 / 已由 _forward_prepare* 完成——
+        # 告知后端跳过自身的 store_cache。当 `kv is None`
+        # （非 NSA-CP）时，用 `q` 作为 `k is v` 断言的哨兵值；
+        # 当 `save_kv_cache=False` 时，注意力路径不会读取它。
+        attn_k = kv if kv is not None else q  # [T, head_dim] | [T, n_local_heads, head_dim]（哨兵值）
+        o = attn_backend.forward(              # [T, n_heads, head_dim] — 完整 TP 输出（若 TP），否则 [T, n_local_heads, head_dim]
+            q=q_padded if q_padded is not None else q,  # [T, n_heads, head_dim] | [T, n_local_heads, head_dim]
             k=attn_k,
             v=attn_k,
             layer=self.attn_mqa,
@@ -580,41 +580,43 @@ class MQALayer(nn.Module):
             attn_sink=self.attn_sink,
             save_kv_cache=False,
         )
-        o = o[:, tp_slice, :]
+        o = o[:, tp_slice, :]                 # [T, n_local_heads, head_dim] — 切取当前 TP rank 的 heads
         fused_rope_inplace(
-            o[..., -self.qk_rope_head_dim :],
+            o[..., -self.qk_rope_head_dim :],  # [T, n_local_heads, qk_rope_head_dim] — 对 rope 维度应用逆 RoPE
             None,
             self.freqs_cis,
             positions=positions,
             inverse=True,
         )
 
-        o = o.view(o.shape[0], self.n_local_groups, -1)
+        # 重新分组：n_local_heads 个 head → n_local_groups 个 group，每个 group 有 (n_local_heads//n_local_groups) 个 head
+        # D = (n_local_heads // n_local_groups) * head_dim = heads_per_group * head_dim
+        o = o.view(o.shape[0], self.n_local_groups, -1)  # [T, n_local_groups, heads_per_group * head_dim]
 
         if _FP8_WO_A_GEMM:
             import deep_gemm
 
-            T, G, D = o.shape
+            T, G, D = o.shape          # [T, n_local_groups, heads_per_group * head_dim]
             R = self.o_lora_rank
             o_fp8, o_s = sglang_per_token_group_quant_fp8(
-                o.reshape(T * G, D).contiguous(),
+                o.reshape(T * G, D).contiguous(),  # [T*G, heads_per_group * head_dim]
                 group_size=128,
             )
             o_s = deep_gemm.ceil_to_ue8m0(o_s)
-            output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)
+            output = torch.empty(T, G, R, device=o.device, dtype=torch.bfloat16)  # [T, n_local_groups, o_lora_rank]
             deep_gemm.fp8_einsum(
                 "bhr,hdr->bhd",
-                (o_fp8.view(T, G, D), o_s.view(T, G, -1)),
-                (self.wo_a.weight.view(G, R, D), self.wo_a.weight_scale_inv.data),
-                output,
+                (o_fp8.view(T, G, D), o_s.view(T, G, -1)),      # [T, G, D], [T, G, D/128]
+                (self.wo_a.weight.view(G, R, D), self.wo_a.weight_scale_inv.data),  # [G, R, D], [G, R, D/128]
+                output,              # [T, n_local_groups, o_lora_rank]
                 recipe=(1, 1, 128),
             )
-            o = output
+            o = output                 # [T, n_local_groups, o_lora_rank]
         else:
-            wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-            o = torch.einsum("tgd,grd->tgr", o, wo_a)
+            wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)  # [G, R, D]
+            o = torch.einsum("tgd,grd->tgr", o, wo_a)  # [T, n_local_groups, o_lora_rank]
 
-        o, _ = self.wo_b(o.flatten(1))
+        o, _ = self.wo_b(o.flatten(1))  # [T, n_local_groups * o_lora_rank] -> [T, hidden_size]
 
         return o
 
@@ -660,7 +662,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         self.hc_mult = hc_mult = config.hc_mult
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
-        self.hc_eps = config.hc_eps
+        self.hc_eps = config.hc_eps 
         mix_hc = (2 + hc_mult) * hc_mult
         hc_dim = hc_mult * config.hidden_size
         self.hc_attn_fn = nn.Parameter(torch.empty(mix_hc, hc_dim, dtype=torch.float32))

@@ -56,17 +56,17 @@ class CompressorBackendMixin:
     def forward_compress(
         self,
         *,
-        kv_score_buffer: torch.Tensor,
-        kv_score_input: torch.Tensor,
-        ape: torch.Tensor,
+        kv_score_buffer: torch.Tensor,  # offline: [pool_size, 2*(1+overlap)*head_dim]; online(c128): [pool_size, 3*head_dim]
+        kv_score_input: torch.Tensor,    # [T, 2*coff*head_dim] — wkv_gate 输出（c4 的 coff=2，c128 的 coff=1）
+        ape: torch.Tensor,               # [compress_ratio*coff, head_dim] — 绝对位置编码（经 .view(-1, head_dim) 后）
         head_dim: int,
         norm: RMSNorm,
         freqs_cis_cache: torch.Tensor,
         rotate: bool,
         forward_batch: ForwardBatch,
-        compress_ratio: int,
+        compress_ratio: int,             # 4 or 128
         is_paged: bool = False,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor:                   # [num_compressed_tokens, head_dim] — 压缩 KV（已应用 norm+rope）
         from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
 
         assert compress_ratio in (
@@ -77,54 +77,55 @@ class CompressorBackendMixin:
             metadata = self.get_paged_compress_metadata(compress_ratio)
             coff = 2 if is_overlap_compress(compress_ratio) else 1
             if compress_ratio == 128 and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
-                kv_score_buffer = kv_score_buffer.view(-1, 1, head_dim * 3)
+                kv_score_buffer = kv_score_buffer.view(-1, 1, head_dim * 3)      # [pool_size, 1, 3*head_dim]
             else:
                 last_dim = 2 * head_dim * coff
                 assert kv_score_buffer.shape[-1] == last_dim
-                kv_score_buffer = kv_score_buffer.view(-1, compress_ratio, last_dim)
+                kv_score_buffer = kv_score_buffer.view(-1, compress_ratio, last_dim)  # [pool_size/cr, cr, 2*coff*head_dim]
         else:
             plan = make_compressor_plan(compress_ratio, forward_batch)
             metadata = (forward_batch.req_pool_indices.to(torch.int32), None, plan)
         indices, extra_data, plan = metadata
 
-        kv_compressed = compress_forward(
+        kv_compressed = compress_forward(   # [num_compressed_tokens, head_dim] — 评分 & 选择后的压缩 KV
             kv_score_buffer=kv_score_buffer,
-            kv_score_input=kv_score_input,
-            ape=ape,
+            kv_score_input=kv_score_input,   # [T, 2*coff*head_dim]
+            ape=ape,                         # [cr*coff, head_dim]
             indices=indices,
             plan=plan,
             compress_ratio=compress_ratio,
             head_dim=head_dim,
             extra_data=extra_data,
         )
-        compress_fused_norm_rope_inplace(
-            kv_compressed,
+        compress_fused_norm_rope_inplace(    # 融合：RMSNorm + RoPE，原地修改 kv_compressed
+            kv_compressed,                   # [num_compressed_tokens, head_dim]
             norm.weight,
             norm.variance_epsilon,
             freqs_cis_cache,
             plan,
         )
-        return rotate_activation(kv_compressed) if rotate else kv_compressed
+        return rotate_activation(kv_compressed) if rotate else kv_compressed  # [num_compressed_tokens, head_dim]
 
     def forward_core_compressor(
         self,
-        x: torch.Tensor,
+        x: torch.Tensor,            # [T, hidden_size] — 解码器层的隐藏状态
         forward_batch: ForwardBatch,
         layer_id: int,
-        compressor: Compressor,
+        compressor: Compressor,      # compress_ratio ∈ {4, 128}，is_in_indexer=False
     ) -> None:
         if forward_batch.forward_mode.is_idle():
             return
-        # PREP_IN_CG lazy upgrade: the concrete backend (DeepseekV4AttnBackend)
-        # owns this helper. MQALayer._forward_prepare calls us before
-        # attn_backend.forward(), so Raw -> DSV4Metadata must happen here too
-        # (e.g. 1.6T layer 0 has compress_ratio=128 and needs cX_compress_metadata).
+        # PREP_IN_CG 延迟升级：具体后端 (DeepseekV4AttnBackend)
+        # 拥有此辅助方法。MQALayer._forward_prepare 在
+        # attn_backend.forward() 之前调用我们，因此 Raw -> DSV4Metadata
+        # 必须在此处完成（例如 1.6T layer 0 的 compress_ratio=128
+        # 需要 cX_compress_metadata）。
         self._maybe_upgrade_forward_metadata()
         token_to_kv_pool = forward_batch.token_to_kv_pool
         if TYPE_CHECKING:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
-        new_compressed_kv = compressor(x, forward_batch)
+        new_compressed_kv = compressor(x, forward_batch)  # [num_compressed_tokens, head_dim]
         core_metadata = self.forward_metadata.core_metadata
         out_loc = (
             core_metadata.c4_out_loc
@@ -134,41 +135,41 @@ class CompressorBackendMixin:
         if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
             token_to_kv_pool.set_extra_key_buffer_fused(
                 layer_id=layer_id,
-                loc=out_loc,
-                cache_k=new_compressed_kv,
+                loc=out_loc,                    # [num_compressed_tokens]
+                cache_k=new_compressed_kv,      # [num_compressed_tokens, head_dim]
             )
         else:
-            pack = quant_to_nope_fp8_rope_bf16_pack_triton(new_compressed_kv.bfloat16())
+            pack = quant_to_nope_fp8_rope_bf16_pack_triton(new_compressed_kv.bfloat16())  # packed uint8
             token_to_kv_pool.set_extra_key_buffer(layer_id, out_loc, pack)
 
     def forward_indexer_compressor(
         self,
-        x: torch.Tensor,
+        x: torch.Tensor,            # [T, hidden_size] — 解码器层的隐藏状态
         forward_batch: ForwardBatch,
         layer_id: int,
-        compressor: Compressor,
+        compressor: Compressor,      # compress_ratio=4，is_in_indexer=True
     ) -> None:
         assert is_overlap_compress(compressor.ratio)
-        # PREP_IN_CG lazy upgrade (see forward_core_compressor for rationale).
+        # PREP_IN_CG 延迟升级（原因见 forward_core_compressor）。
         self._maybe_upgrade_forward_metadata()
         token_to_kv_pool = forward_batch.token_to_kv_pool
         if TYPE_CHECKING:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
-        new_compressed_kv = compressor(x, forward_batch)
+        new_compressed_kv = compressor(x, forward_batch)  # [num_compressed_tokens, head_dim]
         if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
             token_to_kv_pool.set_index_k_fused(
                 layer_id=layer_id,
-                loc=self.forward_metadata.core_metadata.c4_out_loc,
-                cache_k=new_compressed_kv,
+                loc=self.forward_metadata.core_metadata.c4_out_loc,  # [num_compressed_tokens]
+                cache_k=new_compressed_kv,      # [num_compressed_tokens, head_dim]
             )
         else:
             new_compressed_kv_fp8, new_compressed_kv_scale = act_quant(
-                new_compressed_kv
-            )
+                new_compressed_kv               # [num_compressed_tokens, head_dim]
+            )                                   # fp8: [num_compressed_tokens, head_dim], scale: [num_compressed_tokens, head_dim/128]
             token_to_kv_pool.set_index_k_scale_buffer(
                 layer_id=layer_id,
-                loc=self.forward_metadata.core_metadata.c4_out_loc,
+                loc=self.forward_metadata.core_metadata.c4_out_loc,  # [num_compressed_tokens]
                 index_k=new_compressed_kv_fp8,
                 index_k_scale=new_compressed_kv_scale,
             )
@@ -208,15 +209,15 @@ def create_paged_compressor_data(
     *,
     is_prefill: bool,
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
-    req_to_token: torch.Tensor,
-    req_pool_indices: torch.Tensor,
-    seq_lens: torch.Tensor,
-    extend_lens: Optional[torch.Tensor] = None,
+    req_to_token: torch.Tensor,       # [max_num_reqs, max_context_len]
+    req_pool_indices: torch.Tensor,    # [batch_size]
+    seq_lens: torch.Tensor,           # [batch_size]
+    extend_lens: Optional[torch.Tensor] = None,   # [batch_size]（仅 prefill）
     seq_lens_cpu: Optional[List[int]] = None,
     extend_lens_cpu: Optional[List[int]] = None,
     use_prefill_cuda_graph: bool = False,
     num_q_tokens: Optional[int] = None,
-) -> FusedCompressMetadata:
+) -> FusedCompressMetadata:           # (write_loc, extra_data, plan)
     swa_page_size = token_to_kv_pool.swa_page_size
     ring_size = token_to_kv_pool.get_ring_size(compress_ratio=compress_ratio)
     # assert ring_size % compress_ratio == 0
@@ -224,19 +225,19 @@ def create_paged_compressor_data(
     def clip_down(positions: torch.Tensor) -> torch.Tensor:
         return positions // compress_ratio * compress_ratio
 
-    def get_raw_loc(positions: torch.Tensor) -> torch.Tensor:
+    def get_raw_loc(positions: torch.Tensor) -> torch.Tensor:  # [batch_size] → [batch_size] (int32)
         positions = positions.masked_fill(positions < 0, 0)
-        loc = req_to_token[req_pool_indices, positions]
-        swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(loc)
-        swa_pages = swa_loc // swa_page_size
-        state_loc = swa_pages * ring_size + swa_loc % ring_size
-        return (state_loc // compress_ratio).to(torch.int32)
+        loc = req_to_token[req_pool_indices, positions]         # [batch_size]
+        swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(loc)  # [batch_size]
+        swa_pages = swa_loc // swa_page_size                    # [batch_size]
+        state_loc = swa_pages * ring_size + swa_loc % ring_size # [batch_size]
+        return (state_loc // compress_ratio).to(torch.int32)    # [batch_size] — 压缩槽位索引
 
     is_overlap = is_overlap_compress(compress_ratio)
 
     if is_prefill:
         assert extend_lens is not None
-        write_loc, extra_data = triton_create_paged_compress_data(
+        write_loc, extra_data = triton_create_paged_compress_data(  # write_loc: [num_compressed_slots]，extra_data: 可选的重叠位置
             compress_ratio=compress_ratio,
             is_overlap=is_overlap,
             swa_page_size=swa_page_size,
@@ -270,11 +271,11 @@ def create_paged_compressor_data(
             **plan_kwargs,
         )
     else:
-        write_positions = clip_down(seq_lens - 1)
-        write_loc = get_raw_loc(write_positions)
+        write_positions = clip_down(seq_lens - 1)              # [batch_size]
+        write_loc = get_raw_loc(write_positions)               # [batch_size] (int32)
         if is_overlap:
-            write_overlap_loc = get_raw_loc(write_positions - compress_ratio)
-            extra_data = write_overlap_loc.view(-1, 1)
+            write_overlap_loc = get_raw_loc(write_positions - compress_ratio)  # [batch_size]
+            extra_data = write_overlap_loc.view(-1, 1)         # [batch_size, 1]
         else:
             extra_data = None
         plan = CompressorDecodePlan(compress_ratio, seq_lens.to(torch.int32))
@@ -283,6 +284,14 @@ def create_paged_compressor_data(
 
 
 class Compressor(nn.Module):
+    """DeepSeek V4 NSA（原生稀疏注意力）的 KV 压缩器。
+
+    使用学习的评分 + APE（绝对位置编码）将 ratio 个 token 的 KV 压缩为 1 个压缩 token。
+    支持两种模式：
+      - c4（CSA，压缩滑动注意力）：overlap=True，coff=2
+      - c128（HCA，重度压缩注意力）：overlap=False，coff=1
+    """
+
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -302,14 +311,19 @@ class Compressor(nn.Module):
         self.rope_head_dim = getattr(config, "qk_rope_head_dim", 64)
         assert compress_ratio != 0, "compress_ratio should not be 0"
         self.ratio = compress_ratio
-        self.overlap = self.ratio == 4
+        self.overlap = self.ratio == 4   # c4 uses overlapping windows
         self.rotate = rotate
-        coff = 1 + self.overlap
+        coff = 1 + self.overlap          # coff=2 for c4 (overlap), coff=1 for c128
 
+        # APE：绝对位置编码，形状 [ratio, coff*head_dim]
+        # c4: [4, 2*head_dim]，c128: [128, head_dim]
         self.ape = nn.Parameter(
             torch.empty(self.ratio, coff * self.head_dim, dtype=torch.float32)
         )
         wkv_gate_dtype = torch.bfloat16
+        # wkv_gate：将隐藏状态投影到 KV + score 对
+        # c4:  hidden → 4*head_dim  (2*coff*head_dim = 2*2*head_dim)
+        # c128: hidden → 2*head_dim (2*coff*head_dim = 2*1*head_dim)
         self.wkv_gate = ReplicatedLinear(
             self.dim,
             2 * coff * self.head_dim,
@@ -330,11 +344,13 @@ class Compressor(nn.Module):
         self.ape_converted = True
 
         if self.overlap:
-            ape = torch.chunk(self.ape.data, 2, dim=-1)
-            ape = torch.cat([ape[0], ape[1]], dim=0)
-            self.ape.data.copy_(ape.view(self.ratio, -1))
+            # c4 overlap: 将 APE 从 [4, 2*head_dim] → 拆分 → 拼接 → [4, 2*head_dim]
+            # 从交错布局 [kv0, kv1] 重排为连续布局 [k0,k1,v0,v1]
+            ape = torch.chunk(self.ape.data, 2, dim=-1)  # each: [4, head_dim]
+            ape = torch.cat([ape[0], ape[1]], dim=0)       # [8, head_dim]
+            self.ape.data.copy_(ape.view(self.ratio, -1))   # [4, 2*head_dim]
 
-    # NOTE: used by v2 compressor backend
+    # 注意：供 v2 compressor backend 使用
     def get_state_pool(self, forward_batch: ForwardBatch) -> CompressStatePool:
         token_to_kv_pool = forward_batch.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
@@ -347,9 +363,16 @@ class Compressor(nn.Module):
 
         return ret
 
-    # NOTE: used by v2 compressor backend
+    # 注意：供 v2 compressor backend 使用
     def compute_kv_score(self, x: torch.Tensor, forward_batch: ForwardBatch):
-        kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
+        """通过 wkv_gate 将隐藏状态投影到 (KV, score) 对。
+
+        返回：
+            [T, 2*coff*head_dim] — 拼接的 KV 和 score 特征。
+              c4:   [T, 4*head_dim]  (coff=2：2 个重叠窗口的 KV + 各自的 score)
+              c128: [T, 2*head_dim]  (coff=1：单个窗口的 KV + score)
+        """
+        kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)  # [T, 2*coff*head_dim]
         if nsa_use_prefill_cp(forward_batch):
             kv_score = cp_all_gather_rerange_output(
                 kv_score,
@@ -357,24 +380,29 @@ class Compressor(nn.Module):
                 forward_batch,
                 torch.cuda.current_stream(),
             )
-        return kv_score
+        return kv_score                                         # [T, 2*coff*head_dim]
 
     def forward(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
+        """完整压缩流程：score → compress → norm+rope。
+
+        返回：
+            [num_compressed_tokens, head_dim] — 经 norm+rope 后的压缩 KV。
+        """
         if forward_batch.forward_mode.is_idle():
             assert x.shape[0] == 0
-            return x.new_empty(0, self.head_dim)
+            return x.new_empty(0, self.head_dim)               # [0, head_dim]
 
-        kv_score = self.compute_kv_score(x, forward_batch)
+        kv_score = self.compute_kv_score(x, forward_batch)     # [T, 2*coff*head_dim]
 
         backend = forward_batch.attn_backend
         if TYPE_CHECKING:
             assert isinstance(backend, DeepseekV4AttnBackend)
         kv_score_buffer = self.get_state_pool(forward_batch)
-        kv_score_buffer = kv_score_buffer.kv_score_buffer.kv_score
+        kv_score_buffer = kv_score_buffer.kv_score_buffer.kv_score  # [pool_size, 2*(1+overlap)*head_dim]
         return backend.forward_compress(
             kv_score_buffer=kv_score_buffer,
-            kv_score_input=kv_score,
-            ape=self.ape.view(-1, self.head_dim),
+            kv_score_input=kv_score,                            # [T, 2*coff*head_dim]
+            ape=self.ape.view(-1, self.head_dim),              # [ratio*coff, head_dim]
             head_dim=self.head_dim,
             norm=self.norm,
             freqs_cis_cache=self.freqs_cis,
@@ -382,4 +410,4 @@ class Compressor(nn.Module):
             compress_ratio=self.ratio,
             forward_batch=forward_batch,
             is_paged=True,
-        )
+        )                                                       # [num_compressed_tokens, head_dim]
