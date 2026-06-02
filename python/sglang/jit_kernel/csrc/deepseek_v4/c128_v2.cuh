@@ -157,6 +157,7 @@ SGL_DEVICE void c128_forward(
 #pragma unroll
   for (int32_t i = 0; i < kTileElements; ++i) {
     for (int32_t j = 0; j < kElementsPerWarp; ++j) {
+      // 顺便转置
       score_fp32[i][j] = cast<float>(score[j][i]) + cast<float>(bias[j][i]);
     }
   }
