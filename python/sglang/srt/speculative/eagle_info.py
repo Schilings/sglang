@@ -124,6 +124,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         if batch.forward_mode.is_idle():
             return
+# 请求数相同
 
         batch.input_ids = self.draft_token
         maybe_detect_oob(
@@ -777,6 +778,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         if self.future_indices is not None:
+            # future_indices 用于 overlap模式
             self.future_indices = self.future_indices[new_indices]
             return
 
@@ -806,6 +808,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
 
     def merge_batch(self, spec_info: "EagleDraftInput"):
         if self.future_indices is not None:
+            # future_indices 用于 overlap模式
             assert spec_info.future_indices is not None
             self.future_indices = torch.cat(
                 [self.future_indices, spec_info.future_indices]

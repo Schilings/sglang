@@ -175,6 +175,9 @@ class FlashAttentionBackend(AttentionBackend):
                 flash_attn_with_kvcache,
                 get_scheduler_metadata,
             )
+# 好像在最下面才分页啊
+# 但是这里页表，没有按照page size分页啊
+# 编辑页表
 
             self._get_scheduler_metadata = get_scheduler_metadata
         elif self.fa_impl_ver == 4:
@@ -356,15 +359,20 @@ class FlashAttentionBackend(AttentionBackend):
                 # Normal Decode
                 metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
                 metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+                # decode bacth请求query长度全为 1
                 metadata.cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
                 )
+                # 好像在最下面才分页啊
+                # 但是这里页表，没有按照page size分页啊
+                # 编辑页表
                 metadata.cu_seqlens_k = torch.nn.functional.pad(
                     torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
                 )
                 metadata.page_table = self.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
                 ]
+                # 如果设置了attention_chunk_size，就会初始化local_attn_metadata
                 # Precompute FA3 scheduler metadata to avoid per-layer
                 # prepare_varlen_num_blocks kernel calls
                 metadata.scheduler_metadata = self._compute_scheduler_metadata(
@@ -506,6 +514,7 @@ class FlashAttentionBackend(AttentionBackend):
             include_draft_extend_v2=True
         ):
             metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
+            # k的长度是按照seqlen来算
             metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
             metadata.cu_seqlens_k = torch.nn.functional.pad(
                 torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0)
@@ -533,9 +542,11 @@ class FlashAttentionBackend(AttentionBackend):
                 forward_batch.req_pool_indices, : metadata.max_seq_len_k
             ]
 
+            # 如果有prefix
             if any(
                 forward_batch.extend_prefix_lens_cpu
             ) or forward_batch.forward_mode.is_draft_extend(include_v2=True):
+                # 如果有prefix，那么query的长度就是extend_seq_lens
                 extend_seq_lens = forward_batch.extend_seq_lens
                 metadata.max_seq_len_q = max(forward_batch.extend_seq_lens_cpu)
                 metadata.cu_seqlens_q = torch.nn.functional.pad(
@@ -546,6 +557,7 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
 
             # Setup local attention if enabled
+            # 如果设置了attention_chunk_size，就会初始化local_attn_metadata
             if forward_batch.forward_mode == ForwardMode.EXTEND:
                 self._maybe_init_local_attn_metadata(forward_batch, metadata, device)
 
@@ -590,6 +602,7 @@ class FlashAttentionBackend(AttentionBackend):
             )
 
         # Convert the page table to a strided format which is needed by FA3 API
+        # 将页面表转换为FA3 API所需的跨距格式
         if self.page_size > 1:
             self.strided_indices = torch.arange(
                 0, metadata.page_table.shape[1], self.page_size, device=self.device
@@ -600,6 +613,7 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.swa_page_table[:, self.strided_indices] // self.page_size
                 )
 
+            # kv indices转成page indices
             metadata.page_table = (
                 metadata.page_table[:, self.strided_indices] // self.page_size
             )
@@ -701,9 +715,11 @@ class FlashAttentionBackend(AttentionBackend):
         # Calculate window size (can be moved to metadata if layer properties don't change)
         # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
         # here is two side inclusive
+        # 如果这一层的Attention是 滑动窗口Attention，那么就要考虑窗口大小
         is_swa_layer = (
             layer.sliding_window_size is not None and layer.sliding_window_size > -1
         )
+        # 考虑窗口大小
         window_size = (layer.sliding_window_size, 0) if is_swa_layer else (-1, -1)
         k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
@@ -1126,12 +1142,14 @@ class FlashAttentionBackend(AttentionBackend):
     ) -> torch.Tensor:
         if k is not None:
             assert v is not None
+            # 先将kv保存到kv pool中
             if save_kv_cache:
                 cache_loc = (
                     forward_batch.out_cache_loc
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
+                # set_kv_buffer函数就是保存kv
                 if not self.use_mla:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale

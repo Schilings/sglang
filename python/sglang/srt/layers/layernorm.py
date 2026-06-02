@@ -243,6 +243,7 @@ class RMSNorm(MultiPlatformOp):
         if needs_reshape:
             original_shape = x.shape
             x = x.contiguous().reshape(-1, original_shape[-1])
+        # 显式指定var_hidden_size，那么只能native
         if self.variance_size_override is not None:
             return self.forward_native(x, residual, post_residual_addition)
         if is_batch_invariant_mode_enabled():
@@ -274,6 +275,7 @@ class RMSNorm(MultiPlatformOp):
             if needs_reshape:
                 out = out.reshape(original_shape)
             return out
+        # residual需要fuse到算子内
         if residual is not None:
             if self.cast_x_before_out_mul:
                 if (
@@ -304,6 +306,7 @@ class RMSNorm(MultiPlatformOp):
                 residual = residual + post_residual_addition
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
             return x, residual
+        # 没有residual，直接调用norm算子
         out = rmsnorm(x, self.weight.data, self.variance_epsilon)
         if needs_reshape:
             out = out.reshape(original_shape)
@@ -419,11 +422,13 @@ class RMSNorm(MultiPlatformOp):
         if not x.is_contiguous():
             x = x.contiguous()
         orig_dtype = self.override_orig_dtype or x.dtype
+        # 加法用fp32来进行
         x = x.to(torch.float32)
         if residual is not None:
             x = x + residual.to(torch.float32)
             if post_residual_addition is not None:
                 x = x + post_residual_addition.to(torch.float32)
+            # 如果residual需要fp32，那么就不用转回原本dtype
             if self.fp32_residual:
                 residual = x.clone()
             else:
@@ -450,6 +455,7 @@ class RMSNorm(MultiPlatformOp):
         variance = x_var.pow(2).mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.variance_epsilon)
 
+        # 现在x是fp32，如果weight不是fp32，那么x需要从fp32转回原本的dtype
         if self.cast_x_before_out_mul:
             x = self.weight * x.to(orig_dtype)
         else:

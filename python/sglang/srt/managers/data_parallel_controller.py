@@ -149,7 +149,9 @@ class DataParallelController:
         # Dispatch method
         self.round_robin_counter = 0
         dispatch_lookup = {
+            # 简单轮询
             LoadBalanceMethod.ROUND_ROBIN: self.round_robin_scheduler,
+            # PD分离的D端有简单轮询，其余暂未实现，回退简单轮询
             LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,
             LoadBalanceMethod.TOTAL_REQUESTS: self.total_requests_scheduler,
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
@@ -173,6 +175,7 @@ class DataParallelController:
         self.env_lock = threading.Lock()
 
         # Launch data parallel workers
+        # 所有进程
         self.scheduler_procs = []
         self.workers: List[zmq.Socket] = [None] * server_args.dp_size
         self.status: List[bool] = [True] * server_args.dp_size
@@ -229,6 +232,8 @@ class DataParallelController:
         now = time.perf_counter()
         if now - self._last_refresh_time < 0.02:
             return
+        # 关键在于队列怎么更新的
+        # 每次都弹出队列头：一个dp rank
         self._last_refresh_time = now
         self.dp_budget.update_budget(self.load_snapshot_reader.read_all())
 
@@ -262,10 +267,13 @@ class DataParallelController:
                 (BatchTokenizedGenerateReqInput, self.dispatch_batch_generate),
                 (BatchTokenizedEmbeddingReqInput, self.dispatch_batch_embedding),
                 (BlockReqInput, self.send_to_all_workers),
+                # 最短请求队列策略，定期收集 Scheduler 进程未完成的请求个数，作为 Scheduler 进程的负载，将新请求分发给低负载的 Scheduler。
+                # WatchLoadUpdateReq -> 更新 dp_budget
                 (ProfileReq, self.send_to_all_workers),
                 (ActiveRanksOutput, self.update_active_ranks),
             ]
         )
+        # 如果没有匹配的请求类型，则回退为 send_control_message：分发给前control_message_step个DP rank
         self._request_dispatcher.add_fallback_fn(self.send_control_message)
 
     def launch_dp_schedulers(self, server_args, port_args):
@@ -457,6 +465,7 @@ class DataParallelController:
         worker_ports = []
         if server_args.node_rank == 0:
             for dp_rank in range(server_args.dp_size):
+                # 预先创建dp_size个端口和socket
                 worker_port, worker_socket = get_zmq_socket_on_host(
                     self.context, zmq.PUSH, host=bind_host
                 )
@@ -583,6 +592,7 @@ class DataParallelController:
                         numa_utils.configure_subprocess(server_args, gpu_id),
                     ):
                         proc.start()
+                # 所有Scheduler进程启动后，会通过Pipe将模型加载信息返回给Controller进程，
                 self.scheduler_procs.append(proc)
                 scheduler_pipe_readers.append(reader)
 
@@ -595,6 +605,7 @@ class DataParallelController:
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
 
     def maybe_external_dp_rank_routing(self, req: Req):
+        # 如果指定 DP rank，只有通过 SDK 启动推理进程的时候才能使用，通常用于测试、调试。
         if req.routed_dp_rank is not None:
             logger.debug(f"Direct routing to DP rank {req.routed_dp_rank}")
             self.workers[req.routed_dp_rank].send_pyobj(req)
@@ -602,6 +613,7 @@ class DataParallelController:
         return False
 
     def round_robin_scheduler(self, req: Req):
+        # 如果指定 DP rank，只有通过 SDK 启动推理进程的时候才能使用，通常用于测试、调试。
         if self.maybe_external_dp_rank_routing(req):
             return
 
@@ -648,9 +660,12 @@ class DataParallelController:
             while True:
                 self.soft_watchdog.feed()
                 try:
+                    # 请求首先从 tokenizer 传给 Controller
                     recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
                 except zmq.ZMQError:
                     break
+                # 最后，每个 DP rank 内再通过 pytorch 的广播组件将请求从Attn TP rank 0扩散到所有Attn TP rank。
+                # 然后再由 Controller 分发给各个 DP rank 里的Attn TP rank 0，这两步通信都通过 ZMQ 实现。
                 self._request_dispatcher(recv_req)
 
 

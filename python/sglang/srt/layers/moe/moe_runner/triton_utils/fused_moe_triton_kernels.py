@@ -184,11 +184,14 @@ def fused_moe_kernel_gptq_awq(
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
     if pid_m * BLOCK_SIZE_M >= num_tokens_post_padded:
         return
+    # 一次取出一个Block的token
+    # 按照expert排序token，按block size填充，记录token的索引
     offs_token_id = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M).to(tl.int64)
     offs_token = tl.load(sorted_token_ids_ptr + offs_token_id)
     token_mask = offs_token < num_valid_tokens
 
     off_experts = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
+    # 跳过不在本地的 expert
     if filter_expert and off_experts == -1:
         # -----------------------------------------------------------
         # Write back zeros to the output when the expert is not
@@ -208,6 +211,7 @@ def fused_moe_kernel_gptq_awq(
         return
 
     offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
+    # A[:] @ B[:]分tile进行
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = a_ptr + (
         offs_token[:, None] // top_k * stride_am + offs_k[None, :] * stride_ak
@@ -436,6 +440,7 @@ def fused_moe_kernel(
     offs_token = offs_token.to(tl.int64)
     token_mask = offs_token < num_valid_tokens
 
+    # 这个Block的token都属于一个expert
     off_experts_i32 = tl.load(expert_ids_ptr + pid_m)
     off_experts = off_experts_i32.to(tl.int64)
 
@@ -526,6 +531,7 @@ def fused_moe_kernel(
     else:
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
+    # A[:] @ B[:]分tile进行
     for k_start in range(0, K, BLOCK_SIZE_K):
         # Load the next block of A and B, generate a mask by checking the
         # K dimension.
@@ -788,6 +794,7 @@ def invoke_fused_moe_kernel(
         assert B_scale is None
 
     grid = lambda META: (
+        # 一个BLOCK_SIZE_M对应一个Expert
         triton.cdiv(sorted_token_ids.shape[0], META["BLOCK_SIZE_M"])
         * triton.cdiv(B.shape[1], META["BLOCK_SIZE_N"]),
     )

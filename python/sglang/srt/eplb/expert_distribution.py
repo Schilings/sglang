@@ -50,6 +50,9 @@ _OutputMode = Literal["file", "object"]
 
 @dataclass
 class ExpertDistributionMetrics:
+    # 计算得到每一层的gpu利用率：mean(n个gpu的token数)/max(n个gpu的token数)
+    # 现在已经知道每个rank gpu到底总共分发到了多少 token
+    # 每一层的gpu利用率
     eplb_balancedness: torch.Tensor
 
     def copy_to_cpu(self):
@@ -141,6 +144,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         rank: int,
     ):
         self._server_args = server_args
+        # 几个真实专家、几个冗余专家、每rank几个专家
         self._expert_location_metadata = expert_location_metadata
 
         self._recording = False
@@ -148,9 +152,13 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._current_forward_pass_id = Withable()
         self._current_layer_idx = Withable()
         self._current_debug_name = Withable()
+        # 对应收集不同指标
+        # 不同模式：stat、stat_approx、per_pass、per_token
+        #  accumulator收集指标
         self._accumulator = _Accumulator.init_new(
             server_args, expert_location_metadata, rank
         )
+        # 一种gather收集一类指标，虽然但是，应该一般只有一个gather
         self._single_pass_gatherers = {
             k: _SinglePassGatherer.init_new(server_args, expert_location_metadata, rank)
             for k in self._accumulator.get_single_pass_gatherer_keys()
@@ -193,13 +201,16 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             return
         for gatherer_key, gatherer in self._single_pass_gatherers.items():
             gatherer.reset()
+            # 不同gather收集不同指标
             gatherer.on_forward_pass_start(forward_batch)
 
     def _on_forward_pass_end(self, forward_pass_id: int, outputs: Dict[str, Any]):
         if not self._recording:
             return
         for gatherer_key, gatherer in self._single_pass_gatherers.items():
+            # 不同gather收集不同指标
             single_pass_data = gatherer.collect()
+            # 将数据指标写入 accumulator
             self._accumulator.append(
                 forward_pass_id, gatherer_key, single_pass_data, outputs
             )
@@ -375,6 +386,7 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
     ):
         super().__init__(expert_location_metadata, rank)
         self._metadata: Optional[Dict[str, Any]] = None
+        # 记录所有层 前server_args.chunked_prefill_size * 8个token 的topk_ids
         self._topk_ids_of_layer = torch.zeros(
             (
                 expert_location_metadata.num_layers,
@@ -403,6 +415,7 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
         )
 
     def on_select_experts(self, layer_idx: int, topk_ids: torch.Tensor):
+        # 记录所有层 前server_args.chunked_prefill_size * 8个token 的topk_ids
         self._topk_ids_of_layer[layer_idx, : topk_ids.shape[0], : topk_ids.shape[1]] = (
             topk_ids
         )
@@ -436,6 +449,7 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
     def collect(self) -> Dict:
         num_tokens = len(self._metadata["input_ids"])
 
+        # 计算每一层每一个专家被分发到的token数
         global_physical_count = _convert_per_token_to_global_physical_count(
             num_tokens,
             num_layers=self._expert_location_metadata.num_layers,
@@ -445,8 +459,10 @@ class _DetailSinglePassGatherer(_SinglePassGatherer):
 
         return dict(
             **self._metadata,
+            # 记录所有层 前server_args.chunked_prefill_size * 8个token 的topk_ids
             topk_ids_of_layer=self._topk_ids_of_layer[:, :num_tokens, :].clone().cpu(),
             misc_objects=self._misc_objects,
+            # 计算每一层每一个专家被分发到的token数
             global_physical_count=global_physical_count,
         )
 
@@ -487,12 +503,15 @@ class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
         device = get_device()
 
         self._enable_global_physical_experts = enable_global_physical_experts
+        # 本地记录的每一层每一个专家（可能记录全局专家、可能只记录本地专家） 的 指标数（可能是token数，也可能是其他？）
         self._data = torch.zeros(
             (
                 self._expert_location_metadata.num_layers,
                 (
+                    # 记录所有专家的
                     self._expert_location_metadata.num_physical_experts
                     if enable_global_physical_experts
+                    # 或者 只记录本地专家的
                     else self._expert_location_metadata.num_local_physical_experts
                 ),
             ),
@@ -504,14 +523,19 @@ class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
         self._data[...] = 0
 
     def collect(self) -> Dict:
+        # 如果本地记录了全局专家的
         if self._enable_global_physical_experts:
             global_physical_count = self._data
         else:
             # Can optimize if bottleneck
+            # 如果只记录了本地专家，数据就要填充了 记录全局专家 那样的形状
             global_physical_count = _convert_local_to_global_physical_count(
+                # 本地记录的每一层每一个专家（可能记录全局专家、可能只记录本地专家） 的 指标数（可能是token数，也可能是其他？）
                 self._data,
                 rank=self._rank,
+                # 本地专家数
                 num_local_physical_experts=self._expert_location_metadata.num_local_physical_experts,
+                # 全局专家数
                 num_physical_experts=self._expert_location_metadata.num_physical_experts,
             )
 
@@ -587,6 +611,7 @@ def _convert_per_token_to_global_physical_count(
     index = topk_ids_layer_major.masked_fill(~mask, 0).long()
     src = mask.int()
 
+    # 计算每一层每一个专家被分发到的token数
     ans = torch.zeros(
         (num_layers, num_physical_experts),
         dtype=_topk_ids_of_layer.dtype,
@@ -597,6 +622,7 @@ def _convert_per_token_to_global_physical_count(
 
 
 def _convert_local_to_global_physical_count(
+    # 本地记录的每一层每一个专家（可能记录全局专家、可能只记录本地专家） 的 指标数（可能是token数，也可能是其他？）
     local_physical_count: torch.Tensor,
     rank: int,
     num_local_physical_experts: int,
@@ -678,6 +704,8 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
 
         if self._enable:
             self.window_sizes = [10, 100, 1000]
+            # 只计算窗口内的指标
+            # 双向队列，因为设置了窗口大小
             self._history = _DequeCollection(maxlens=self.window_sizes)
             self._rank = torch.distributed.get_rank()
             expert_dispatch_cls = resolve_collector_class(
@@ -700,6 +728,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         super().append(forward_pass_id, gatherer_key, single_pass_data, outputs)
         if self._enable:
             return self._append_utilization_rate(
+                # global_physical_count ->  本地记录的每一层每一个专家（可能记录全局专家、可能只记录本地专家） 的 指标数（可能是token数，也可能是其他？）
                 forward_pass_id, single_pass_data["global_physical_count"], outputs
             )
 
@@ -711,22 +740,32 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
     def _append_utilization_rate(
         self,
         forward_pass_id: int,
+        # 本地记录的每一层每一个专家（可能记录全局专家、可能只记录本地专家） 的 指标数（可能是token数，也可能是其他？）
         single_pass_global_physical_count: torch.Tensor,
         outputs: Dict[str, Any],
     ):
+        # 细粒度从 专家 到 gpu rank
+        # 计算每一层每个rank（可能记录全局专家、可能只记录本地专家）的 指标数（可能是token数，也可能是其他？）
         gpu_physical_count = compute_gpu_physical_count(
+            # 本地记录的每一层每一个专家（可能记录全局专家、可能只记录本地专家） 的 指标数（可能是token数，也可能是其他？）
             single_pass_global_physical_count,
             num_gpu=self._expert_location_metadata.ep_size,
         )
         gpu_physical_count = gpu_physical_count.to(self._server_args.device)
+        # 现在要每个rank求sum，才能知道一个gpu到底分发到了多少 token
+        # 例如已经计算出该rank收到的token，每一层，多少分发到了gpu0，gpu1，gpu2，gpu3
         torch.distributed.reduce(
             gpu_physical_count, dst=0, op=torch.distributed.ReduceOp.SUM
         )
 
+        # 最后只有rank 0负责收集，前面计算还是需要每个rank参与的
         if self._rank == 0:
             self._handle_metric_eplb_heatmap(gpu_physical_count)
 
+            #每一层的gpu利用率
             utilization_rate_gpu = torch.mean(
+                # 现在计算每一层的gpu利用率：mean(n个gpu的token数)/max(n个gpu的token数), 即在该层中
+                # 现在已经知道每个rank gpu到底总共分发到了多少 token
                 compute_utilization_rate(gpu_physical_count)
             )
             if envs.SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC.get():
@@ -737,6 +776,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
             else:
                 # TODO maybe refactor this part to also avoid a `.item()` gpu->cpu sync
                 utilization_rate_cpu = utilization_rate_gpu.item()
+                # 每一层的gpu利用率
                 self._history.append(utilization_rate_cpu)
 
                 gpu_physical_count_sum = gpu_physical_count.sum().item()
@@ -1034,6 +1074,7 @@ def _convert_global_physical_count_to_logical_count(
 
 
 def compute_gpu_physical_count(
+    # 本地记录的每一层每一个专家（可能记录全局专家、可能只记录本地专家） 的 指标数（可能是token数，也可能是其他？）
     physical_count_of_whatever: torch.Tensor,  # (..., num_layer, num_physical_expert)
     num_gpu: int,
 ):
@@ -1047,6 +1088,7 @@ def compute_gpu_physical_count(
 
 
 def compute_utilization_rate(
+    # 现在已经知道每个rankgpu到底总共分发到了多少 token
     gpu_physical_count_of_batch: torch.Tensor,  # (..., num_layer, num_gpu)
 ):
     """output: utilization_rate (..., num_layer)"""

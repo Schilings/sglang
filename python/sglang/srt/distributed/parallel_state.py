@@ -281,6 +281,7 @@ class GroupCoordinator:
             self.device = torch.device("cpu")
         self.device_module = torch.get_device_module(self.device)
 
+        # 建立nccl group
         for ranks in group_ranks:
             active_ranks = torch.ones(len(ranks), dtype=torch.int32, device=self.device)
             active_ranks_cpu = torch.ones(len(ranks), dtype=torch.int32)
@@ -2401,6 +2402,8 @@ def monkey_patch_vllm_parallel_state(reverse: bool = False):
     except ImportError:
         return
 
+    # 事后恢复
+    # 临时修改vllm_parrlel_state的get_pp_group、get_tp_group、get_world_group函数
     global vllm_get_pp_group, vllm_get_tp_group, vllm_get_world_group
     if vllm_get_pp_group is None:
         vllm_get_pp_group = vllm_parallel_state.get_pp_group

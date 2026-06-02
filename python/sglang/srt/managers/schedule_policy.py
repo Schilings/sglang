@@ -181,6 +181,9 @@ class SchedulePolicy:
                 )
             elif policy == CacheAwarePolicy.DFS_WEIGHT:
                 SchedulePolicy._sort_by_dfs_weight(waiting_queue, self.tree_cache)
+            # 否则提前终止循环（因为后续请求优先级更低）
+            # budget桶容量不够容纳这个请求
+            # 2. 如果开启了chunked prefill，即开启enable_mixed_chunk时，会设置chunked_prefill_size，这个才是budget桶大小！！
             else:
                 raise ValueError(f"Unknown CacheAware Policy: {policy=}")
         else:
@@ -263,6 +266,7 @@ class SchedulePolicy:
                 ):
                     temporary_deprioritized.add(r.rid)
                 else:
+                    # 对这个“匹配链”的所有node添加引用计数
                     # Insert with a dummy key
                     self.waiting_queue_radix_tree.insert(
                         InsertParams(
@@ -433,14 +437,18 @@ class PrefillAdder:
         if self.dllm_config is not None:
             self._init_dllm_meta(dllm_config)
 
+        # 如果有budget
         if self.rem_chunk_tokens is not None:
             self.rem_chunk_tokens -= num_mixed_decode_tokens
         self.rem_total_token_offset = num_mixed_decode_tokens
         self.cur_rem_token_offset = num_mixed_decode_tokens
 
         self.req_states = None
+        # 当前调度的请求
         self.can_run_list = []
+        # 当前被抢占的请求
         self.preempt_list = []
+        # 当前要分块计算的请求
         self.new_chunked_req = None
         self.log_hit_tokens = 0
         self.reprocessed_log_hit_tokens = 0
@@ -498,6 +506,7 @@ class PrefillAdder:
     @property
     def rem_total_tokens(self):
         if self.is_hybrid_swa:
+            # 剩下的可用的token空间：可用空间+可被释放的空间
             available_and_evictable = (
                 self.token_to_kv_pool_allocator.full_available_size()
                 + self.tree_cache.full_evictable_size()
@@ -512,6 +521,7 @@ class PrefillAdder:
                 self.token_to_kv_pool_allocator.available_size()
                 + self.tree_cache.evictable_size()
             )
+        # 剩下的可用的token空间 - （此次调度的所有请求，可能还需要的token数的总和）
         return available_and_evictable - self.rem_total_token_offset
 
     @property
@@ -540,6 +550,7 @@ class PrefillAdder:
                 + self.tree_cache.evictable_size()
             )
 
+        # 剩下的可用的token空间 - （此次调度的所有请求，实际需要的token数的总和）
         return available_and_evictable - self.cur_rem_token_offset
 
     def _swa_budget_for_req(self, extend_input_len: int) -> int:
@@ -563,11 +574,14 @@ class PrefillAdder:
         return -(-tokens // self.page_size) * self.page_size
 
     def budget_state(self):
+        # 剩余可用token空间不足
         no_token = self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0
         if not no_token and self.is_hybrid_swa:
             no_token = self.rem_swa_tokens <= 0
         if no_token:
             return AddReqResult.NO_TOKEN
+# 超过了设置的最大token数限制，返回 OTHER
+# 到达了限制的最大token数 or budget桶容量不足
 
         if self.rem_input_tokens <= 0:
             return AddReqResult.OTHER
@@ -575,10 +589,13 @@ class PrefillAdder:
         if self.dllm_config is not None:
             if self.rem_dllm_tokens <= 0:
                 return AddReqResult.OTHER
+        #  没开启 or budget桶容量够
+        # 1. 如果开启了chunked prefill，即开启enable_mixed_chunk时，会设置chunked_prefill_size，这个才是budget桶大小！！
         else:
             if self.rem_chunk_tokens is not None and self.rem_chunk_tokens <= 0:
                 return AddReqResult.OTHER
 
+        # 还能继续尝试添加请求
         return AddReqResult.CONTINUE
 
     def _update_prefill_budget(
@@ -589,7 +606,10 @@ class PrefillAdder:
         retracted_stain: bool,
     ):
         # TODO(lsyin): check this workaround logic, which only ensures the prefill will not out of memory, and may be too conservative
+        # 向上取整为page size的倍数
+        # req.extend_input_len表示除了prefix的部分，即除了prefix的token
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
+# total直接按照最坏情况算，可能需要的token空间为：此次prefill的token数extend_input_len + 后续生成的最大token数max_new_tokens
 
         # alloc_extend reserves an extra page_size per request to make sure the budget doesn't over-commit
         page_overhead = self.page_size
@@ -607,7 +627,9 @@ class PrefillAdder:
 
         # reprocessed_log_* is a subset of log_*; metrics_reporter subtracts it
         # when computing the first-attempt prefix cache hit rate.
+        # 记录击中了多少prefix
         self.log_hit_tokens += prefix_len
+        # 记录prefill了多少token
         self.log_input_tokens += extend_input_len
         if retracted_stain:
             self.reprocessed_log_hit_tokens += prefix_len
@@ -677,6 +699,8 @@ class PrefillAdder:
         )
 
     def add_chunked_req(self, req: Req):
+        # 然后来得到 -> 还能计算多少token
+        # 比较 剩余budget桶容量 和 设置的最大token数限制容量 最小值
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
@@ -849,6 +873,8 @@ class PrefillAdder:
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
+# total_tokens 表示该请求可能需要计算的最多token数，直接考虑拉满的情况
+# req.extend_input_len表示除了prefix的部分，即除了prefix的token
 
         # Reserve page_size for page-alignment overhead. The paged allocator
         # may consume up to one extra page per request (see alloc_extend), and
@@ -862,10 +888,15 @@ class PrefillAdder:
         total_tokens = req.extend_input_len + max_new + self.page_size
 
         # adjusting the input_tokens based on host_hit_length and page_size
+        # 实际目前需要计算的token数
         real_input_tokens = req.extend_input_len - req.host_hit_length
+        # 向上取整为page size的倍数
         real_input_tokens = self.ceil_paged_tokens(real_input_tokens)
+        # 匹配到的prefix长度
         prefix_len = len(req.prefix_indices)
 
+        # 剩余的token空间不足以容纳该请求，无法添加该请求，返回 NO_TOKEN
+        # total_tokens 表示该请求可能需要计算的最多token数，直接考虑拉满的情况
         if total_tokens >= self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
 
@@ -884,8 +915,12 @@ class PrefillAdder:
             # - if the can_run_list is empty, always accept the first prefill request
             return AddReqResult.OTHER
 
+        # 对这个“匹配链”的所有node暂时添加引用计数，防止这些node被释放，因为抢占的时候可能会释放node
+        # req.last_node记录了该请求的prefix匹配链的最后一个节点
         with self._lock_node(req.last_node):
             # self.rem_total_tokens may decrease after the lock acquisition
+            # 但是上锁暂时添加引用计数后，就不是不可删除的资源，剩余可用的token空间 发生变化
+            # 意思是：如果这个“匹配链”的某个node引用本来为0，那么是列为可删除的资源，是算在 剩余可用的token空间 内的
             if total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
 
@@ -907,7 +942,9 @@ class PrefillAdder:
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
 
+            # 向上取整为page size的倍数
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
+# 同上，上锁后，剩余可用的token空间 可能发生变化
 
             if (
                 self.rem_chunk_tokens is None
@@ -931,9 +968,11 @@ class PrefillAdder:
                 self._req_inc_lock_ref(req)
             elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill
+                # budget桶未满的时候，该请求可以完全prefill计算
                 self.can_run_list.append(req)
 
                 self._req_inc_lock_ref(req)
+                # 更新budget桶信息
                 self._update_prefill_budget(
                     prefix_len,
                     input_tokens,
@@ -945,6 +984,8 @@ class PrefillAdder:
                 )
             else:
                 # Make sure at least one page is available
+                # 截断成trunc_len
+                # 那么计算剩下的budget容量，向下取整为page size的倍数
                 trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size
 
                 if trunc_len <= 0:
@@ -969,10 +1010,12 @@ class PrefillAdder:
                     return AddReqResult.OTHER
 
                 # Chunked prefill
+                # 截断成trunc_len
                 req.set_extend_input_len(trunc_len)
                 req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
 
                 self.can_run_list.append(req)
+                # 这个是new_chunked_req
                 self.new_chunked_req = req
 
                 self._req_inc_lock_ref(req)
@@ -996,12 +1039,15 @@ class PrefillAdder:
         # Preemption runs between these two phases (inside get_new_batch_prefill),
         # so running_batch may still contain requests whose KV cache is already freed.
         # We must skip them here to avoid a double-free on release_req.
+        # 从running队列内抢占一些请求下来直至满足该req的计算
         valid_running_reqs = (
             r
             for r in self.running_batch.reqs
             if r not in self.preempt_list and not r.finished()
         )
 
+        # 其次按等待队列进入时间倒序排序（越早进入的优先级越高
+        # 首先按优先级排序（乘以-priority_sign实现升序或降序切换）
         sorted_valid_running_reqs = sorted(
             valid_running_reqs,
             key=lambda x: (
@@ -1010,45 +1056,60 @@ class PrefillAdder:
             ),
         )
 
+        # 记录被抢占的请求
         preemptible_reqs = []
+        # 计算还需要多少token空间，按照最坏情况估计，假设req生成token数拉满
         min_tokens_to_remove = (
             req.extend_input_len
             + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
             - self.rem_total_tokens
         )
+        # 遍历排序后的running请求
         for running_req in sorted_valid_running_reqs:
             # Priority difference needs to meet the threshold to be preemptible.
+            # 计算新请求与当前运行请求的优先级差值
             priority_diff = (req.priority - running_req.priority) * (-priority_sign)
 
+            # 如果优先级差超过阈值
             if priority_diff > self.priority_scheduling_preemption_threshold:
+                # 则将该请求加入可抢占列表
                 preemptible_reqs.append(running_req)
+                # 累计释放的token数量
                 min_tokens_to_remove -= self._get_running_request_total_token_offset(
                     running_req
                 )
+                # 直到满足新请求所需的最小token数
                 if min_tokens_to_remove <= 0:
                     break
             else:
                 break
 
         # Check max token count limit can be met
+        # 检查是否找到可抢占请求且token数量足够
         if len(preemptible_reqs) == 0 or min_tokens_to_remove > 0:
             return False
 
         # Preempt running requests. Release allocated resources for immediate usage.
+        # 将可抢占请求转为集合便于查找
         preemptible_reqs = set(preemptible_reqs)
         keep_indices = []
         release_counter = 0
+        # 遍历运行批次中的请求
         for i, running_req in enumerate(self.running_batch.reqs):
+            # 如果是可抢占请求
             if running_req in preemptible_reqs:
                 self.rem_total_token_offset -= (
                     self._get_running_request_total_token_offset(running_req)
                 )
                 release_counter += 1
+                # 释放符合条件的请求，重新入列的请求会被标记为is_retracted=True，即回退请求
                 self.running_batch.release_req(
                     i, len(self.running_batch.reqs) - release_counter, server_args
                 )
             else:
                 keep_indices.append(i)
+        # 过滤掉被抢占的请求，保留其他请求
         self.running_batch.filter_batch(keep_indices=keep_indices)
+        # 更新抢占列表并返回成功状态
         self.preempt_list.extend(preemptible_reqs)
         return True

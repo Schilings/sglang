@@ -339,6 +339,8 @@ def traverse_tree(
                 retrieve_next_sibling,
                 parent_pos,
             )
+# target_cache_loc记录->后面topk-1个组的这部分冗余的kv indices
+# tgt_indices —> 后面topk-1个组的这些冗余的token的kv indices
 
     dfs(0, retrieve_next_token, retrieve_next_sibling, -1)
 
@@ -445,7 +447,10 @@ def get_last_loc_large_page_size_large_top_k(
     page_size: int,
 ):
     prefix_lens = seq_lens
+    # 意思是prefix在最后一页有几个token
+    # 最后一页的最后一个token的相对位置
     last_page_lens = prefix_lens % page_size
+    # 每个top组需要多少页
     num_new_pages_per_topk = (
         last_page_lens + speculative_num_steps + page_size - 1
     ) // page_size

@@ -176,8 +176,10 @@ class MatchResult(NamedTuple):
                                 exists a mamba state.
     """
 
+    # 保存了匹配链中每个节点的value
     device_indices: torch.Tensor
     last_device_node: Any
+    # 返回匹配链中的最后一个节点
     last_host_node: Any
     best_match_node: Any
     host_hit_length: int = 0

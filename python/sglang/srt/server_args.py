@@ -883,6 +883,7 @@ class ServerArgs:
     modelexpress_config: Optional[str] = None
 
     # For PD-Multiplexing
+    # PD-Multiplexing是一种优化技术，允许在同一个GPU上同时运行模型的预填充阶段和解码阶段，以提高资源利用率和吞吐量。
     enable_pdmux: bool = False
     pdmux_config_path: Optional[str] = None
     sm_group_num: int = 8

@@ -65,6 +65,8 @@ class RadixKey:
         is_bigram: bool = False,
     ):
         # token ids sequence (raw ints in both modes)
+        # 例如: ["A", "B", "C"]
+        # 逻辑标识：从根节点到当前节点的路径所代表的 Token 序列
         self.token_ids = token_ids
         # extra key (e.g. lora_id, cache_salt)
         self.extra_key = extra_key
@@ -134,6 +136,7 @@ class RadixKey:
                 f"RadixKey operations require matching extra_key, but got "
                 f"{self.extra_key=} != {other.extra_key=}"
             )
+# 因为keys是截断为page_size的倍数的，可能还有剩余未满一页的尾部
 
     # TODO(Jialin): replace zip with numpy to skip per-element PyLong boxing
     def match(self, other: "RadixKey", page_size: int = 1) -> int:
@@ -200,11 +203,21 @@ class TreeNode:
     counter = 0
 
     def __init__(self, id: Optional[int] = None, priority: int = 0):
+        # 其中key需要截断为page_size的倍数 ----> 因此可以认为TreeNode中的key的长度全都是page_size的倍数！！！！
+        # 每个child key为 (page size个token ids)
+        # 树结构：子节点分支
         self.children = defaultdict(TreeNode)
         self.parent: TreeNode = None
+        # 例如: ["A", "B", "C"]
+        # 逻辑标识：从根节点到当前节点的路径所代表的 Token 序列
         self.key: RadixKey = None
+        # 例如: [10, 11, 12]
+        # 物理索引：从根节点到当前节点的路径所代表的 Token 序列在 token_to_kv_pool 中的物理 Slot Indices
         self.value: Optional[torch.Tensor] = None
+        # lock_ref > 0 时，该节点及其物理槽位不可被驱逐
+        # 引用计数：当前有多少个正在运行的请求在使用这个节点
         self.lock_ref = 0
+        # 驱逐策略元数据：LRU 时间戳
         self.last_access_time = time.monotonic()
         self.creation_time = time.monotonic()
 
@@ -215,11 +228,14 @@ class TreeNode:
         # store the host indices of KV cache
         self.host_value: Optional[torch.Tensor] = None
         # store hash values of each pages
+        # 每一个Page的hash值
         self.hash_value: Optional[List[str]] = None
         # priority for priority-aware eviction
+        # 优先级
         self.priority = priority
 
         self.id = TreeNode.counter if id is None else id
+        # 节点数+1
         TreeNode.counter += 1
 
     @property
@@ -268,6 +284,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         self.disable_finished_insert = params.disable_finished_insert
         self.eviction_policy = params.eviction_policy.lower()
 
+        # 事件驱动模型
         self.kv_event_queue = []
 
         if params.enable_metrics:
@@ -366,18 +383,40 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             * If the lookup ends inside a stored segment the node is split once
                 to expose a precise boundary; this structural refinement improves
                 subsequent match efficiency and does not duplicate data.
+        # 那么req_to_token_pool内记录的这个req的kv indices就要修改
+        # [req.cache_protected_len : new_prefix_len]原本这部分的kv indices已经被free，换成去复用多出来的prefix的token的kv indices
+        # 原因就是prefix变长了！！！！！
+        # 在batch.prepare_extend()就已经写在req_to_token_pool了，为什么再这里又再写一次
+        # 7. new_indices[req.cache_protected_len :]指的是该请求的extend input部分，即除了prefix的实际计算的token们的kv indices
+        # new_indices：整个req目前的token ids的indices
+        # 6. 前面插入了，现在匹配，肯定是完全匹配，这是整个req目前的token ids的indices
+        # 那么自己的kv_indices[req.cache_protected_len : new_prefix_len]这部分就不用了，直接复用多出来的prefix的token
+        # 那么这里free的范围是 [prefix_len : new_prefix_len]
+        # 且设置了req.cache_protected_len = prefix_len
+        # 其中在init_next_round_input做计算准备的时候对prefix进行了匹配了，
+        # 意思就是prefix变长了！！！！！
+        # 意思是？在上次调度的时候，刚好有请求生成的token延长了这个req的前缀？？不是没有这种可能好像
+        # 当new_prefix_len ！= prefix_len时？会有这种情况吗？
+        # 但是经过一次调度执行后，这个时候insert也会匹配prefix，此时有new_prefix_len
+        # 这里有个问题：一个req在chunked prefill前会进行prefix匹配，此时有prefix_len
         """
+        # 更新req.cache_protected_len
+        # 5. 注意这里free的范围是 [req.cache_protected_len : new_prefix_len]
+        # 4. 将这些token插入到前缀树中，最后只会插入一个Node，返回匹配的总prefix长度
         key = params.key
         key, _ = key.maybe_to_bigram_view(self.is_eagle)
 
         if self.disable or len(key) == 0:
             return self._empty_match_result
+# 当page_size大于1时，会在匹配前将长度截断为page_size的倍数
 
         key = key.page_aligned(self.page_size)
 
         if len(key) == 0:
             return self._empty_match_result
 
+        # last_node ： 返回匹配链中的最后一个节点
+        # value ： 保存了匹配链中每个节点的value
         value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
             value = torch.cat(value)
@@ -413,9 +452,11 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
     def cache_finished_req(self, req: Req, is_insert: bool = True):
         """Cache request when it finishes."""
         # In deterministic mode, disable finished request insertion to radix cache
+        # deterministic mode 不允许结束推理的请求进行insert
         if self.disable_finished_insert:
             is_insert = False
 
+        # 1. 计算需要缓存的长度
         kv_committed_len = req.pop_committed_kv_cache()
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
@@ -424,10 +465,17 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             self.token_to_kv_pool_allocator.free(kv_indices)
             return
 
+        # 2. 取出缓存的token ids
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
+        # 2. 计算完的token ids对应的kv已经存储在了kv pool中，获取其索引
+        # 3. 这些token ids对应在kv pool里面的索引
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
+# ！！！！！其中key需要截断为page_size的倍数 ----> 因此可以认为TreeNode中的key的长度全都是page_size的倍数！！！！
+# 3. 计算key和value，节点中key是token ids，value其kv值在kv pool的index
+# 其中key需要截断为page_size的倍数
+# 4. 计算key和value，节点中key是token ids，value其kv值在kv pool的index
 
         radix_key = RadixKey(
             token_ids, req.extra_key, is_bigram=self.is_eagle
@@ -462,6 +510,10 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.disable:
             return
 
+        # 因此对于chunked req，req.fill_ids只是完成prefill计算的前半部分token
+        # 截断后的fill_ids长度为prefix_len + trunc_len
+        # 对于chunked req，其fill_ids会在调度时被截断：req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
+        # 1. 计算完的token ids需要存储在前缀树中
         token_ids = req.fill_ids
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
@@ -508,12 +560,14 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         # So we introduce this `cache_protected_len` field to make sure the partial part can be freed correctly.
         req.cache_protected_len = len(new_indices)
 
+        # req的last node可能变成了另一个
         self.dec_lock_ref(req.last_node)
         self.inc_lock_ref(new_last_node)
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
         # - page_size != 1: there is a partial page at the end, keep the full kv_indices
         # - eagle case: bigram keys will only cache len - 1 kv indices
+        # 诶？怎么会有变短的情况呢？
         if len(new_indices) < len(kv_indices):
             req.prefix_indices = torch.cat(
                 [new_indices, kv_indices[len(new_indices) :]]
@@ -521,6 +575,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         else:
             req.prefix_indices = new_indices
 
+        # 如果是chunked 请求，那么该值为更新
         req.last_node = new_last_node
 
     def pretty_print(self):
@@ -535,8 +590,11 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             return EvictResult()
 
         start_time = time.perf_counter()
+        # 1. 扫描树中所有 lock_ref == 0 的叶子节点
         num_tokens = params.num_tokens
         leaves = list(self.evictable_leaves)
+        # 优先级低的排前面
+        # 2. 按照 priority/last_access_time 从旧到新排序 (LRU)
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
         ]
@@ -546,14 +604,20 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
 
+            # token对应的kv cache的存储？？
+            # 为什么insert的时候没见到token_to_kv_pool_allocator
+            # 3. 释放物理槽位并删除节点，直到凑齐足够的显存空间
             self.token_to_kv_pool_allocator.free(x.value)
             num_evicted += len(x.value)
+            # 4. 删除节点
             self._delete_leaf(x)
 
+            # 5. 如果删除节点x后，其父节点也成为叶子节点，添加到删除堆内
             if len(x.parent.children) == 0 and x.parent.lock_ref == 0:
                 new_priority = self.eviction_strategy.get_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
+            # 6. 记录删除事件
             self._record_remove_event(x)
 
         self.update_eviction_metrics(num_evicted, start_time)
@@ -563,6 +627,9 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.disable:
             return IncLockRefResult(delta=0)
 
+        # 沿着匹配链把所有node的引用都-1
+        # 沿着匹配链把所有node的引用都+1
+        # 从该节点向根节点匹配
         delta = 0
         while node != self.root_node:
             if node.lock_ref == 0:
@@ -618,24 +685,40 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
         access_time = time.monotonic()
         node.last_access_time = access_time
+# 如果不满一个page呢？
+# 虽然RadixKey可能保存了更长的token ids，但是只取 tuple(key.token_ids[:page_size]) 用于匹配
+# 如果页大小大于1，则取键中前page_size个token ID + extral_key组成元组作为普通键
 
         child_key = key.child_key(self.page_size)
 
+        # 记录匹配链 得到的 value值
         value = []
         while len(key) > 0 and child_key in node.children.keys():
+            # 匹配到子节点
             child = node.children[child_key]
             child.last_access_time = access_time
+            # 但是不代表完全匹配，一个节点是可能存很长token id的，看匹配多长的prefix
+            # 第一个page相同，就认为key相同
             prefix_len = child.key.match(key, page_size=self.page_size)
+            # 则split，然后父节点就是匹配链的最后一个节点
+            # 但是这里不是insert，将other_key继续匹配，匹配到某个节点发现要split
+            # key分为两份prefix与other_key，如果是insert，则将other_key作为父node的child
+            # 则把这个node拆分成两个prefix和suffix，作为父子关系，然后返回父node
+            # 如果该请求的token id的匹配链到这里结束，但是没有完全匹配最后一个node
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 value.append(new_node.value)
+                # 父node
                 node = new_node
                 break
             else:
                 value.append(child.value)
                 node = child
+                # 使用RadixKey在Radix树中进行查询匹配的时候，会将前面的 匹配的prefix 弹出(本质不是弹出，只是slice)，逐个node匹配
+                # RadixKey存放的是完整的序列的token ids
                 key = key[prefix_len:]
 
+                # 继续取新的page key匹配下一个node
                 if len(key):
                     child_key = key.child_key(self.page_size)
 
@@ -644,6 +727,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int):
         # new_node -> child
         # New node inherits child's priority (represents shared prefix)
+        # 切割出一个父node，将该node作为去其child
         new_node = TreeNode(priority=child.priority)
         new_node.hit_count = child.hit_count
         new_node.children = {key[split_len:].child_key(self.page_size): child}
@@ -651,6 +735,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
         new_node.value = child.value[:split_len].clone()
+        # 切割child node的key value
         child.parent = new_node
         child.key = child.key[split_len:]
         child.value = child.value[split_len:].clone()
@@ -661,6 +746,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             child.hash_value, split_len, self.page_size
         )
 
+        # 返回父node
         return new_node
 
     def _inc_hit_count(self, node: TreeNode, chunked: bool = False):
@@ -685,21 +771,33 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         access_time = time.monotonic()
         node.last_access_time = access_time
         # Update priority along the path (take max to propagate higher priority)
+        # 把匹配链的优先级都取 max
         node.priority = max(node.priority, priority)
         if len(key) == 0:
             return 0
+# 如果不满一个page呢？
+# 使用当前key的前page size个token ids进行匹配
 
         child_key = key.child_key(self.page_size)
 
+        # 记录该请求匹配到的总prefix长度
         total_prefix_length = 0
         while len(key) > 0 and child_key in node.children.keys():
+            # 匹配到子节点
             node = node.children[child_key]
             node.last_access_time = access_time
+            # 但是不代表完全匹配，一个节点是可能存很长token id的，看匹配多长的prefix
+            # 第一个page相同，就认为key相同
             prefix_len = node.key.match(key, page_size=self.page_size)
             total_prefix_length += prefix_len
+            # 使用RadixKey在Radix树中进行查询匹配的时候，会将前面的 匹配的prefix 弹出(本质不是弹出，只是slice)，逐个node匹配
+            # RadixKey存放的是完整的序列的token ids
             key = key[prefix_len:]
             value = value[prefix_len:]
 
+            # key分为两份prefix与other_key，将other_key作为父node的child
+            # 则把这个node拆分成两个prefix和suffix，作为父子关系，然后返回父node
+            # 如果该请求的token id的匹配链到这里结束，但是没有完全匹配最后一个node
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
                 new_node.priority = max(new_node.priority, priority)
@@ -708,9 +806,11 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             else:
                 node.priority = max(node.priority, priority)
                 self._inc_hit_count(node, chunked)
+            # 继续取新的page key匹配下一个node
             if len(key):
                 child_key = key.child_key(self.page_size)
 
+        # 如果other_key不为空，将other_key作为父node的child
         if len(key):
             new_node = TreeNode(priority=priority)
             new_node.parent = node
@@ -722,7 +822,10 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             self._update_leaf_status(node)
             self._update_leaf_status(new_node)
             # Hash will be computed lazily during event emission
+            # 新节点的token id会分页，分页计算哈希值，然后分页通知，有多个事件
+            # 需要存储这个新节点的token ids的，通过事件驱动，监听者会消费这些时间
             self._record_store_event(new_node)
+        # 返回匹配到的总prefix长度
         return total_prefix_length
 
     def _print_helper(self, node: TreeNode, indent: int):
@@ -777,6 +880,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             for child in current_node.children.values():
                 if child.evicted:
                     continue
+                # 这一页的hash值
                 stack.append(child)
         return total_size
 

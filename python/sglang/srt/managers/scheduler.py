@@ -284,10 +284,13 @@ _is_npu = is_npu()
 
 
 class Scheduler(
+    # 负责处理 SchedulerOutput
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
     SchedulerMultiplexMixin,
+    # 负责处理 PP
     SchedulerPPMixin,
+    # 负责处理 DP Attn
     SchedulerDllmMixin,
     SchedulerMlxOverlapMixin,
 ):
@@ -319,6 +322,8 @@ class Scheduler(
         self.abort_on_priority_when_disabled = (
             server_args.abort_on_priority_when_disabled
         )
+        # 只有该rank需要建立channels，使用ipc通信，在同一节点内
+        # 只有pp0+attn_tp_rank0 才会接受来自tokenizerManager的请求和rpc请求
         self.schedule_low_priority_values_first = (
             server_args.schedule_low_priority_values_first
         )
@@ -356,6 +361,8 @@ class Scheduler(
                 server_args.dp_size,
                 server_args.attn_cp_size,
             )
+        # PUSH，只负责发送，没有接受请求的能力
+        # DEALER，既能发送，也能接受
         )
         self.ps = ParallelState(
             tp_rank=tp_rank,
@@ -463,6 +470,13 @@ class Scheduler(
             self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
             self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
 
+        # 如果decode内存不足，
+        # chunked_req还在，其每次调度完都会释放资源，
+        # 因为如chunked_req是在执行分块prefill，优先prefill，chunked_req还在，说明prefill请求还有，所以上一次调度还是Prefill。
+        # 如果chunked_req不为None，说明上一次调度执行包含了chunked_req，为什么这么说呢？
+        # 那么就不用执行了，没有请求调度
+        # 如果 运行队列已满， 或者等待队列为空， 或者没有请求还在分块执行
+        # 设置了桶大小，且不用radix_cache，那么就用chunk cache
         if (
             self.server_args.disaggregation_mode == "decode"
             and self.server_args.disaggregation_decode_enable_offload_kvcache
@@ -479,6 +493,7 @@ class Scheduler(
                 server_args=self.server_args,
             )
         else:
+            # 非pp_rank = 0的话，其tp_rank会接受上一个pp stage的tp_rank点对点发送的请求
             self.decode_offload_manager = None
 
         # Register draft KV pool (when spec + HiCache co-enabled).
@@ -616,6 +631,7 @@ class Scheduler(
         self.load_snapshot_writer = None
         if not is_rank_zero:
             return
+# 如果需要约束输出？
 
         dp_rank = self.ps.dp_rank if self.ps.dp_rank is not None else 0
         try:
@@ -665,6 +681,7 @@ class Scheduler(
 
     def init_tokenizer(self):
         server_args = self.server_args
+        # 模型是否是Generation模型，一般是
         self.is_generation = self.model_config.is_generation
 
         if server_args.skip_tokenizer_init:
@@ -679,8 +696,14 @@ class Scheduler(
                     use_fast=not server_args.disable_fast_image_processor,
                     tokenizer_backend=server_args.tokenizer_backend,
                 )
+                # 收集dp_cooperation_info和执行时长什么的metrics
+                # 添加到队列
+                # 两个send，能发生响应给TokenizerManger进程和DetokenizerManger进程
                 self.tokenizer = get_tokenizer_from_processor(self.processor)
             else:
+                # 正常情况
+                # 如果是prefill请求
+                # 空闲时执行自检与重置
                 self.tokenizer = get_tokenizer(
                     server_args.tokenizer_path,
                     tokenizer_mode=server_args.tokenizer_mode,
@@ -779,6 +802,7 @@ class Scheduler(
             tp_rank=self.ps.tp_rank,
             moe_ep_rank=self.ps.moe_ep_rank,
             nccl_port=self.nccl_port,
+            # Target Worker传给Draft Worker
             target_worker=self.tp_worker,
             dp_rank=self.ps.dp_rank,
             attn_cp_rank=self.ps.attn_cp_rank,
@@ -821,6 +845,7 @@ class Scheduler(
         # Get token and memory info from the model worker
         (
             self.max_total_num_tokens,
+            # 不是桶大小，但是是系统设置的prefill最大token数，类似桶
             self.max_prefill_tokens,
             self.max_running_requests,
             self.max_queued_requests,
@@ -929,6 +954,9 @@ class Scheduler(
             self.chunked_prefill_size = None
         elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
+        # 即如果一次调度中，该请求只能分块执行，那么在下次调度中仍然使其分块执行，直至prefill结束？
+        # 然后在下次调度中依旧使用这个chunked req
+        # 如果一次调度中存在chunked prefill，则将chunked req保存起来
         self.chunked_req = None
         # Tracks whether the current self.chunked_req was actually scheduled
         # into last iteration's batch (i.e., in can_run_list -> got a fresh
@@ -939,6 +967,7 @@ class Scheduler(
         # init_next_round_input, so running stash would double-free and
         # corrupt prefix_indices.
         self._chunked_req_scheduled_last_iter = False
+        # 哦哦，原来chunked_prefill_size设置了不代表mixed_chunk，还需要开启
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None
             and self.server_args.enable_mixed_chunk
@@ -1106,6 +1135,7 @@ class Scheduler(
                 transfer_backend=self.transfer_backend,
             )
 
+        # PD分离
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             # *2 for the headroom.
             buffer_size = self.max_running_requests * 2
@@ -1205,6 +1235,7 @@ class Scheduler(
         if not self.enable_overlap:
             return
 
+        # 干嘛的额
         self.batch_record_buf = [None] * 2
         self.batch_record_ct = 0
 
@@ -1238,6 +1269,7 @@ class Scheduler(
                     tokens = fill_ids[0:end]
                     column_starts.append(0)
                 else:
+                    # 如果是RPC请求，把执行结果返回去
                     # Prepend n-1 tokens before prefix_len for n-gram context
                     tokens = fill_ids[start - self.ngram_embedding_n + 1 : end]
                     column_starts.append(start - self.ngram_embedding_n + 1)
@@ -1279,6 +1311,7 @@ class Scheduler(
     def init_request_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
             [
+                # 请求添加入waiting queue
                 (TokenizedGenerateReqInput, self.handle_generate_request),
                 (TokenizedEmbeddingReqInput, self.handle_embedding_request),
                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
@@ -1290,6 +1323,7 @@ class Scheduler(
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
+                # 从磁盘加载权重进行权重更新
                 (
                     UpdateWeightFromDiskReqInput,
                     self.weight_updater.update_weights_from_disk,
@@ -1354,6 +1388,10 @@ class Scheduler(
                     self.load_lora_adapter_from_tensors,
                 ),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
+                # tokenizer 收集到所有ATTN TP rank 0的GetLoadReqOutput回包之后汇总发送给 Controller。
+                # 虽然所有 TP rank 都会收集负载，但只有ATTN TP rank 0会回包GetLoadReqOutput给 tokenizer。
+                # Controller 将请求转发给ATTN TP rank 0，ATTN TP rank 0将请求广播给同 DP rank 的其它ATTN TP rank。
+                # 由 tokenizer进程的定时器触发，默认每 0.1 秒往 Controller 发送一个GetLoadReqInput消息收集负载
                 (GetLoadsReqInput, self.handle_get_loads_req),
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
@@ -1427,6 +1465,7 @@ class Scheduler(
         while True:
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
+            # 遍历，根据请求类型，分发请求
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 continue
@@ -1490,6 +1529,8 @@ class Scheduler(
 
             # Process the last batch
             if self.last_batch:
+                # 如果提前后处理了 last batch，那么这里就不用了
+                # 如果 上一个Batch 已经提前在 该Batch放入gpu执行 前阻塞等待处理了，那么这里就不用处理了。
                 if not disable_overlap_for_batch:
                     pop_and_process()
             elif batch is None:
@@ -1553,8 +1594,11 @@ class Scheduler(
                 )
                 continue
 
+            # 根据请求类型，分发请求
             output = self._request_dispatcher(recv_req)
             if output is not None:
+                # 这个所谓的结果应该类似于 "发送成功"？？
+                # 如果不是RPC请求，把处理结果返回给tokenizer Manager进程
                 if not isinstance(output, RpcReqOutput):
                     self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
                 else:
@@ -1789,6 +1833,7 @@ class Scheduler(
         """
         if raw_mm_inputs is None:
             return None
+# Prefill 请求从waiting_queue来，对waiting_queue按照优先级排序
 
         group_world_size = 1
         try:
@@ -1915,6 +1960,7 @@ class Scheduler(
                 # Use default bootstrap port
                 recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
+            # 构造为新的Req对象
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
@@ -1957,6 +2003,7 @@ class Scheduler(
             )
             req.tokenizer = self.tokenizer
 
+            # 如果是PD分离
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
                 if (
@@ -1991,7 +2038,9 @@ class Scheduler(
             if self.metrics_reporter.enable_metrics:
                 req.time_stats.set_metrics_collector(self.metrics_collector)
             if isinstance(req.finished_reason, FINISH_ABORT):
+                # 根据设定的max length计算还能采样的最大长度
                 self.init_req_max_new_tokens(req)
+                #并插入到waiting_queue中
                 self._add_request_to_queue(req)
                 return
 
@@ -2056,6 +2105,7 @@ class Scheduler(
                 return
 
         # initialize before returning
+        # 根据设定的max length计算还能采样的最大长度
         self.init_req_max_new_tokens(req)
 
         # Validate prompt length
@@ -2077,6 +2127,7 @@ class Scheduler(
             if recv_req.return_logprob and recv_req.token_ids_logprob is None:
                 # If logprob is required but neither token_ids_logprob nor logprob_start_len is
                 # set, return the logprobs for output tokens by default
+                # 对于只进行prefill的请求，不进行logprob计算
                 req.logprob_start_len = len(req.origin_input_ids)
             elif req.is_prefill_only:
                 # For prefill-only requests with logprob_start_len == -1, set logprob_start_len
@@ -2084,6 +2135,7 @@ class Scheduler(
                 req.logprob_start_len = len(req.origin_input_ids)
             else:
                 # If return_logprob is False, only the last token requires logprob computation
+                # 如果不return_logprob，默认只计算最后一个token的logprob
                 req.logprob_start_len = -1
         else:
             req.logprob_start_len = recv_req.logprob_start_len
@@ -2156,9 +2208,11 @@ class Scheduler(
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
             return
+        # 正常不分离模式
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
                 return
+            # 如果self.enable_hicache_storage=True，匹配前缀，获取前缀的kv indices
             self._prefetch_kvcache(req)
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
@@ -2410,7 +2464,10 @@ class Scheduler(
             self.dllm_manager.filter_finished_reqs()
 
         # Merge the prefill batch into the running batch
+        # 所以这个记录哪些chunked请求要排除，不转成decode请求
+        # 正常prefill请求处理后要转成decode请求，但是chunked的请求还没处理完
         chunked_req_to_exclude = set()
+# 如果上一次调度有chunked请求
 
         if self.dllm_config is not None and self.dllm_manager.any_staging_reqs():
             chunked_req_to_exclude.update(self.dllm_manager.staging_queue)
@@ -2420,7 +2477,11 @@ class Scheduler(
         if self.chunked_req is not None:
             # Move the chunked request out of the batch so that we can merge
             # only finished requests to running_batch.
+            # 暂时移出分块请求
+            # 所以这个记录哪些chunked请求要排除，不转成decode请求
+            # 正常prefill请求处理后要转成decode请求，但是chunked的请求还没处理完
             chunked_req_to_exclude.add(self.chunked_req)
+# chunked_req就会调用cache_unfinished_req来存储kv token
 
             if self._chunked_req_scheduled_last_iter:
                 self.stash_chunked_request(self.chunked_req)
@@ -2453,9 +2514,13 @@ class Scheduler(
 
             # Filter batch
             last_bs = self.last_batch.batch_size()
+            # 过滤 1️⃣chunked请求(没有完成prefill) 或 2️⃣只需要prefill的请求(如果max_sample_num_token=0) 或 3️⃣被用户中断的请求  等这类finished的请求
+            # 同时把chunked_req_to_exclude内的请求也踢掉
+            # 过滤 上一次调度后 已完成或被移出 的请求
             self.last_batch.filter_batch(
                 chunked_req_to_exclude=list(chunked_req_to_exclude)
             )
+            # 如果过滤后变小了，说明有请求被踢出running队列，说明 Running Batch 可能有空位了
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 
@@ -2570,6 +2635,7 @@ class Scheduler(
         ) and self.chunked_req is None:
             return None
 
+        # running_batch有几个Decode请求
         running_bs = len(self.running_batch.reqs)
 
         # Ignore the check if self.chunked_req is not None.
@@ -2597,7 +2663,9 @@ class Scheduler(
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
         if self.chunked_req is not None and self.enable_dynamic_chunking:
+            # 该请求已经分块计算了多少token
             history_len = len(self.chunked_req.prefix_indices)
+            # 根据history_len，动态预测设置chunked_prefill_size大小
             dynamic_size = self.predict_next_chunk_size(history_len)
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
@@ -2610,7 +2678,9 @@ class Scheduler(
             self.running_batch,
             self.new_token_ratio_tracker.current,
             self.max_prefill_tokens,
+            # 桶大小
             chunked_prefill_size,
+            # 如果开启mixed_chunk，那么优先考虑 running_batch 的资源使用，再用剩下的资源去尝试调用prefill请求
             running_bs if self.is_mixed_chunk else 0,
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=self.max_prefill_bs,
@@ -2672,6 +2742,7 @@ class Scheduler(
                     req.rid
                 )
 
+            # 核心：匹配前缀，获取前缀的kv indices
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(
                 req,
@@ -2822,8 +2893,10 @@ class Scheduler(
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
+        # 传入的batch是 self.running_batch
         initial_bs = batch.batch_size()
 
+        # 过滤掉 完成或终止 的请求
         batch.filter_batch(v1_spec_info_filtered=True)
         if batch.is_empty():
             batch.batch_is_full = False
@@ -2844,6 +2917,9 @@ class Scheduler(
             old_mamba_available = (
                 mamba_pool.available_size() if mamba_pool is not None else None
             )
+            # 2. 自动 回退retract 部分请求，将其重新放入waiting queue
+            # 1. 自动 终止abort 部分请求，返回前端提示请求已终止，默认为 []即不终止任何请求
+            # 如果decode内存不足，
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
                 self.server_args
             )
@@ -2867,6 +2943,7 @@ class Scheduler(
                     ),
                 )
             self.new_token_ratio_tracker.current = new_token_ratio
+            # 1. 自动 终止abort 部分请求，返回前端提示请求已终止
             for req in reqs_to_abort:
                 abort_reason: FINISH_ABORT = req.to_finish
                 self.ipc_channels.send_to_tokenizer.send_output(
@@ -2891,6 +2968,8 @@ class Scheduler(
                 )
             logger.warning(msg_prefix + msg_details)
 
+            # 虽然传入is_retracted=True，但是只有在PD分离的Decode端才会生效
+            # 2. 自动 回退 retract 部分请求，将其重新放入waiting queue
             for req in retracted_reqs:
                 self._add_request_to_queue(req, is_retracted=True)
         else:
@@ -2903,6 +2982,7 @@ class Scheduler(
             return batch
 
         # Update batch tensors
+        # 原来在这里调用
         batch.prepare_for_decode()
         return batch
 
@@ -2982,6 +3062,7 @@ class Scheduler(
             return self._run_batch_prebuilt(batch)
 
         # Run forward
+        # 模型是否是Generation模型，一般是
         if self.is_generation:
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
@@ -3077,6 +3158,7 @@ class Scheduler(
                         # req_pool_indices; relay is unused (worker rebuilds input_ids
                         # inside verify). Keep pre-PR behavior.
                         batch.input_ids = batch_result.next_token_ids.to(torch.int64)
+                # 暂未实现
                 self.update_cache_from_scheduler(batch, batch_result)
 
             # These 2 values are needed for processing the output, but the values can be
@@ -3167,6 +3249,7 @@ class Scheduler(
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
 
         if batch.forward_mode.is_decode():
+            # 如果是decode请求
             self.batch_result_processor.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():
@@ -3687,6 +3770,9 @@ class Scheduler(
             tmp_batch, tmp_result = self.result_queue.popleft()
             self.process_batch_result(tmp_batch, tmp_result)
 
+        # 那么就要考虑将一些 完成Prefill后需要Deocde的请求（is_prefill_only=False） 合并到Running队列内，
+        # 如果last bacth是 Prefill Batch！！！！  SGLang的running队列只负责decode
+        # last_batch 记录的是上一次调度的schedule batch
         if self.last_batch and self.last_batch.forward_mode.is_extend():
             chunked_req_to_exclude = set()
             self.last_batch.filter_batch(
@@ -3982,6 +4068,7 @@ def run_scheduler_process(
     # Create a scheduler and run the event loop
     scheduler = None
     try:
+        # 1 创建scheduler
         scheduler = Scheduler(
             server_args,
             port_args,
@@ -3996,6 +4083,7 @@ def run_scheduler_process(
 
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
+# 2 根据模式运行scheduler
 
         # Run the event loop (blocks until shutdown)
         scheduler.run_event_loop()

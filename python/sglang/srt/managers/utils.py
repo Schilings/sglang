@@ -25,8 +25,10 @@ logger = logging.getLogger(__name__)
 
 @dataclasses.dataclass
 class GenerationBatchResult:
+    # 模型 forward 完整的 logits 输出和相关信息
     logits_output: Optional[LogitsProcessorOutput] = None
     pp_hidden_states_proxy_tensors: Optional[PPProxyTensors] = None
+    # 经过采样的下一个 token 的 ID
     next_token_ids: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None
     num_correct_drafts: int = 0  # no bonus included
     num_correct_drafts_per_req_cpu: Optional[List[int]] = None
@@ -38,12 +40,17 @@ class GenerationBatchResult:
     skipped_output_comm: bool = False
 
     # For output processing
+    # 每个请求的扩展输入长度
     extend_input_len_per_req: Optional[List[int]] = None
+    # 每个请求开始计算 logprob 的位置
     extend_logprob_start_len_per_req: Optional[List[int]] = None
 
     # For overlap scheduling
+    # GPU 到 CPU 数据传输完成的同步事件
     copy_done: Optional[torch.cuda.Event] = None
+    # 延迟采样函数
     delay_sample_func: Optional[callable] = None
+    # Future 机制中的索引信息
     future_indices: Optional[torch.Tensor] = None
     speculative_num_draft_tokens: Optional[int] = None
 
@@ -55,6 +62,7 @@ class GenerationBatchResult:
     new_seq_lens: Optional[torch.Tensor] = None
 
     # relay path: forward stream -> next step forward
+    # speculative decoding 的下一轮输入信息
     next_draft_input: Optional[EagleDraftInput] = None
 
     # Refs the worker wants scheduler to keep alive for the same 2-iter window

@@ -96,6 +96,7 @@ def organize_draft_results(
 ):
     score_list = torch.cat(score_list, dim=1).flatten(1)
     ss_token_list = torch.cat(token_list, dim=1)
+    # 最后rerank出累乘分数top的num_draft_token个token进行prefill verify
     top_scores = torch.topk(score_list, num_draft_token - 1, dim=-1)
     top_scores_index = top_scores.indices
     top_scores_index = torch.sort(top_scores_index).values

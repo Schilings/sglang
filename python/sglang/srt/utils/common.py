@@ -666,6 +666,9 @@ def get_available_gpu_memory(
         free_gpu_memory = total_mem - used_mem
 
     if distributed:
+        # 最终返回所有GPU中可用显存的那个最小值。
+        # 还会通过分布式通信操作（如torch.distributed.all_reduce的MIN操作）与张量并行组（Tensor Parallel Group）中的其他所有GPU进行同步，
+        # 当distributed=True时，这个函数不仅会获取当前GPU（self.gpu_id）的可用显存，
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32)
         torch.distributed.all_reduce(
             tensor, op=torch.distributed.ReduceOp.MIN, group=cpu_group
@@ -3945,6 +3948,7 @@ def get_num_new_pages(
         return (seq_lens % page_size == 1).int().sum().item()
 
     assert prefix_lens.device == cpu_device
+    # 页数 向上取整了！！！
     num_pages_after = (seq_lens + page_size - 1) // page_size
     num_pages_before = (prefix_lens + page_size - 1) // page_size
     num_new_pages = num_pages_after - num_pages_before

@@ -110,6 +110,7 @@ def _set_kv_buffer_impl(
             indices,
             row_bytes=row_bytes,
         )
+# SWA和MHA可能用的不同的head_num、head_dim、v_head_dim
 
     if _is_cpu and _cpu_has_amx_support:
         return torch.ops.sgl_kernel.store_cache_cpu(
@@ -155,13 +156,19 @@ class ReqToTokenPool:
         self._alloc_size = size + 1
         self.max_context_len = max_context_len
         self.device = device
+        # 使用memory_saver管理kv_cache，支持快速offload和onload
         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            # 主要存储结构：[请求数量, 最大上下文长度]
             self.req_to_token = torch.zeros(
                 (self._alloc_size, max_context_len), dtype=torch.int32, device=device
             )
+        # 可用槽位列表，一个请求一个槽
         self.free_slots = list(range(1, self._alloc_size))
 
     def write(self, indices, values):
+        # 那么req_to_token[ req1, 0:3 ] = [7, 67, 131]
+        # 例如req1的前3个token在kv cache中的位置是7，67,131
+        # 各自req对应的req_to_token_pool的行，记录的是每个token的kv index值
         self.req_to_token[indices] = values
 
     def available_size(self):
@@ -248,6 +255,7 @@ class MambaPool:
         temporal_state_shape = cache_params.shape.temporal
         conv_dtype = cache_params.dtype.conv
         ssm_dtype = cache_params.dtype.temporal
+        # 使用memory_saver管理kv_cache，支持快速offload和onload
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
         )
@@ -264,6 +272,7 @@ class MambaPool:
         with (
             self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE),
             (
+                # 这是什么用法？
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
                 if self.enable_custom_mem_pool
                 else nullcontext()
@@ -831,6 +840,8 @@ class MHATokenToKVPool(KVCache):
             else v_head_dim if v_head_dim is not None else head_dim
         )
 
+        # 使用memory_saver管理kv_cache，支持快速offload和onload
+        # 应该是创建kv cache存放的实际空间了
         self._create_buffers()
 
         self.device_module = torch.get_device_module(self.device)
@@ -842,7 +853,11 @@ class MHATokenToKVPool(KVCache):
             else None
         )
 
+        # 如果允许kv cache offload到cpu，则kv cache数据会保存在cpu上
+        # 因为memory_saver的卸载方式只是单纯把kv cache的数据全部清空，kv cache后续为空
+        # 是否允许kv offload到cpu
         if enable_kv_cache_copy:
+            # 给kernel warmup一下
             self._init_kv_copy_and_warmup()
         else:
             self._kv_copy_config = None
@@ -863,6 +878,8 @@ class MHATokenToKVPool(KVCache):
         _KV_COPY_NUM_WARPS_LARGE_TILE = 8
         _KV_COPY_NUM_WARPS_SMALL_TILE = 4
 
+        # bytes_per_tile 应该表示 按 byte 分块，每一块的byte大小
+        # stride_bytes 应该等于 self.head_num * self.head_dim
         stride_bytes = int(self.data_strides[0].item())
         if stride_bytes >= _KV_COPY_STRIDE_THRESHOLD_LARGE:
             bytes_per_tile = _KV_COPY_TILE_SIZE_LARGE
@@ -872,10 +889,13 @@ class MHATokenToKVPool(KVCache):
             bytes_per_tile = _KV_COPY_TILE_SIZE_SMALL
 
         # Calculate num_locs_upper to avoid large Triton specialization (e.g. 8192)
+        # 这个是？
         chunk_upper = 128 if bytes_per_tile >= _KV_COPY_TILE_SIZE_LARGE else 256
 
         self._kv_copy_config = {
+            # 按 byte 分块，每一块的byte大小
             "bytes_per_tile": bytes_per_tile,
+            # 按 byte 分块，一层k或一层v分成多少块
             "byte_tiles": (stride_bytes + bytes_per_tile - 1) // bytes_per_tile,
             "num_warps": (
                 _KV_COPY_NUM_WARPS_SMALL_TILE
@@ -885,12 +905,18 @@ class MHATokenToKVPool(KVCache):
             "num_locs_upper": chunk_upper,
         }
 
+        # 弄下假数据用来warmup
         dummy_loc = torch.zeros(chunk_upper, dtype=torch.int64, device=self.device)
         grid = (self.data_ptrs.numel(), self._kv_copy_config["byte_tiles"])
 
+        # ( k的层数+v的层数, 分块数)
         copy_all_layer_kv_cache_tiled[grid](
+            # k，v buffer的指针
             self.data_ptrs,
+            # k，v buffer维度0的步长
             self.data_strides,
+            # 复制到目标位置的indices
+            # 哪些indices
             dummy_loc,
             dummy_loc,
             1,
@@ -901,6 +927,7 @@ class MHATokenToKVPool(KVCache):
         )
 
     def _create_buffers(self):
+        # 使用memory_saver管理kv_cache，支持快速offload和onload
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
@@ -909,6 +936,8 @@ class MHATokenToKVPool(KVCache):
             ):
                 # [size, head_num, head_dim] for each layer
                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                # k_buffer是个列表，每一层对应一个元素
+                # 第一个page是占位符
                 self.k_buffer = [
                     torch.zeros(
                         (self.size + self.page_size, self.head_num, self.head_dim),
@@ -926,6 +955,7 @@ class MHATokenToKVPool(KVCache):
                     for _ in range(self.layer_num)
                 ]
 
+        # 获取每一层的buffer的存储地址，然后一起存放到tensor
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer],
             dtype=torch.uint64,
@@ -937,6 +967,8 @@ class MHATokenToKVPool(KVCache):
             device=self.device,
         )
         self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
+        # 简单说就是预计算每个缓存张量的内存步长，用于优化KV缓存的传输和复制操作。
+        # 计算每个张量形状除第一维外其余维度的乘积，再乘以数据类型大小
         self.data_strides = torch.tensor(
             [
                 np.prod(x.shape[1:]) * x.dtype.itemsize
@@ -991,8 +1023,10 @@ class MHATokenToKVPool(KVCache):
         current_platform.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
+        # 遍历每一层
         for layer_id in range(self.layer_num):
             kv_cache_cpu.append([])
+            # 分块加载这些位置的数据
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
                 k_cpu = self.k_buffer[layer_id][chunk_indices].to(
@@ -1024,6 +1058,7 @@ class MHATokenToKVPool(KVCache):
 
     def _get_key_buffer(self, layer_id: int):
         # for internal use of referencing
+        # 获取某一层的
         if self.store_dtype != self.dtype:
             return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
         return self.k_buffer[layer_id - self.start_layer]

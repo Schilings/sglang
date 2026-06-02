@@ -86,24 +86,33 @@ class ExpertLocationMetadata:
         server_args: ServerArgs, model_config: ModelConfig, moe_ep_rank: int
     ):
         """Trivial location - logical expert i corresponds to physical expert i"""
+        #信息：num_layers,num_logical_experts,num_groups
         common = ExpertLocationMetadata._init_common(server_args, model_config)
 
         if common is None:
             return None
 
+        # 专家总数（包括用于填充的冗余专家）
         num_physical_experts = common["num_physical_experts"]
         model_config_for_expert_location = common["model_config_for_expert_location"]
+        # 多少层是moe
         num_layers = model_config_for_expert_location.num_layers
+        # 专家总数（不包括用于填充的冗余专家）
         num_logical_experts = model_config_for_expert_location.num_logical_experts
 
+        # 获取真实专家的索引
+        # 哪些专家是真实的，非冗余的
         physical_to_logical_map = (
             torch.arange(0, num_physical_experts).repeat(num_layers, 1)
             % num_logical_experts
         )
 
+        # 关键还是init_by_mapping
         return ExpertLocationMetadata.init_by_mapping(
             server_args,
             model_config,
+            # 获取真实专家的索引
+            # 哪些专家是真实的，非冗余的
             physical_to_logical_map=physical_to_logical_map,
             moe_ep_rank=moe_ep_rank,
         )
@@ -117,6 +126,8 @@ class ExpertLocationMetadata:
     ):
         if not isinstance(physical_to_logical_map, torch.Tensor):
             physical_to_logical_map = torch.tensor(physical_to_logical_map)
+        # 获取真实专家的索引
+        # 哪些专家是真实的，非冗余的
         physical_to_logical_map = physical_to_logical_map.to(server_args.device)
 
         common = ExpertLocationMetadata._init_common(server_args, model_config)
@@ -128,6 +139,7 @@ class ExpertLocationMetadata:
         logical_to_all_physical_map = _compute_logical_to_all_physical_map(
             server_args=server_args,
             physical_to_logical_map=physical_to_logical_map,
+            # 专家总数（真实的，不包括用于填充的冗余专家）
             num_logical_experts=model_config_for_expert_location.num_logical_experts,
             ep_size=common["ep_size"],
             moe_ep_rank=moe_ep_rank,
@@ -195,17 +207,23 @@ class ExpertLocationMetadata:
         if model_config_for_expert_location is None:
             return None
 
+        # 专家总数（包括用于填充的冗余专家）
         num_physical_experts = (
+            # 专家总数（不包括用于填充的冗余专家）
             model_config_for_expert_location.num_logical_experts
+            # 冗余专家数
             + server_args.ep_num_redundant_experts
         )
         ep_size = server_args.ep_size
         assert num_physical_experts % ep_size == 0
+        # 每个rank的专家数
         num_local_physical_experts = num_physical_experts // ep_size
 
         return dict(
             model_config_for_expert_location=model_config_for_expert_location,
+            # 专家总数
             num_physical_experts=num_physical_experts,
+            # 每个rank的专家数
             num_local_physical_experts=num_local_physical_experts,
             ep_size=ep_size,
         )
@@ -366,7 +384,10 @@ def broadcast_global_expert_location_metadata(
 
 def _compute_logical_to_all_physical_map(
     server_args: ServerArgs,
+    # 获取真实专家的索引
+    # 哪些专家是真实的，非冗余的
     physical_to_logical_map: torch.Tensor,
+    # 专家总数（真实的，不包括用于填充的冗余专家）
     num_logical_experts: int,
     ep_size: int,
     moe_ep_rank: int,
@@ -385,14 +406,18 @@ def _compute_logical_to_all_physical_map(
             logical_expert_id = physical_to_logical_map[
                 layer_id, physical_expert_id
             ].item()
+            # 添加到候选的物理专家列表中
             logical_to_all_physical_map[layer_id][logical_expert_id].append(
                 physical_expert_id
             )
 
     # Replace by the physical expert on local GPU or node if possible
     if moe_ep_rank is not None:
+        # 一个node有几个rank
         num_gpus_per_node = server_args.ep_size // server_args.nnodes
+        # 一个rank放几个专家
         num_local_gpu_physical_experts = num_physical_experts // ep_size
+        # 一个node放几个专家
         num_local_node_physical_experts = (
             num_local_gpu_physical_experts * num_gpus_per_node
         )
@@ -400,6 +425,7 @@ def _compute_logical_to_all_physical_map(
             for logical_expert_id in range(num_logical_experts):
                 # Try to find the nearest physical expert
                 nearest_expert = _find_nearest_expert(
+                    # 候选的物理专家
                     candidate_physical_expert_ids=logical_to_all_physical_map[layer_id][
                         logical_expert_id
                     ],

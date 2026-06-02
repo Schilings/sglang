@@ -121,6 +121,7 @@ class ModelRunnerKVCacheMixin:
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         else:
+            # 多少层
             # Use ratio-based calculation to auto-fit available memory
             assert config.mamba2_cache_params.mamba_cache_per_req > 0
             per_req = config.mamba2_cache_params.mamba_cache_per_req
@@ -239,6 +240,7 @@ class ModelRunnerKVCacheMixin:
                 additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
 
         return MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO + additional_ratio
+# 如果由剩余内存计算出来的 max_total_num_tokens 小于系统配置的，那就选择计算出来的
 
     def _validate_prefill_only_disable_kv_cache_pool_family(
         self: ModelRunner,
@@ -326,6 +328,7 @@ class ModelRunnerKVCacheMixin:
                         start_layer=self.start_layer,
                     )
                 else:
+                    # 非fp4
                     self.req_to_token_pool = DecodeReqToTokenPool(
                         size=max_num_reqs,
                         max_context_len=self.model_config.context_len
@@ -847,6 +850,7 @@ class ModelRunnerKVCacheMixin:
             token_capacity = min(token_capacity, user_limit)
 
         # Sync across PP ranks (each may have different layer counts)
+        # 不同pp rank可能层数不同，其对应的kv cache大小也不同，容纳的最多token数也不同，统一一下
         if self.pp_size > 1:
             tensor = torch.tensor(token_capacity, dtype=torch.int64)
             torch.distributed.all_reduce(

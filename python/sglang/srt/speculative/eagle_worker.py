@@ -115,11 +115,13 @@ class EAGLEWorker(TpModelWorker):
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.gpu_id = gpu_id
         self.device = server_args.device
+        # Target Worker传给Draft Worker
         self.target_worker = target_worker
         self.page_size = server_args.page_size
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+# batch上还是CaptureHiddenMode.FULL, 所以拿到的还是Draft Model输出的 所有hidden states
 
         # Adaptive speculative
         self.adaptive_controller: Optional[AdaptiveController] = None
@@ -127,6 +129,9 @@ class EAGLEWorker(TpModelWorker):
             self.adaptive_controller = AdaptiveController(
                 self, config_path=server_args.speculative_adaptive_config
             )
+# speculative_moe_a2a_backend_context : 临时改变moe a2a的端，deepep/mooncake/ascend_fuseep
+# speculative_moe_backend_context : 临时改变moe的计算后端，triton/cutlass/deep_gemm
+# draft_tp_context : 临时改变tp组引用
 
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -157,7 +162,11 @@ class EAGLEWorker(TpModelWorker):
             self.hot_token_id = None
 
         # Init draft worker
+        # speculative_moe_a2a_backend_context : 临时改变moe a2a的端，deepep/mooncake/ascend_fuseep
+        # speculative_moe_backend_context : 临时改变moe的计算后端，triton/cutlass/deep_gemm
+        # draft_tp_context : 临时改变tp组引用
         if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
+            # 为什么这里用 ATTN_TP
             ctx = draft_tp_context(get_attention_tp_group())
         else:
             ctx = empty_context()
@@ -174,6 +183,7 @@ class EAGLEWorker(TpModelWorker):
                 attn_cp_rank=attn_cp_rank,
                 moe_dp_rank=moe_dp_rank,
                 nccl_port=nccl_port,
+                # 复用Target Model的KV cache？？！！！！
                 is_draft_worker=True,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
@@ -212,6 +222,9 @@ class EAGLEWorker(TpModelWorker):
         self.draft_model_runner.server_args.disable_cuda_graph = (
             backup_disable_cuda_graph
         )
+        # speculative_moe_a2a_backend_context : 临时改变moe a2a的端，deepep/mooncake/ascend_fuseep
+        # speculative_moe_backend_context : 临时改变moe的计算后端，triton/cutlass/deep_gemm
+        # draft_tp_context : 临时改变tp组引用
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
@@ -617,6 +630,7 @@ class EAGLEWorker(TpModelWorker):
             # TODO: We only need self.speculative_num_steps - 1 * topk cache loc
             out_cache_loc, token_to_kv_pool_state_backup = alloc_token_slots(
                 batch.tree_cache,
+                # 一个req，一个step，选择topk个token
                 num_seqs * alloc_len_per_decode,
                 backup_state=True,
             )
@@ -628,8 +642,11 @@ class EAGLEWorker(TpModelWorker):
                     batch.seq_lens,
                     self.speculative_num_steps,
                 )
+                # 原先的seq_lens就是verify时的prefix_lens
                 prefix_lens_cpu = batch.seq_lens_cpu
+                # draft model一步只选择一个token，那么verify的时候就多出num_steps个token
                 seq_lens_cpu = batch.seq_lens_cpu + self.speculative_num_steps
+                # 每个req就有num_steps个token要验证
                 extend_num_tokens = num_seqs * self.speculative_num_steps
             else:
                 # In this case, the last partial page needs to be duplicated.
@@ -658,10 +675,13 @@ class EAGLEWorker(TpModelWorker):
                     self.page_size,
                 )
                 prefix_lens_cpu = batch.seq_lens_cpu
+                # 每个req的draft prefix(就是原seqlen)在最后一页有几个token
                 last_page_lens_cpu = prefix_lens_cpu % self.page_size
+                # 每个top组需要多少页
                 num_new_pages_per_topk = (
                     last_page_lens_cpu + self.speculative_num_steps + self.page_size - 1
                 ) // self.page_size
+                # verify的seq_lens = 原先的seq_lens + 需要的页数*page_size
                 seq_lens_cpu = (
                     prefix_lens_cpu // self.page_size * self.page_size
                     + num_new_pages_per_topk * (self.page_size * self.topk)
@@ -682,11 +702,18 @@ class EAGLEWorker(TpModelWorker):
             )
 
         if self.page_size > 1 and self.topk > 1:
+            # 计算其cumsum
+            # last_page_lens -> 每个req的draft prefix(就是原seqlen)在最后一页有几个token
             last_page_lens_cumsum = torch.cumsum(last_page_lens, dim=0)
+            # 每个req的最后一页的几个token，每个req会重复topk遍，冗余了topk-1遍
             duplicate_cache_len = torch.sum(last_page_lens_cpu).item() * (self.topk - 1)
+            # 记录->后面topk-1个组的这部分冗余的kv indices
             target_cache_loc = torch.zeros(
                 duplicate_cache_len, dtype=torch.int32, device=self.device
             )
+            # 因此需要将这些kv复制给后面topk-1个组的page上
+            # 记录->这些token在原本seq_len的正常kv indices，用于每个topk组直接使用
+            # 每个req的draft prefix(就是原seqlen)在最后一页有几个token
             source_cache_loc = torch.zeros(
                 duplicate_cache_len, dtype=torch.int32, device=self.device
             )
@@ -728,6 +755,7 @@ class EAGLEWorker(TpModelWorker):
         batch.out_cache_loc = out_cache_loc
         batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
         batch.return_hidden_states = False
+        # draft输出的token的position从 值seqlen-1开始
         spec_info.positions = batch.seq_lens.repeat_interleave(self.topk, dim=0)
         self.token_to_kv_pool_allocator.restore_state(token_to_kv_pool_state_backup)
 
@@ -1134,6 +1162,8 @@ class EAGLEWorker(TpModelWorker):
         forward_batch.return_logprob = False
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
+        # batch上还是CaptureHiddenMode.FULL, 所以拿到的还是Draft Model输出的 所有hidden states？
+        # draft model执行只保留最后一个token的hidden states
         logits_output = self.draft_model_runner.forward(forward_batch).logits_output
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
         assert isinstance(forward_batch.spec_info, EagleDraftInput)

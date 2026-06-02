@@ -295,7 +295,9 @@ class PiecewiseCudaGraphRunner:
         )
         self.buffers.share_buffers()
 
+        # 收集所有Attn计算模块
         self.attention_layers = self.model_runner.attention_layers
+        # 收集所有moe专家模块
         self.moe_layers = self.model_runner.moe_layers
         self.moe_fusions = self.model_runner.moe_fusions
         self.dsa_indexers = getattr(self.model_runner, "dsa_indexers", None)
@@ -470,6 +472,7 @@ class PiecewiseCudaGraphRunner:
             ):
                 if start_len is not None and start_len < seq_len:
                     return False
+        # 只要小雨最大的bsz都能reply
         if num_tokens <= self.max_num_tokens:
             return True
         return False

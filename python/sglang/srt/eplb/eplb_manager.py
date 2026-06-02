@@ -61,15 +61,19 @@ class EPLBManager:
             torch.get_device_module().synchronize()
             time_start = time.time()
 
+        # 调用dump_record把统计的数据持久化一份
+        # ExpertDistributionRecorder记录了每一次推理时的token分发情况
         dump_record_output = get_global_expert_distribution_recorder().dump_record(
             output_mode="object"
         )
         logical_count = dump_record_output["logical_count"]
+        # 窗口内的gpu平均利用率
         average_utilization_rate_over_window = dump_record_output[
             "average_utilization_rate_over_window"
         ]
 
         # Check whether rebalancing is needed
+        # 如果当前gpu利用率高于阈值，则不需要rebalance
         if not self._check_rebalance_needed(average_utilization_rate_over_window):
             return
 

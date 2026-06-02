@@ -208,6 +208,7 @@ class ScatterMode(Enum):
         """The scatter mode for model forward pass input and output data"""
         if is_dsa_enable_prefill_cp() or is_mla_prefill_cp_enabled():
             return ScatterMode.SCATTERED
+# mlp是FULL的话就这一层就是TP_ATTN_FULL走
 
         return ScatterMode.TP_ATTN_FULL
 
@@ -362,6 +363,7 @@ class LayerScatterModes:
         context = _LayerModeComputationContext(**kwargs)
         return cls(
             layer_input_mode=cls._compute_layer_input_mode(context),
+            # Attn模块肯定是TP_ATTN_FULL, 每个DP rank都有各自的完整输入
             attn_mode=ScatterMode.TP_ATTN_FULL,
             mlp_mode=cls._compute_mlp_mode(context),
             middle_residual_mode=cls._compute_middle_residual_mode(context),
@@ -370,12 +372,18 @@ class LayerScatterModes:
 
     @classmethod
     def _compute_layer_input_mode(cls, context: _LayerModeComputationContext):
+        # 那么第一层肯定是 TP_ATTN_FULL, 每个DP rank都有各自的完整输入
+        # layer_input指的是这个layer的初始输入
         if context.layer_id == 0:
             return ScatterMode.model_input_output()
+        # 后面的话，就看上一层的输出是什么格式，这一层的输入来自上一层的输出
         return cls._compute_layer_output_mode(context.previous_layer())
 
     @classmethod
     def _compute_mlp_mode(cls, context: _LayerModeComputationContext):
+        # 那么ep用a2a，减少冗余的通信，mlp应该就是SCATTERED
+        # 1. 如果是moe层，使用all2all的话
+        # 要么 SCATTERED 要么 FULL
         if context.is_layer_sparse:
             if (
                 # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
@@ -407,7 +415,9 @@ class LayerScatterModes:
 
     @classmethod
     def _compute_middle_residual_mode(cls, context: _LayerModeComputationContext):
+        # mlp_mode 要么 SCATTERED 要么 FULL
         mlp_mode = cls._compute_mlp_mode(context)
+        # mlp是SCATTERED的话就看要不要Gather
         if mlp_mode == ScatterMode.SCATTERED:
             return ScatterMode.SCATTERED
         if mlp_mode in (ScatterMode.FULL, ScatterMode.MOE_FULL):
@@ -417,6 +427,7 @@ class LayerScatterModes:
     @classmethod
     def _compute_layer_output_mode(cls, context: _LayerModeComputationContext):
         mlp_mode = cls._compute_mlp_mode(context)
+        # 最后一层肯定要 TP_ATTN_FULL 走
         if context.layer_id == context.num_layers - 1:
             return ScatterMode.model_input_output()
         if mlp_mode == ScatterMode.SCATTERED:
@@ -515,6 +526,8 @@ class LayerCommunicator:
         post_residual_addition: Optional[torch.Tensor] = None,
     ):
         if get_attn_tp_context().input_scattered:
+            # residual：tp组内scatter
+            # hidden_states：tp组内reduce_scatter
             hidden_states, residual = self._tp_reduce_scatter(
                 hidden_states,
                 residual,
@@ -909,6 +922,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
             and (
                 residual_input_mode in [ScatterMode.SCATTERED, ScatterMode.TP_ATTN_FULL]
             )
+            # 两个output不一样
             and (hidden_states_output_mode == ScatterMode.FULL)
             and (residual_output_mode == ScatterMode.TP_ATTN_FULL)
         ):
@@ -935,6 +949,7 @@ class CommunicateWithAllReduceAndLayerNormFn:
             and (
                 residual_input_mode in [ScatterMode.SCATTERED, ScatterMode.TP_ATTN_FULL]
             )
+            # 两个output不一样
             and (hidden_states_output_mode == ScatterMode.SCATTERED)
             and (residual_output_mode == ScatterMode.SCATTERED)
         ):

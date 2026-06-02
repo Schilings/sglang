@@ -159,6 +159,8 @@ class BaseTpWorker(ABC):
 
         monkey_patch_torch_reductions()
         success, message = self.model_runner.update_weights_from_tensor(
+            # 因为是同一GPU内的Tensor，没必要传递整个tensor
+            # tensor ipc handle反序列化得到tensor
             named_tensors=MultiprocessingSerializer.deserialize(
                 recv_req.serialized_named_tensors[self.tp_rank]
             ),
@@ -260,7 +262,9 @@ class TpModelWorker(BaseTpWorker):
 
         self._init_model_config()
         self._init_model_runner()
+# DLLM算法是什么呢？
 
+        # 如果开启了 多层Eagle
         if is_multi_layer_eagle:
             self._init_multi_layer_eagle_model_runners()
 
@@ -289,28 +293,36 @@ class TpModelWorker(BaseTpWorker):
         self.device = self.model_runner.device
 
         # Init nccl groups
+        # ModelRunner里应该建立好了nccl环境？
         self.pp_group = get_pp_group()
         self.world_group = get_world_group()
 
         # Profile number of tokens
+        # 一次forward最大允许的token数
         self.max_total_num_tokens = self.model_runner.max_total_num_tokens
+        # 一次forward最大允许的prefill token数
         self.max_prefill_tokens = server_args.max_prefill_tokens
+        # 一次forward最大允许的running request数
         self.max_running_requests = self.model_runner.max_running_requests
         assert self.max_running_requests > 0, "max_running_request is zero"
+        # 一次forward最大允许的queued request数
         self.max_queued_requests = server_args.max_queued_requests
         assert (
             self.max_queued_requests is None or self.max_queued_requests >= 1
         ), "If configured, max_queued_requests must be at least 1 for any work to be scheduled."
+        # 一个request允许的最长token数
         self.max_req_len = min(
             self.model_config.context_len - 1,
             self.model_runner.max_token_pool_size - 1,
         )
+        # 一个request允许的最长input token数
         self.max_req_input_len = self.max_req_len - 5
         assert (
             self.max_req_len > 0 and self.max_req_input_len > 0
         ), "Memory pool size is too small"
 
         # Sync random seed across TP workers
+        # 统一每个Rank的随机种子
         self.random_seed = broadcast_pyobj(
             [server_args.random_seed],
             self.tp_size * self.pp_rank + tp_rank,
@@ -344,6 +356,7 @@ class TpModelWorker(BaseTpWorker):
     def _init_model_runner(self):
         from sglang.srt.model_executor.model_runner import ModelRunner
 
+        # 核心还是在于ModelRunner
         self._model_runner = ModelRunner(
             model_config=self.model_config,
             mem_fraction_static=self.server_args.mem_fraction_static,
@@ -468,13 +481,17 @@ class TpModelWorker(BaseTpWorker):
         if self.is_dllm():
             return self._forward_batch_generation_dllm(forward_batch)
 
+        # 只有last pp stage需要处理输出结果
         if self.pp_group.is_last_rank:
+            # 1. 运行模型前向
             out = self.model_runner.forward(
                 forward_batch,
                 pp_proxy_tensors=pp_proxy_tensors,
                 skip_attn_backend_init=skip_attn_backend_init,
             )
+            # logits_output用于采样
             logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
+            # 2. 准备好结果打包返回
             batch_result = GenerationBatchResult(
                 logits_output=logits_output,
                 can_run_cuda_graph=can_run_cuda_graph,
@@ -486,7 +503,11 @@ class TpModelWorker(BaseTpWorker):
             if is_verify:
                 # Skip sampling; spec_v2 worker fires its own publish post-verify.
                 return batch_result
+# Batch：表示Bacth内是否存在一个请求的is_prefill_only为True
+# Req：表示该请求是否只执行prefill，如果False，则该请求执行完prefill要执行decode
+# 4 如果batch内有正常请求，那么都是要采样的
 
+            # 3.1 如果需要延迟异步采样
             if (
                 self.enable_overlap
                 and not self.enable_spec
@@ -504,12 +525,14 @@ class TpModelWorker(BaseTpWorker):
 
             if not forward_batch.is_prefill_only:
                 # For normal requests, sample the next token ids.
+                # 4.1 不只是prefill请求，则采样
                 batch_result.next_token_ids = self.model_runner.sample(
                     logits_output, forward_batch
                 )
             else:
                 # For prefill-only requests, create dummy token IDs on CPU
                 # The size should match the batch size (number of sequences), not total tokens
+                # 4.2 如果全是非正常请求，就是只要prefill，后面不decode了的请求，不采样
                 batch_result.next_token_ids = torch.zeros(
                     len(forward_batch.seq_lens),
                     dtype=torch.long,
@@ -531,6 +554,7 @@ class TpModelWorker(BaseTpWorker):
                 pp_proxy_tensors=pp_proxy_tensors,
                 skip_attn_backend_init=skip_attn_backend_init,
             )
+            # 非pp last stage的话，前向结果是 pp_proxy_tensors
             pp_proxy_tensors, can_run_cuda_graph = out.logits_output, out.can_run_graph
             return GenerationBatchResult(
                 pp_hidden_states_proxy_tensors=pp_proxy_tensors,

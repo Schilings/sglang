@@ -294,6 +294,7 @@ def add_chunked_prefix_cache_attention_backend(backend_name):
         logger.info(
             f"Added {backend_name} to CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS."
         )
+# 生成会话 ID，格式为 "IP地址:RPC端口"，用于标识当前传输会话
 
 
 # Detect stragger ranks in model loading
@@ -438,6 +439,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 model_revision=server_args.speculative_draft_model_revision,
                 is_draft_model=True,
             )
+            # 获取设置的 预填充和解码的注意力后端 种类
+            # 如果是从 remote instance 加载模型权重，且使用nccl后端通信
             self.eagle_use_aux_hidden_state = True
 
             try:
@@ -529,6 +532,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.forward_stream = torch.get_device_module(self.device).Stream()
 
         # CPU offload
+        # Offloader用于将model卸载到CPU
         set_offloader(create_offloader_from_server_args(server_args, dp_rank=dp_rank))
 
         self._weight_checker = WeightChecker(model_runner=self)
@@ -552,10 +556,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.initialize(pre_model_load_memory)
         self.check_quantized_moe_compatibility()
 
+        # 在源实例和目标实例的每个TP（Tensor Parallel）rank之间建立通信组传输权重
+        # 这个发送仅由tp0负责，要求 远程端的模型并行策略 与 当前端的模型并行策略 相同
+        # 因此需要向remote instance发送信息用于一起建立nccl组：world_size=2、ip、ports等等
+        # 但是 remote instance 不一定有该节点rank的相关信息
+        # 需要初始化nccl组来进行权重的发送和接收
         if (
             self.server_args.elastic_ep_backend is not None
             and self.server_args.elastic_ep_rejoin
         ):
+            # 这个发送仅由tp0负责，向remote instance发送该rank的信息用于一起建立nccl组：world_size=2、ip、ports等等
             join_process_groups()
             broadcast_global_expert_location_metadata(
                 src_rank=self._get_healthy_expert_location_src_rank(
@@ -583,6 +593,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def init_msprobe(self):
         # Init the msprobe
+        # 再根据多个names, dtypes, shapes重构
+        # 建立一个大的empty tensor，广播的得到后
         try:
             from msprobe.pytorch import PrecisionDebugger, seed_all
         except ImportError:
@@ -620,6 +632,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.server_args.remote_instance_weight_loader_use_transfer_engine():
             self.remote_instance_init_transfer_engine()
 
+        # 正常启动，该模型不是draft model
         if not self.is_draft_worker:
             set_global_expert_location_metadata(
                 compute_initial_expert_location_metadata(
@@ -636,6 +649,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             set_global_expert_distribution_recorder(
                 ExpertDistributionRecorder.init_new(
                     server_args,
+                    # 上面刚记录的 专家数量信息
                     get_global_expert_location_metadata(),
                     rank=self.tp_rank,
                 )
@@ -831,6 +845,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             else:
                 self.graph_runner = None
                 self.graph_mem_usage = 0
+        # 设置全局的预填充和解码的注意力后端
         else:
             self.graph_runner = None
             self.graph_mem_usage = 0
@@ -854,12 +869,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.model_config.is_deepseek_v4_arch:
             return
 
+        # 哪些是Full Attention层
         full_attention_layer_ids = [
             layer_idx
             for layer_idx in range(self.start_layer, self.end_layer + 1)
             if hasattr(self.model_config, "full_attention_layer_ids")
             and layer_idx in self.model_config.full_attention_layer_ids
         ]
+        # 哪些Sliding Window Attention层
         swa_attention_layer_ids = [
             layer_idx
             for layer_idx in range(self.start_layer, self.end_layer + 1)
@@ -920,6 +937,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         Must be called before CUDA graph capture so the captured graphs
         include aux hidden state output paths.
+        # 应该是会创建出  如MHATokenToKVPool 和 TokenToKVPoolAllocator、 ReqToTokenPool
         """
         if self.eagle_use_aux_hidden_state:
             self.model.set_eagle3_layers_to_capture(
@@ -941,8 +959,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 "Please install mooncake for using remote instance transfer engine: pip install mooncake"
             )
             return
+        # 创建 TransferEngine 实例，用于处理远程实例间的数据传输
         self.remote_instance_transfer_engine = TransferEngine()
+        # 获取本地 IP 地址，用于网络通信
         local_ip = get_local_ip_auto()
+        # - envs.MOONCAKE_DEVICE.get(): 获取 Mooncake 设备类型（如 GPU、CPU 等）
+        # - "rdma": 使用 RDMA (Remote Direct Memory Access) 进行高效数据传输
+        # - "P2PHANDSHAKE": 使用点对点握手协议
+        # - local_ip: 本地 IP 地址
+        # 参数说明：
+        # 初始化传输引擎，配置通信协议和参数
         self.remote_instance_transfer_engine.initialize(
             local_ip,
             "P2PHANDSHAKE",
@@ -961,6 +987,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """
         import requests as http_requests
 
+        # 多机还是单机
         if self.server_args.dist_init_addr:
             # Multi-node: bootstrap server is on the head node (node_rank==0).
             # Derive host from dist_init_addr (shared across all nodes).
@@ -1091,6 +1118,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 except:
                     pass  # A warning will be raised in `init_distributed_environment`
 
+        # 建立分布式环境和通信组前，该GPU gpu_id 的可用显存
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         if not self.server_args.enable_p2p_check:
             monkey_patch_p2p_access_check()
@@ -1133,6 +1161,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     )
 
             # Only initialize the distributed environment on the target model worker.
+            # 建立nccl分布式环境
             init_distributed_environment(
                 backend=backend,
                 world_size=self.tp_size * self.pp_size,
@@ -1143,6 +1172,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 moe_a2a_backend=self.server_args.moe_a2a_backend,
                 recovered_rank=self.server_args.elastic_ep_rejoin,
             )
+            # 为模型并行配置好通信组。
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,
                 attention_data_parallel_size=self.dp_size,
@@ -1154,12 +1184,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 enable_symm_mem=self.server_args.enable_symm_mem,
                 recovered_rank=self.server_args.elastic_ep_rejoin,
             )
+            # 为特定的注意力机制并行（如数据并行注意力）配置好通信组。
             initialize_dp_attention(
                 server_args=self.server_args,
                 model_config=self.model_config,
             )
             if is_npu():
                 register_sgl_tp_rank(self.gpu_id)
+# 建立 分布式环境和通信组 后，获取所有GPU中可用显存的最小值。
+# 最终返回所有GPU中可用显存的那个最小值。
+# 当distributed=True时，会通过TP组中的其他所有GPU进行同步AllReduce Min,
 
             # Pre-warm NCCL/RCCL to eliminate cold-start latency in first request
             # Controlled by --pre-warm-nccl flag (default: enabled on AMD GPUs)
@@ -1191,8 +1225,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.attention_tp_group = get_attention_tp_group()
 
         # Check memory for tensor parallelism
+        # 建立 分布式环境和通信组 后，该GPU gpu_id 的可用显存
         local_gpu_memory = get_available_gpu_memory(self.device, self.gpu_id)
+        # 正常不是 draft model
         if self.tp_size > 1 and not self.is_draft_worker:
+            # 根据配置选择是否报错
+            # 意思是：如果最小显存 小于 该GPU gpu_id 的可用显存90%，则认为内存不均衡。
             if pre_model_load_memory < local_gpu_memory * 0.9:
                 msg = "The memory capacity is unbalanced. Some GPUs may be occupied by other processes. "
                 msg += f"{pre_model_load_memory=}, {local_gpu_memory=}, {local_gpu_memory * 0.9=}"
@@ -1263,6 +1301,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device != "cpu":
             torch.set_num_threads(1)
         if self.device == "cuda":
+            # cuda计算能力<8，只能float16，不支持bfloat16
             if torch.cuda.get_device_capability()[0] < 8:
                 logger.info(
                     "Compute capability below sm80. Use float16 due to lack of bfloat16 support."
@@ -1272,12 +1311,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 if torch.cuda.get_device_capability()[1] < 5:
                     raise RuntimeError("SGLang only supports sm75 and above.")
 
+        # 如果flashinfer可用，则配置环境变量
         set_cuda_arch()
 
         # Prepare the model config
         from sglang.srt.configs.modelopt_config import ModelOptConfig
 
         modelopt_config = ModelOptConfig(
+            # 模型量化配置！
             quant=self.server_args.modelopt_quant,
             checkpoint_restore_path=self.server_args.modelopt_checkpoint_restore_path,
             checkpoint_save_path=self.server_args.modelopt_checkpoint_save_path,
@@ -1312,6 +1353,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and self.server_args.remote_instance_weight_loader_backend
             == RemoteInstanceWeightLoaderBackend.NCCL
         ):
+            # 每个通信组的世界大小为2
+            # 例如：源TP 0 ↔ 目标TP 0，源TP 1 ↔ 目标TP 1等
+            # 在源实例和目标实例的每个TP（Tensor Parallel）rank之间建立通信组传输权重
+            # 支持从具有相同并行策略的实例加载权重,即要求 远程端的模型并行策略 与 当前端的模型并行策略 相同
+            # 开个线程异步发送
             if self.tp_rank == 0:
                 instance_ip = NetworkAddress.resolve_host(socket.gethostname())
                 t = threading.Thread(
@@ -1332,6 +1378,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         enable_cpu_backup = self.server_args.enable_weights_cpu_backup or (
             self.is_draft_worker and self.server_args.enable_draft_weights_cpu_backup
         )
+        # 方便model卸载
         with self.memory_saver_adapter.region(
             GPU_MEMORY_TYPE_WEIGHTS,
             enable_cpu_backup=enable_cpu_backup,
@@ -1340,6 +1387,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 load_config=self.load_config,
                 model_config=self.model_config,
             )
+            # 核心load
             self.model = self.loader.load_model(
                 model_config=self.model_config,
                 device_config=DeviceConfig(self.device, self.gpu_id),
@@ -1353,15 +1401,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if _is_npu:
             torch.npu.empty_cache()
         monkey_patch_vllm_parallel_state(reverse=True)
+# 如果有Offloader，那么现在就卸载到CPU？？？
 
         if not self.is_draft_worker:
             get_offloader().post_init()
 
         # Register model for layerwise NVTX profiling if enabled
+        # 在模型运行时，使用NVTX进行layer细粒度性能分析
         if self.server_args.enable_layerwise_nvtx_marker:
             pyt_hooks = PytHooks()
             pyt_hooks.register_hooks(self.model, module_prefix="model")
 
+        # 如果使用FP8来存储KV Cache，那么fp8的scale因子是需要手动配置
         if self.server_args.kv_cache_dtype == "fp8_e4m3":
             if self.server_args.quantization_param_path is not None:
                 if callable(getattr(self.model, "load_kv_cache_scales", None)):
@@ -1809,6 +1860,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ), "Default torch process group must be initialized"
         assert group_name != "", "Group name cannot be empty"
 
+        # 远程Training Engine端的某个rank发送请求，与本地Infer Engine的某个rank，希望建立通信组
         rank = rank_offset + self.tp_rank
 
         logger.info(
@@ -1867,6 +1919,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             "Please call `init_weights_update_group` first."
         )
 
+        # 1. 一般都会分桶更新，且多个权重被展开为一维拼凑一起
         if load_format == "flattened_bucket":
             return self._update_bucketed_weights_from_distributed(
                 names, dtypes, shapes, group_name
@@ -1874,6 +1927,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         try:
             weights = []
             handles = []
+            # 然后通过调用broadcast函数阻塞等待远程Training Engine将权重广播过来
+            # 传递name、dtype、shape给Infer Engine，Infer Engine本地的rank创建empty tensor
             for name, dtype, shape in zip(names, dtypes, shapes):
                 target_dtype = (
                     dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
@@ -1891,6 +1946,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             for handle in handles:
                 handle.wait()
 
+            # 加载权重
             self.model.load_weights(weights)
             return True, "Succeeded to update parameter online."
 
@@ -1942,6 +1998,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         monkey_patch_torch_reductions()
         if load_format == "flattened_bucket":
             # Handle flattened bucket format
+            # 将flattened的大的一个Tensor，根据多个权重的matedata重构出多个Tensor，然后再调用model.load_weights
             return self._update_weights_from_flattened_bucket(
                 flattened_tensor_bucket_dict=named_tensors
             )
@@ -1950,15 +2007,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         device_module = torch.get_device_module(self.device)
         infered_device = device_module.current_device()
 
+        # 2. 非flattened bucket，那么统一转成Tensor进行更新
         named_tensors = [
+            # _unwrap_tensor: 将LocalSerializedTensor转成Tensor
             (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
             for name, tensor in named_tensors
         ]
+        # (1) 获取模型model.named_parameters()所有tensor，逐个copy过去
         if load_format == "direct":
             _model_load_weights_direct(self.model, named_tensors)
+        # (2) 自定义custom_loader
         elif load_format in self.server_args.custom_weight_loader:
             custom_loader = dynamic_import(load_format)
             custom_loader(self.model, named_tensors)
+        # (3) 默认model自带load_weights,一般只是比direct模型多了一些name转换或者校准的逻辑
         elif load_format is None:
             self.model.load_weights(named_tensors)
         else:
@@ -1987,9 +2049,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             converted_metadata.append(converted_meta)
 
         # Create bucket and reconstruct tensors
+        # 根据多个权重的matedata重构出多个Tensor
         bucket = FlattenedTensorBucket(
             flattened_tensor=flattened_tensor, metadata=converted_metadata
         )
+        # 逻辑很简单：逐个定位[meta.start_idx : meta.end_idx]，然后.view(meta.dtype).reshape(meta.shape)
         reconstructed_tensors = bucket.reconstruct_tensors()
 
         # Load the reconstructed tensors using the standard method
@@ -2261,6 +2325,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def init_attention_backend(self):
         """Init attention kernel backend."""
+        # PD-Multiplexing(复用)是一种优化技术，允许在同一个GPU上同时运行模型的预填充阶段和解码阶段，以提高资源利用率和吞吐量。
         if self.server_args.enable_pdmux:
             self.attn_backend = self._get_attention_backend(init_new_workspace=True)
             self.decode_attn_backend_group = []
@@ -2270,6 +2335,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         elif self.server_args.enable_two_batch_overlap and not self.is_draft_worker:
             self.attn_backend = TboAttnBackend.init_new(self._get_attention_backend)
         else:
+            # 正常应该是这个？
             self.attn_backend = self._get_attention_backend()
 
     def _get_attention_backend(self, init_new_workspace: bool = False):
@@ -2289,6 +2355,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.decode_attention_backend_str,
         ) = self.server_args.get_attention_backends()
 
+        # 如果解码的注意力后端和预填充的注意力后端不一致，则使用混合注意力后端
         if self.decode_attention_backend_str != self.prefill_attention_backend_str:
             from sglang.srt.layers.attention.hybrid_attn_backend import (
                 HybridAttnBackend,
@@ -2324,6 +2391,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             get_global_server_args().prefill_attention_backend,
             get_global_server_args().decode_attention_backend,
         ) = (self.prefill_attention_backend_str, self.decode_attention_backend_str)
+        # 返回注意力后端
         return attn_backend
 
     def _get_attention_backend_from_str(
@@ -2922,8 +2990,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             return
 
+        # 收集所有Attn计算模块
         self.attention_layers = []
+        # 收集所有moe专家模块
         self.moe_layers = []
+        # 哪些module需要运行piecewise cuda graph
         self.moe_fusions = []
         self.dsa_indexers = []
         for layer in layer_model.layers:

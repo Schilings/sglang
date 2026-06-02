@@ -117,6 +117,7 @@ class SchedulerWeightUpdaterManager:
         """Update the online model parameter."""
         success, message = self.tp_worker.update_weights_from_distributed(recv_req)
         if success:
+            # 回收所有kv cache，并重置状态
             self.flush_cache_after_weight_update(recv_req)
         else:
             logger.error(message)
@@ -133,6 +134,7 @@ class SchedulerWeightUpdaterManager:
             self.flush_cache_after_weight_update(recv_req)
         else:
             logger.error(message)
+        # 因为新权重来自同一个GPU，因此在继续使用前，需要阻塞等待所有rank都完成
         torch.distributed.barrier(group=self.tp_cpu_group)
         return UpdateWeightsFromTensorReqOutput(success, message)
 
@@ -166,6 +168,7 @@ class SchedulerWeightUpdaterManager:
         for tag in tags:
             self.offload_tags.add(tag)
 
+        # 权重weights、kv cache、cuda graph
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
             self.flush_cache()
@@ -177,6 +180,7 @@ class SchedulerWeightUpdaterManager:
             torch.distributed.barrier(self.tp_cpu_group)
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
 
+        # 权重weights、kv cache、cuda graph等
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
 

@@ -715,14 +715,17 @@ class DefaultModelLoader(BaseModelLoader):
 
         target_device = torch.device(device_config.device)
         quant_config = _get_quantization_config(model_config, self.load_config)
+        # 模型dtype
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
+                # 获取模型架构
                 model = _initialize_model(
                     model_config,
                     self.load_config,
                     quant_config,
                 )
 
+            # 加载权重
             self.load_weights_and_postprocess(
                 model, self._get_all_weights(model_config, model), target_device
             )

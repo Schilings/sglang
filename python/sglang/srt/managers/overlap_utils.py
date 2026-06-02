@@ -95,7 +95,13 @@ def resolve_forward_inputs(batch: ScheduleBatch, future_map: FutureMap) -> None:
                     batch.mix_running_indices,
                 )
             batch.input_ids = torch.cat([prefill_gpu, decode_gpu])
+        # 2. Speculative模式：存储完整的draft输入信息
         else:
+            # 所以 负数ID取负数变为正数索引，从token_ids_buf取出token id替换到input_ids内对应位置
+            # 负数ID 表示的是 token_ids_buf的索引值的负数
+            # 如果input_ids内的有些token id是负数
+            # 普通decode模式下，将负数的token id替换为future token id。
+            # speculative模式下延迟初始化缓冲区
             batch.input_ids = prefill_gpu
         batch.prefill_input_ids_cpu = None
         batch.mix_running_indices = None
@@ -131,6 +137,7 @@ class FutureMap:
         # full decision (per-backend flag + TBO / piecewise CG overrides).
         self.needs_cpu_seq_lens = needs_cpu_seq_lens
         self.req_pool_size = req_to_token_pool.req_to_token.shape[0]
+# 1. 普通解码模式：只存储token IDs
 
         self.output_tokens_buf = (
             torch.full((self.req_pool_size,), -1, dtype=torch.int64, device=self.device)

@@ -299,6 +299,7 @@ def initialize_dp_attention(
         if moe_dense_tp_size is None:
             _LOCAL_ATTN_DP_SIZE = _ATTN_DP_SIZE
         else:
+            # 没用到
             _LOCAL_ATTN_DP_SIZE = max(1, dp_size // (tp_size // moe_dense_tp_size))
     else:
         _ATTN_DP_SIZE = 1

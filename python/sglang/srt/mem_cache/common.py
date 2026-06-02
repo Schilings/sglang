@@ -72,7 +72,9 @@ def write_cache_indices(
     prefix_tensors: list[torch.Tensor],
     req_to_token_pool: ReqToTokenPool,
 ):
+    # 使用Triton
     if support_triton(get_global_server_args().attention_backend):
+        # 为什么要通过data_ptr的方式呢
         prefix_pointers = torch.tensor(
             [t.data_ptr() for t in prefix_tensors],
             device=req_to_token_pool.device,
@@ -97,6 +99,8 @@ def write_cache_indices(
             seq_len = seq_lens_cpu[i].item()
             extend_len = extend_lens_cpu[i].item()
 
+            # 写prefill的token的kv indices
+            # 写prefix的kv indices
             req_to_token_pool.write(
                 (req_idx, slice(0, prefix_len)),
                 prefix_tensors[i],
@@ -156,6 +160,7 @@ def alloc_token_slots(
     backup_state: bool = False,
 ):
     allocator = tree_cache.token_to_kv_pool_allocator
+    # 如果allocator内剩余kv indices不足，调用tree_cache.evict(num_tokens)清除
     evict_from_tree_cache(tree_cache, num_tokens)
 
     state = None
@@ -216,6 +221,7 @@ def alloc_paged_token_slots_extend(
 ):
     # Over estimate the number of tokens: assume each request needs a new page.
     allocator = tree_cache.token_to_kv_pool_allocator
+    # 诶？为什么要多出 num of request 页
     num_tokens = extend_num_tokens + len(seq_lens_cpu) * allocator.page_size
     evict_from_tree_cache(tree_cache, num_tokens)
 
@@ -223,6 +229,7 @@ def alloc_paged_token_slots_extend(
     if backup_state:
         state = allocator.backup_state()
 
+    # out_cache_loc ：[extend_num_tokens, ]记录这些token对应的kv indices
     out_cache_loc = allocator.alloc_extend(
         prefix_lens,
         prefix_lens_cpu,
@@ -300,6 +307,8 @@ def alloc_for_extend(
     extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
 
     # Allocate req slots
+    # req_pool_indices : [num_reqs, ] 记录了这些request在req_to_token_pool中的索引
+    # 1. Req角度分配
     req_pool_indices = alloc_req_slots(
         batch.req_to_token_pool, batch.reqs, batch.tree_cache
     )
@@ -307,6 +316,7 @@ def alloc_for_extend(
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
     # Allocate KV cache (throws exception on failure)
+    # 2.KV token角度分配
     if batch.tree_cache.page_size == 1:
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     else:
@@ -315,6 +325,7 @@ def alloc_for_extend(
             (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
             for t in prefix_tensors
         ]
+        # out_cache_loc ：[extend_num_tokens, ] allocator分配的记录这些token对应的kv indices
         out_cache_loc = alloc_paged_token_slots_extend(
             tree_cache=batch.tree_cache,
             prefix_lens=prefix_lens_device,
@@ -326,6 +337,8 @@ def alloc_for_extend(
         )
 
     # Write to req_to_token_pool
+    # 即各自req对应的req_to_token_pool的行，记录的是每个token的kv index值
+    # 根据req_pool_indices往 request对应的req_to_token_pool中写入out_cache_loc的值
     write_cache_indices(
         out_cache_loc,
         req_pool_indices_device,

@@ -268,6 +268,7 @@ class MultimodalDataItem:
         ):
             return self.__dict__["model_specific_data"][name]
         else:
+            # 如果不全是是decode请求，则extend的len属性要设置
             raise AttributeError(
                 f"'{self.__class__.__name__}' object has no attribute '{name}'"
             )
@@ -557,6 +558,7 @@ class MultimodalInputs:
             "media_nums_per_sample",
             "visible_frame_counts",
         ]
+        # 转成tensor，并移到gpu
         for arg in optional_args:
             val = getattr(obj, arg, None)
             if val is not None:
@@ -1080,6 +1082,7 @@ class Req(ReqDllmMixin):
         if tree_cache is not None:
             if cow_mamba is None:
                 cow_mamba = tree_cache.supports_mamba()
+            # 核心：匹配前缀，获取前缀的kv indices
             match_result = tree_cache.match_prefix(
                 MatchPrefixParams(
                     key=RadixKey(
@@ -1129,6 +1132,7 @@ class Req(ReqDllmMixin):
                 )
             )
 
+        # extend_input_len表示除了prefix的部分，即除了prefix的token
         self.set_extend_input_len(len(self.fill_ids) - len(self.prefix_indices))
 
     def _compute_max_prefix_len(self, input_len: int) -> int:
@@ -1482,16 +1486,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
 
     # === Core: request list (ForwardBatch derives lora_ids / rids / grammars / positions from it) ===
+    # 请求列表
     reqs: List[Req]
 
     # === Global config and shared resources (engine-lifetime; identical across batches) ===
     # Memory pool and cache
+    # 所有 requests 的所有 token 到 kv cache 的映射池
     req_to_token_pool: ReqToTokenPool = None
+    # KV cache 分配器
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator = None
+    # 前缀缓存树
     tree_cache: BasePrefixCache = None
 
     # Batch configs
     model_config: ModelConfig = None
+    # 是否开启schedule overlapping
     enable_overlap: bool = False
 
     # Device
@@ -1504,9 +1513,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Tell whether the current running batch is full so that we can skip
     # the check of whether to prefill new requests.
     # This is an optimization to reduce the overhead of the prefill check.
+    # running队列内的请求是否已经满了。满了就不添加新的prefill请求
     batch_is_full: bool = False
 
     # For chunked prefill in PP
+    # 因此chunked_req记录该chunked prefill 请求，且顶多一个
+    # 每一次schedule，因为限制了bucket token数，那么可能会有一个token在prefill截断
     chunked_req: Optional[Req] = None
     chunked_req_next_prompt_token: Optional[int] = None
     contains_last_prefill_chunk: bool = True
@@ -1514,6 +1526,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For DP attention
     inner_idle_batch: Optional[ScheduleBatch] = None
     # Decode requests carried alongside a chunked-prefill batch
+    # decode请求
     decoding_reqs: List[Req] = None
 
     # For split prefill
@@ -1539,6 +1552,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # === GPU tensors crossing to ForwardBatch (clone targets for stream isolation) ===
     # Batched arguments to model runner
+    # 输入 token IDs
     input_ids: torch.Tensor = None  # shape: [b], int64
     # Staging consumed by resolve_forward_inputs (prefill H2D / mixed gather).
     prefill_input_ids_cpu: Optional[torch.Tensor] = None
@@ -1553,12 +1567,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     ne_token_table: torch.Tensor = None
 
     req_pool_indices: torch.Tensor = None  # shape: [b], int64
+    # 所有 requests 的序列长度
     seq_lens: torch.Tensor = None  # shape: [b], int64
 
     # The original sequence lengths, Qwen-1M related
     orig_seq_lens: torch.Tensor = None  # shape: [b], int32
 
     # The output locations of the KV cache
+    # 输出 token IDs
     out_cache_loc: torch.Tensor = None  # shape: [b], int64
 
     # For hybrid GDN prefix cache
@@ -1578,6 +1594,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     extend_input_logprob_token_ids: Optional[torch.Tensor] = None
 
     # === Config / flags crossing to ForwardBatch (by-value) ===
+    # 前向模式
     forward_mode: ForwardMode = None
     global_forward_mode: Optional[ForwardMode] = None
 
@@ -1604,6 +1621,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # The sum of all sequence lengths
     seq_lens_sum: int = None
+    # prefill请求的token总数
     extend_num_tokens: Optional[int] = None
 
     # Diffusion LLM
@@ -1624,7 +1642,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     encoder_lens_cpu: Optional[List[int]] = None
 
     # For extend and mixed chunekd prefill
+    # 所有 requests 的前缀长度
     prefix_lens: List[int] = None
+    # prefill请求的长度 (seq_len - prefix_len)
     extend_lens: List[int] = None
     extend_logprob_start_lens: List[int] = None
 
@@ -1672,6 +1692,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             device=req_to_token_pool.device,
             spec_algorithm=spec_algorithm,
             return_hidden_states=any(req.return_hidden_states for req in reqs),
+            #Batch：表示Bacth内是否存在一个请求的is_prefill_only为True
+            #Req：表示该请求是否只执行prefill，如果False，则该请求执行完prefill要执行decode
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
             chunked_req_next_prompt_token=_compute_chunked_req_next_prompt_token(
@@ -1811,6 +1833,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.logprob_start_len = max(req.logprob_start_len, encoder_len)
 
     def prepare_for_extend(self):
+        # Prefill Batch标识
         self.forward_mode = ForwardMode.EXTEND
 
         if self.is_dllm():
@@ -1819,11 +1842,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Init tensors
         reqs = self.reqs
+        # 每个请求的input_ids
         input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
+        # 每个请求的seq_len
         seq_lens = [len(r.fill_ids) for r in reqs]
+        # 每个请求的prompt len
         orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
+        # 每个请求的prefix len
         prefix_lens = [len(r.prefix_indices) for r in reqs]
+        # 该batch所有请求的即将计算的token数总和
         extend_lens = [r.extend_input_len for r in reqs]
 
         _pin = is_pin_memory_available(self.device)
@@ -2041,6 +2069,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
+        # 暂时不考虑mamba
         if get_global_server_args().enable_mamba_extra_buffer():
             self.mamba_track_indices = torch.tensor(
                 mamba_track_indices_cpu,
@@ -2282,6 +2311,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # requests from the back, so we can only retract from the back.
         # TODO(sang): Clean up finish path and support better retract
         # policy.
+        # 最后导致 --> 输出越短 + 输入越长 排前面， 排后面的优先被回退
+        # 3. 使用reverse=True实现降序排序
+        # 2. 当output_ids长度相同时，按origin_input_ids长度升序排列（输入越短排在越前面）
+        # 1. 按output_ids长度降序排列（输出越长排在越前面）
         if not server_args.speculative_algorithm:
             sorted_indices.sort(
                 key=lambda i: (
@@ -2293,6 +2326,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         retracted_reqs = []
         first_iter = True
+        # 持续回退，回退至显存够用
         while first_iter or (
             not self.check_decode_mem(selected_indices=sorted_indices)
         ):
@@ -2301,13 +2335,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 break
 
             first_iter = False
+            # 输出越长 + 输入越短 优先被回退
+            # 弹出尾部请求索引，排后面的优先被回退
             idx = sorted_indices.pop()
             req = self.reqs[idx]
             retracted_reqs.append(req)
             # release memory and don't insert into the tree because we need the space instantly
+            # 释放掉请求（token_to_kv_pool_allocator、radix cache、req_to_token_pool）
             self.release_req(idx, len(sorted_indices), server_args)
 
         reqs_to_abort: List[Req] = []
+        # 一个请求，可能太长了，一个都容纳不了
         if len(sorted_indices) <= 1 and not self.check_decode_mem(
             selected_indices=sorted_indices
         ):
@@ -2326,6 +2364,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 "retract_decode: aborted last request %s due to OOM", last_req.rid
             )
 
+        # sorted_indices剩下没被回退的
         self.filter_batch(keep_indices=sorted_indices)
 
         # Reqs in batch are filtered
@@ -2346,11 +2385,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             )
         # TODO (csy): for preempted requests, we may want to insert into the tree
+        # is_insert=False，表示释放资源，且不插入到前缀数上，即不留着给其他请求匹配prefix
         release_kv_cache(req, self.tree_cache, is_insert=False)
         # NOTE(lsyin): we should use the newly evictable memory instantly.
         num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
         evict_from_tree_cache(self.tree_cache, num_tokens)
 
+        # 回退该请求，is_retracted = True
         req.reset_for_retract()
 
     def prepare_encoder_info_decode(self):
@@ -2358,6 +2399,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.encoder_cached = [True] * len(self.reqs)
 
     def prepare_for_idle(self):
+        # IDLE Batch标识
         self.forward_mode = ForwardMode.IDLE
         self.input_ids = torch.empty(0, dtype=torch.int64, device=self.device)
         self.seq_lens = torch.empty(0, dtype=torch.int64, device=self.device)
@@ -2381,6 +2423,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return ret
 
     def prepare_for_decode(self):
+        # Decode Batch标识
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
         # Decode embeds the last output token via embed_tokens; clear the stale
@@ -2638,6 +2681,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,
             all_extend_in_batch=self.all_extend_in_batch,
+            #Batch：表示Bacth内是否存在一个请求的is_prefill_only为True
+            #Req：表示该请求是否只执行prefill，如果False，则该请求执行完prefill要执行decode
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,

@@ -279,6 +279,7 @@ class TorchNativeAttnBackend(AttentionBackend):
             cache_loc = forward_batch.encoder_out_cache_loc
         else:
             cache_loc = forward_batch.out_cache_loc
+# 先保存kv
 
         if save_kv_cache and k is not None and v is not None:
             self.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)

@@ -109,6 +109,7 @@ class Qwen3_VisionMLP(nn.Module):
         prefix: str = "",
         use_data_parallel: bool = False,
     ):
+        #  输入dim = 输出dim
         super().__init__()
         self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
         self.tp_rank = 0 if use_data_parallel else get_attention_tp_rank()
@@ -145,6 +146,7 @@ class Qwen3VLVisionPatchEmbed(nn.Module):
         self.patch_size = config.patch_size
         self.temporal_patch_size = config.temporal_patch_size
         self.in_channels = config.in_channels
+        # 输出维度 hidden_size
         self.embed_dim = config.hidden_size
 
         kernel_size = [self.temporal_patch_size, self.patch_size, self.patch_size]
@@ -260,6 +262,7 @@ class Qwen3VLMoeVisionPatchMerger(nn.Module):
         use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
+        # 输入dim ！= 输出dim
         self.hidden_size = context_dim * (spatial_merge_size**2)
         self.padded_context_dim = padded_context_dim * (spatial_merge_size**2)
 
@@ -395,6 +398,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
                 for layer_idx in range(vision_config.depth)
             ]
         )
+        # 5 输出dim ！= 输出dim
         self.merger = Qwen3VLMoeVisionPatchMerger(
             dim=vision_config.out_hidden_size,
             context_dim=self.hidden_size,
