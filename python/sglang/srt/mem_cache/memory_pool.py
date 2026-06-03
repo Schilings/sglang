@@ -969,7 +969,7 @@ class MHATokenToKVPool(KVCache):
         self.data_ptrs = torch.cat([self.k_data_ptrs, self.v_data_ptrs], dim=0)
         # 简单说就是预计算每个缓存张量的内存步长，用于优化KV缓存的传输和复制操作。
         # 计算每个张量形状除第一维外其余维度的乘积，再乘以数据类型大小
-        self.data_strides = torch.tensor(
+        self.data_strides = torch.tensor( 
             [
                 np.prod(x.shape[1:]) * x.dtype.itemsize
                 for x in self.k_buffer + self.v_buffer
