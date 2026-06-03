@@ -430,6 +430,7 @@ class CompressorBackendMixin:
         compress_ratio: int,             # 4 or 128
         page_size: int,
         out_loc: torch.Tensor,           # [num_compressed_tokens] — 分页缓存中的输出槽位索引
+        use_fp4_indexer: bool = False,
     ) -> None:
         assert compress_ratio == 4 or compress_ratio == 128
         assert rotate == is_indexer == (head_dim == 128)
@@ -485,6 +486,9 @@ class CompressorBackendMixin:
         kv_score_input = compressor.compute_kv_score(x, forward_batch)  # [T, 2*coff*head_dim] — linear(x, wkv_gate)
         state_pool = compressor.get_state_pool(forward_batch)
         out_loc = self._get_out_loc(compressor.ratio)  # [num_compressed_tokens] — 输出槽位索引
+        use_fp4_indexer = (
+            compressor.is_in_indexer and self.enable_deepseek_v4_fp4_indexer
+        )
         if compressor.is_in_indexer:
             kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)
             page_size = token_to_kv_pool.get_index_k_page_size()
@@ -511,6 +515,7 @@ class CompressorBackendMixin:
             compress_ratio=compressor.ratio,
             page_size=page_size,
             out_loc=out_loc,                 # [num_compressed_tokens]
+            use_fp4_indexer=use_fp4_indexer,
         )
         from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
         from sglang.srt.layers.attention.nsa.triton_kernel import act_quant

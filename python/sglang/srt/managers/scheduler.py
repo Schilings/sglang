@@ -284,7 +284,6 @@ _is_npu = is_npu()
 
 
 class Scheduler(
-    # 负责处理 SchedulerOutput
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
     SchedulerMultiplexMixin,
