@@ -66,12 +66,12 @@ class TreeNode:
         self.key: RadixKey = None
         self.value: Optional[torch.Tensor] = None
         # swa_tombstone is used to indicate the kv indices have been freed for swa layers
-        self.swa_tombstone = False
+        self.swa_tombstone = False # SWA 数据是否已"死亡"
         # invariant: for any node, if swa_lock_ref is locked, full_lock_ref must be locked;
         # if full_lock_ref is locked, swa_lock_ref doesn't need to be locked. So,
         # full_lock_ref is always >= swa_lock_ref.
-        self.full_lock_ref = 0
-        self.swa_lock_ref = 0
+        self.full_lock_ref = 0 # Full KV 的引用计数
+        self.swa_lock_ref = 0 # SWA KV 的引用计数
         # last access time is only used for sanity check. LRU is maintained by the lru list.
         self.last_access_time = get_last_access_time()
 
@@ -91,7 +91,7 @@ class TreeNode:
 
         self.id = TreeNode.counter if id is None else id
         TreeNode.counter += 1
-        self.swa_uuid = None
+        self.swa_uuid = None # SWA 锁的边界标记
 
     @property
     def evicted(self):
@@ -377,13 +377,13 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         self.root_node.hash_value = []
         self.root_node.full_lock_ref = 1
         self.root_node.swa_lock_ref = 1
-        self.full_evictable_size_ = 0
-        self.swa_evictable_size_ = 0
-        self.full_protected_size_ = 0
-        self.swa_protected_size_ = 0
+        self.full_evictable_size_ = 0 #  Full 可驱逐量
+        self.swa_evictable_size_ = 0 # SWA 可驱逐量
+        self.full_protected_size_ = 0 # Full 被锁定量
+        self.swa_protected_size_ = 0 # SWA 被锁定量
         # LRU lists are used to maintain the order of eviction of the nodes in the tree
-        self.full_lru_list = LRUList(is_swa_list=False)
-        self.swa_lru_list = LRUList(is_swa_list=True)
+        self.full_lru_list = LRUList(is_swa_list=False) # Full 维度的 LRU 链表
+        self.swa_lru_list = LRUList(is_swa_list=True) # SWA 维度的 LRU 链表
         self._record_all_cleared_event()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
@@ -674,9 +674,19 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         It locks the full_lock_ref for nodes between the [last node, root), exclusive.
         It locks the swa_lock_ref for nodes between the [last node, swa_uuid_for_lock], inclusive.
         """
+        '''
+        树结构:  Root → N1[0-32] → N2[32-64] → N3[64-96] → N4[96-128]
+        请求匹配到 N4, sliding_window=64
+        
+        Full 加锁: N4 + N3 + N2 + N1 (全部)
+        SWA 加锁:  N4(32) + N3(32) = 64 → 到 N3 就够了
+          → swa_uuid_for_lock = N3.swa_uuid
+          → 解锁时只需解锁到 N3
+        '''
         if self.disable:
             return IncLockRefResult()
 
+        # 加锁时 Full 和 SWA 范围不同
         swa_lock_size = 0
         swa_uuid_for_lock = None
         while node != self.root_node:
@@ -687,11 +697,13 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             if node.full_lock_ref == 0:
                 self.full_evictable_size_ -= len(node.value)
                 self.full_protected_size_ += len(node.value)
+            # Full: 从 node 到 root 全部加锁
             node.full_lock_ref += 1
 
             # lock swa if we have not reached the sliding window size.
             # When we reach the sliding window size, we will set the swa_uuid_for_lock.
             # caller needs to pass the swa_uuid_for_lock to dec_lock_ref
+            # SWA: 只锁最近 sliding_window_size 个 token
             if swa_lock_size < self.sliding_window_size:
                 assert (
                     not node.swa_tombstone
@@ -703,6 +715,9 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 swa_lock_size += len(node.value)
                 if swa_lock_size >= self.sliding_window_size:
                     if node.swa_uuid is None:
+                        # 标记 SWA 锁的边界
+                        # swa_uuid_for_lock 的作用：因为 SWA 锁只覆盖最近 W 个 token，需要标记锁到哪里为止。
+                        # 这个 UUID 在 dec_lock_ref 中用来判断什么时候停止解锁 SWA。
                         node.swa_uuid = gen_swa_uuid()
                     swa_uuid_for_lock = node.swa_uuid
             node = node.parent
@@ -727,7 +742,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
         if self.disable:
             return DecLockRefResult()
-
+        # 解锁时用 UUID 控制范围
         dec_lock_swa = not skip_swa
         while node != self.root_node:
             assert (
@@ -736,8 +751,10 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             if node.full_lock_ref == 1:
                 self.full_evictable_size_ += len(node.value)
                 self.full_protected_size_ -= len(node.value)
+            # Full: 全部解锁
             node.full_lock_ref -= 1
 
+            # SWA: 解锁到 swa_uuid_for_lock 为止
             if dec_lock_swa:
                 assert (
                     not node.swa_tombstone
@@ -751,6 +768,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                     self.swa_protected_size_ -= len(node.value)
                 node.swa_lock_ref -= 1
                 if swa_uuid_for_lock and node.swa_uuid == swa_uuid_for_lock:
+                    # 到边界了，停止解锁 SWA
                     dec_lock_swa = False
 
             node = node.parent
@@ -784,7 +802,8 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         """
         if self.disable:
             return
-
+        # SWA 提前释放优化
+        # 这是性能优化的关键。请求在 decode 阶段，随着位置前进，旧的 SWA 锁已经没用了：
         while node != self.root_node:
             assert (
                 not node.swa_tombstone
@@ -793,8 +812,13 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 node.swa_lock_ref > 0
             ), f"dec_swa_lock_only on node with {node.swa_lock_ref=}, {node.id=}"
 
+            # 最后一个 SWA 锁要释放了
+            # 叶子 vs 内部节点的不同处理：
+            # 叶子：立即 free_swa + tombstone，因为 SWA LRU 不能包含有 full_lock_ref > 0 的叶子
+            # 内部：只移入 swa_evictable，后续 SWA 驱逐时统一处理
             if node.swa_lock_ref == 1:
                 self.swa_protected_size_ -= len(node.value)
+                # Fast-Path：叶子节点，直接回收 SWA 物理内存 + tombstone
                 if len(node.children) == 0:
                     # Leaf: free SWA pool slots and tombstone, and remove from
                     # swa_lru_list so SWA-eviction won't pick this tombstoned
@@ -804,10 +828,11 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                     self.swa_lru_list.remove_node(node)
                     node.swa_tombstone = True
                 else:
+                    # 内部节点：标记为可驱逐
                     # Internal: standard protected -> evictable.
                     self.swa_evictable_size_ += len(node.value)
             node.swa_lock_ref -= 1
-
+            # 边界节点不能释放，可能包含其他req的资源
             if swa_uuid_for_lock and node.swa_uuid == swa_uuid_for_lock:
                 break
             node = node.parent
@@ -877,7 +902,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
         value = []
         # for path connected to root without tombstone, always match, so set to inf
-        match_len_since_tombstone = float("inf")
+        match_len_since_tombstone = float("inf") # 从 root 出发没有 tombstone
         best_value_len = 0
         best_last_node = node
         enable_compact = envs.SGLANG_OPT_SWA_RADIX_CACHE_COMPACT.get()
@@ -886,17 +911,21 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
             if enable_compact:
                 self._compact_single_child_chain(child)
-
+            # 一直重复尝试匹配到连续的非 tombstone 节点，断了就重来
+            # 遇到 tombstone 时，从 tombstone 之后开始重新计数非 tombstone 的匹配长度。
+            # 只有连续非 tombstone 的匹配长度 ≥ sliding_window_size 时，SWA 层才能有效使用这段前缀。
+            # 这是 tombstone 影响前缀匹配安全性的关键逻辑。
             if child.swa_tombstone:
                 # update best_value_len and best_last_node if needed
                 if match_len_since_tombstone >= self.sliding_window_size:
                     best_value_len = len(value)
                     best_last_node = node
                 # reset match_len_since_tombstone if we hit a tombstone node
-                match_len_since_tombstone = 0
+                match_len_since_tombstone = 0 # 重置计数
 
             prefix_len = child.key.match(key, page_size=self.page_size)
             if prefix_len < len(child.key):
+                # 部分匹配
                 new_node = self._split_node(child.key, child, prefix_len)
                 value.append(new_node.value)
                 if not new_node.swa_tombstone:
@@ -904,6 +933,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 node = new_node
                 break
             else:
+                # 完全匹配
                 value.append(child.value)
                 if not child.swa_tombstone:
                     match_len_since_tombstone += len(child.value)
