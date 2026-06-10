@@ -2688,6 +2688,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     def maybe_evict_swa(self):
+        """Q: SWA 提前回收在哪里触发？为什么要提前回收？
+           A: 每个 batch 处理前调用 maybe_evict_swa()，在两种模式下触发:
+              • decode 模式: token 逐 token 生成，每 eviction_interval 步回收一次
+              • chunked extend 模式 (ChunkCache): prefill 逐 chunk 进行，每 chunk 都检查
+
+              提前回收的目的: SWA 层只需要 window_size 内的 KV。
+              一旦 token 滑出窗口，对应的 swa slot 就可以释放回 swa_attn_allocator，
+              供其他请求复用。而 full slot 要保留到请求结束。
+
+           Q: 为什么用 eviction_interval 而不是每一步都回收？
+           A: 平衡"SWA token 浪费"和"回收开销"。
+              每一步都回收浪费在 mapping 查表和 free 操作上，
+              每隔 N 步回收一次会多占 N 个 swa slot，但省了 (N-1) 次回收开销。
+              interval = max(page_size, window_size × MULTIPLIER) 且对齐到 page。
+        """
         if self.tree_cache.supports_swa():
             sliding_window_size = self.tree_cache.sliding_window_size
             server_args = get_global_server_args()
@@ -2697,8 +2712,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 and hasattr(self.tree_cache, "dec_swa_lock_only")
             )
 
-            # Eviction_interval: trade-off between SWA token waste and eviction overhead
             page_size = self.tree_cache.page_size
+            # 回收间隔: max(page_size, window_size * MULTIPLIER)，对齐到 page
             eviction_interval = max(
                 page_size,
                 int(
@@ -2709,16 +2724,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             eviction_interval = (eviction_interval // page_size) * page_size
             for idx, req in enumerate(self.reqs):
                 if self.forward_mode.is_decode():
-                    # We set evict_swa condition here with two reasons:
-                    # 1. In overlap scheduler, we cannot evict swa when req.decode_batch_idx == 0 since the prev extend batch is still running.
-                    # 2. Evict swa every eviction_interval tokens to reduce the overhead.
+                    # decode: token 逐 token 生成，每 eviction_interval 步回收一次
+                    # decode_batch_idx=0 是刚转入 decode 的第一帧，overlap 模式下上轮 extend 可能还在跑，跳过
                     if req.decode_batch_idx % eviction_interval == 1:
-                        self._evict_swa(req, req.seqlen - 1)
+                        self._evict_swa(req, req.seqlen - 1)    # pre_len = seqlen - 1
 
-                    # Once the decode position has moved past the sliding window,
-                    # the SWA portion of the prefill-time tree lock is no longer
-                    # needed by this request. Convert it from protected to
-                    # evictable so SWA LRU can reclaim it under pressure.
+                    # decode 位置超出滑动窗口后，SWA 的树锁不再需要
+                    # 转为可驱逐状态，SWA LRU 可在压力下回收
                     if (
                         release_leaf_lock
                         and not req.swa_prefix_lock_released
@@ -2731,12 +2743,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         )
                         req.swa_prefix_lock_released = True
                 elif self.forward_mode.is_extend() and self.tree_cache.is_chunk_cache():
+                    # chunked prefill: 每 chunk 结束后回收滑出窗口的 SWA token
                     pre_len = self.prefix_lens[idx]
                     if self.enable_overlap:
-                        # In chunked prefill case, when the second extend batch is scheduling, the first extend batch is still running, so we cannot evict swa tokens
+                        # overlap 模式下 extend_batch_idx=0/1 时上轮还在跑，不能回收
                         if req.extend_batch_idx < 2:
                             continue
                         else:
+                            # 用上一轮的 pre_len（减掉当前 chunk size）来算回收边界
                             pre_len = (
                                 pre_len - server_args.chunked_prefill_size
                                 if server_args.chunked_prefill_size > 0
@@ -2747,41 +2761,58 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         self._evict_swa(req, pre_len)
 
     def _evict_swa(self, req: Req, pre_len: int):
+        """Q: 回收的边界是怎么算的？为什么有个 page_size 的安全边际？
+           A: evict_threshold = pre_len - sliding_window_size - page_size
+              即 pre_len 往前推 window_size + page_size 个位置。
+              多减一个 page_size 是为了保留一个"锚点 page"，让 radix tree 的
+              叶子节点有非 tombstone 的 value 可存，保证多轮对话的缓存复用。
+              不保留的话叶子节点变成 tombstone，导致 SWA 内存泄漏。
+
+           Q: 为什么不回收边界以下的 token（如 threshold 内的）？
+           A: req.swa_evicted_seqlen 记录已回收的位置，每次都从上次截止点往后回收，
+              不会重复回收已释放的 token。
+
+           Q: 回收后 mapping 怎么更新？
+           A: free_slots 是 full pool 的 slot 索引，传给 free_swa()，
+              在 SWATokenToKVPoolAllocator.free_swa() 内部:
+                swa_indices = mapping[free_slots]  → 查表得 swa slot
+                swa_attn_allocator.free(swa_indices)  → 真正回收
+                mapping[free_slots] = 0  → 清除映射
+        """
         assert self.tree_cache.supports_swa(), "prefix cache must support swa"
         sliding_window_size = self.tree_cache.sliding_window_size
 
-        # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
+        # radix cache 保护的 token 不能被回收，skip 掉
         assert (
             req.cache_protected_len % self.tree_cache.page_size == 0
         ), "cache_protected_len must be page aligned"
         req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, req.cache_protected_len)
 
-        # Subtract an extra page_size so the eviction frontier never reaches the
-        # radix tree insert boundary (page_floor(seq_len)). This keeps at least one
-        # page of non-evicted SWA KV for the tree to store as a non-tombstone node,
-        # preserving cache reuse in multi-turn scenarios. Without this, leaf nodes
-        # may become tombstoned, causing SWA memory leak.
-        # See also: _insert_helper case 3 in swa_radix_cache.py (defensive counterpart).
+        # 计算回收边界: pre_len 往前推 (window_size + page_size)
+        # 多减 page_size 作为安全边际: 至少保留一页给 radix tree 存非 tombstone 节点
+        # 否则叶子节点变 tombstone → SWA 内存泄漏
         if envs.SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN.get():
-            evict_threshold = pre_len - sliding_window_size
+            evict_threshold = pre_len - sliding_window_size                    # 不留边际
         else:
-            evict_threshold = pre_len - sliding_window_size - self.tree_cache.page_size
+            evict_threshold = pre_len - sliding_window_size - self.tree_cache.page_size  # 留一页
         new_swa_evicted_seqlen = max(
-            req.swa_evicted_seqlen,
-            evict_threshold,
+            req.swa_evicted_seqlen,   # 已回收的位置
+            evict_threshold,          # 新计算的回收边界
         )
 
+        # 对齐到 page 边界，保证每次回收整页
         if self.tree_cache.page_size > 1:
             new_swa_evicted_seqlen = (
                 new_swa_evicted_seqlen // self.tree_cache.page_size
             ) * self.tree_cache.page_size
 
+        # 增量回收: 只回收 [上次截止点, 新边界) 之间的 slot
         if new_swa_evicted_seqlen > req.swa_evicted_seqlen:
             free_slots = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, req.swa_evicted_seqlen : new_swa_evicted_seqlen
-            ]
-            self.token_to_kv_pool_allocator.free_swa(free_slots)
-            req.swa_evicted_seqlen = new_swa_evicted_seqlen
+            ]                                                         # 从 req_to_token 取 full slot 索引
+            self.token_to_kv_pool_allocator.free_swa(free_slots)     # → mapping 查表 → 回收 swa → 置 0
+            req.swa_evicted_seqlen = new_swa_evicted_seqlen           # 更新截止点
 
     def __str__(self):
         return (

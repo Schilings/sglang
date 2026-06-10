@@ -20,10 +20,24 @@ def alloc_extend_kernel(
       Part 2: 填充完整的新 page（从 free_pages 取）
       Part 3: 填充新 page 的前半段（与 Part 2 最后一个 page 共享）
 
-    注意: 当从 radix cache 匹配前缀时，prefix_len 一定是 page_size 的倍数
-    （因为 radix tree 中的节点 value 长度都是 page-aligned 的），
-    此时 Part 1 = 0，不会执行。Part 1 仅在 chunked prefill 场景下
-    （同一个请求上一次 extend 没填满一个 page）才有意义，填的是自己之前分配的半满 page。
+    Part 1 何时执行？
+    ─────────────────
+    当 prefix_len 不是 page_size 的倍数时，表明前缀的最后一个 page 还有空位，
+    需要用 Part 1 填满。这取决于 prefix 的来源：
+
+    • RadixCache 路径（有 prefix 匹配）：
+      radix cache 存储时 key 经过了 .page_aligned(page_size) 截断，
+      cache_unfinished_req 也只会缓存 page-aligned 长度的 KV indices。
+      因此 match_prefix 返回的 prefix_len 一定是 page_size 的倍数 → Part 1 = 0。
+
+    • ChunkCache / Streaming Session 路径（无 radix prefix 匹配）：
+      chunked prefill 第二次调度时，init_next_round_input 调用时 tree_cache=None，
+      不会重新 match prefix。prefix_indices 由上一轮 cache_unfinished_req 直接设置
+      （取全部 kv_indices，不做 page-aligned 截断）。
+      如果上一轮 extend 没填满一个 page，prefix_len 就不是 page_size 的倍数 → Part 1 > 0，
+      将拼接到自己之前分配的半满 page 后面。
+
+    首次 prefill（无历史 prefix）的 prefix_len = 0，也是 page_size 的倍数 → Part 1 = 0。
     """
     pid = tl.program_id(0)
 

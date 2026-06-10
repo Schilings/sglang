@@ -111,6 +111,14 @@ class SWAKVPool(BaseSWAKVPool):
             -1	      末尾哨兵	        alloc_decode 中 last_loc=-1 需要映射到 swa last_loc=-1
         """
         self.full_to_swa_index_mapping: Optional[torch.Tensor] = None
+        # Q: 为什么 translate_loc_from_full_to_swa 需要缓存？
+        # A: 一次 forward pass 中所有 SWA 层用的是同一个 loc tensor，
+        #    mapping[kv_indices] 是 GPU global memory 随机索引读取，有显著延迟。
+        #    如果模型有 N 个 SWA 层，不做缓存就要做 N 次同样的 GPU 查表操作。
+        #    缓存后只需查一次，后续层直接复用结果。
+        # Q: 缓存什么时候失效？
+        # A: 每次 alloc / free / register_mapping 后调 invalidate_loc_cache()，
+        #    因为 full_to_swa_index_mapping 被修改了。
         self._cached_swa_loc: Optional[torch.Tensor] = None
         self._cached_loc_key: Optional[tuple] = None
 
@@ -125,6 +133,9 @@ class SWAKVPool(BaseSWAKVPool):
         self.invalidate_loc_cache()
 
     def invalidate_loc_cache(self) -> None:
+        """Q: 为什么每种 alloc/free 操作后都要调这个方法？
+           A: alloc/free 会修改 full_to_swa_index_mapping，
+              缓存中存的 swa_loc 已经过时，必须让下次 SWA 层重新查表。"""
         self._cached_swa_loc = None
         self._cached_loc_key = None
 
@@ -185,26 +196,32 @@ class SWAKVPool(BaseSWAKVPool):
             return self.full_kv_pool.get_kv_buffer(layer_id_pool)
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor) -> torch.Tensor:
-        """""""""
-        req_to_token 存的是 full pool 的 slot 索引:
-        req_to_token[req_idx] = [3, 7, 12, 25, 30, ...]
-        Full 层直接用: full_kv_pool[slot]
-        SWA 层需要翻译: swa_slot = full_to_swa_index_mapping[slot]
-                        swa_kv_pool[swa_slot]
+        """Q: 为什么 full pool 的 slot 需要翻译成 swa slot？
+           A: req_to_token 存的是 full pool 的 slot 索引:
+              req_to_token[req_idx] = [3, 7, 12, 25, 30, ...]
+              Full 层直接用: full_kv_pool[slot]
+              SWA 层需要查表: swa_slot = full_to_swa_index_mapping[slot]
+                               swa_kv_pool[swa_slot]
+
+           Q: 为什么用 (data_ptr(), numel()) 做缓存 key 而不是直接判断 tensor 相等？
+           A: data_ptr()（非 untyped_storage().data_ptr()）包含 tensor 内部 offset，
+              同一块 storage 的不同 view 会得到不同 key。
+              同时判断 numel() 防止同一个地址重新分配了不同大小的 tensor。
+
+           Q: 缓存的工作流程是怎样的？
+           A: Forward pass 逐层执行:
+                Layer 16 (第一个 SWA 层): key 未命中 → mapping[kv_indices] 查表 → 缓存
+                Layer 17-31 (其余 SWA 层): 同一 loc tensor → key 命中 → 直接返回缓存
+              Allocator 分配/释放后:
+                invalidate_loc_cache() → 清缓存 → 下一轮 forward 重新查表
+
+           Q: mapping 的值分别代表什么？
+           A: 0  = 没有 SWA KV（token 已滑出窗口，被 free_swa() 回收）
+              >0 = 对应的 swa slot（正常映射）
+              -1 = 末尾哨兵（last_loc=-1 需要映射到 swa last_loc=-1）
         """
         assert self.full_to_swa_index_mapping is not None
-        # data_ptr() (not untyped_storage().data_ptr()) encodes the offset, so
-        # views at different positions within the same storage get distinct keys.
-        # -1 in kv_indices maps to -1 via the sentinel appended to the mapping.
-        """
-        Forward pass 中:
-          Layer 16 (SWA): translate_loc_from_full_to_swa(loc) → 查表，缓存
-          Layer 17 (SWA): translate_loc_from_full_to_swa(loc) → 同一 loc，命中缓存
-          Layer 18 (SWA): ... 命中缓存
-        
-        Allocator 分配/释放后:
-          invalidate_loc_cache() → 清缓存，下次重新查表
-        """
+
         key = (kv_indices.data_ptr(), kv_indices.numel())
         if key != self._cached_loc_key:
             if self._cached_loc_key is not None:
@@ -212,13 +229,6 @@ class SWAKVPool(BaseSWAKVPool):
                     "translate_loc_from_full_to_swa: loc tensor changed mid-forward "
                     "without invalidate_loc_cache() — possible missing call site"
                 )
-            """
-            mapping 中的三个值
-            mapping 值	    含义      	         场景
-                 0	     没有 SWA KV	        token 在 window 外，SWA 已被 free_swa() 回收
-                >0	     对应的 swa slot	    正常映射
-                -1	      末尾哨兵	        alloc_decode 中 last_loc=-1 需要映射到 swa last_loc=-1
-            """
             self._cached_swa_loc = self.full_to_swa_index_mapping[kv_indices].to(
                 torch.int32
             )
@@ -403,17 +413,20 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 swa_kv_pool,
                 need_sort,
             )
-        # Note: append one more item of value -1 in the end so -1 maps to -1.
-        # It is needed for the last_loc in alloc_extend, where the first full_last_loc
-        # is -1, and we need to map it to swa_last_loc -1 as well.
+        # 映射表: full_to_swa_index_mapping[full_slot] = swa_slot
+        # 长度 = size + page_size + 1（末尾多一个 -1 哨兵）
+        # 值的含义:
+        #   0  = 无 SWA KV（slot 未分配，或已被 free_swa/evict 回收）
+        #   >0 = 对应的 swa slot
+        #   -1 = 哨兵（last_loc=-1 在 alloc_extend 时映射到 swa_last_loc=-1）
         self.full_to_swa_index_mapping = torch.cat(
             [
-                torch.zeros(
+                torch.zeros(                                  # 全部初始化为 0（无映射）
                     size + self.page_size,
                     dtype=torch.int64,
                     device=device,
                 ),
-                torch.tensor([-1], dtype=torch.int64, device=device),
+                torch.tensor([-1], dtype=torch.int64, device=device),  # 末尾哨兵
             ]
         )
 
@@ -474,18 +487,20 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if need_size > self.swa_attn_allocator.available_size():
             return None
 
-        alloc_full_indices = self.full_attn_allocator.alloc(need_size)
-        alloc_swa_indices = self.swa_attn_allocator.alloc(need_size)
+        alloc_full_indices = self.full_attn_allocator.alloc(need_size)  # full 池分配
+        alloc_swa_indices = self.swa_attn_allocator.alloc(need_size)    # swa 池分配（独立）
         assert alloc_full_indices is not None
         assert alloc_swa_indices is not None
 
+        # 写入映射: full slot → swa slot
+        # 两个池独立分配，slot 编号可能完全不同，靠此映射表关联
         if _is_npu:
             self.full_to_swa_index_mapping[alloc_full_indices.to(torch.int64)] = (
                 alloc_swa_indices.to(torch.int64)
             )
         else:
             self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
-        return alloc_full_indices
+        return alloc_full_indices  # 上层只用 full slot
 
     def alloc_extend(
         self,
@@ -637,6 +652,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return alloc_full_indices
 
     def free(self, free_index: torch.Tensor):
+        """Q: 回收时如何同步清除 mapping？
+           A: free() 同时释放 full 和 swa 两边的 slot，调用链:
+              free(full_slots) → free_swa(full_slots)
+                → mapping[full_slots] 查表得到 swa_slots → 释放 → mapping[full_slots] = 0
+              注意: swa slot 可能已经被 _evict_swa() 提前回收（滑出窗口时），
+              此时 mapping 值为 0，free_swa 内通过 swa_indices > 0 过滤跳过。
+        """
         if free_index.numel() == 0:
             return
 
@@ -670,11 +692,31 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.full_to_swa_index_mapping[full_indices] = swa_indices
 
     def free_swa(self, free_index: torch.Tensor):
-        self._kvcache.invalidate_loc_cache()
-        swa_indices = self.full_to_swa_index_mapping[free_index]
-        swa_indices = swa_indices[swa_indices > 0]
-        self.swa_attn_allocator.free(swa_indices)
-        self.full_to_swa_index_mapping[free_index] = 0
+        """Q: 什么时候调 free_swa？full slot 和 swa slot 的生命周期有何不同？
+           A: free_swa 有两个调用者:
+              1. free() — 请求结束时，兜底回收所有剩余 SWA KV
+              2. _evict_swa() — 每次 decode 若干步后，提前回收滑出窗口的 SWA KV
+
+              因此 swa slot 的生命周期 ≤ full slot 的生命周期:
+                full slot:  分配后一直存活到请求结束
+                swa slot:  可能在中途被 _evict_swa() 提前回收
+
+           Q: 为什么要 swa_indices > 0 过滤？
+           A: 如果 swa slot 已被 _evict_swa() 提前回收，mapping 值已置为 0。
+              此时 free() 再调 free_swa()，0 表示"无 SWA KV"，直接跳过。
+              只有 >0 的才是需要真正回收的 swa slot。
+
+           Q: 为什么最后要 mapping[free_index] = 0？
+           A: 置 0 标记该 full slot 不再有对应的 SWA KV。
+              后续 translate_loc_from_full_to_swa 查表时遇到 0，
+              会映射到 swa pool 的 slot 0（预留 padding slot），
+              attention kernel 写入 dummy 值不会影响其他有效数据。
+        """
+        self._kvcache.invalidate_loc_cache()                          # mapping 将变化，失效翻译缓存
+        swa_indices = self.full_to_swa_index_mapping[free_index]      # full slot → swa slot
+        swa_indices = swa_indices[swa_indices > 0]                    # 过滤已提前回收的（值为0）
+        self.swa_attn_allocator.free(swa_indices)                     # 归还 swa page
+        self.full_to_swa_index_mapping[free_index] = 0                # 清除映射
 
     def backup_state(self):
         return [

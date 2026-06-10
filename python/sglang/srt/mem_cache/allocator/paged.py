@@ -159,16 +159,25 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         extend 部分的三段式填充（由 alloc_extend_kernel 执行）:
 
           Part 1: 填充旧 page 的剩余空间（不消耗新 page）
-            当 prefix_len 不对齐到 page_size 时，前缀最后一个 page 还有空位，
+            当 prefix_len 不是 page_size 的倍数时，前缀最后一个 page 还有空位，
             这些 slot 之前已经整页分配给该请求，直接用 last_loc+1 接上。
 
-            重要: 从 radix cache 匹配前缀时，prefix_len 一定是 page_size 的倍数
-            （因为 radix tree 中的节点 value 长度都是 page-aligned 的），
-            此时 Part 1 = 0，不会执行。因此不会出现"填别的请求的 page"的问题——
-            因为共享的 radix cache page 总是满的，没有剩余空间可填。
+            何时 prefix_len 不是 page_size 的倍数？
+            ─────────────────────────────────────────
+            • RadixCache 路径（有 radix prefix 匹配）：
+              radix cache 存储时 key 经过了 .page_aligned(page_size) 截断，
+              cache_unfinished_req 也只会缓存 page-aligned 长度的 KV indices。
+              因此 match_prefix 返回的 prefix_len 一定是 page_size 的倍数 → Part 1 = 0。
+              不会出现"填别的请求的 page"的问题——共享的 radix cache page 总是满的。
 
-            Part 1 仅在 chunked prefill 场景下才有意义：同一个请求上一次 extend
-            没填满一个 page，这次继续填，填的是自己之前分配的半满 page。
+            • ChunkCache / Streaming Session 路径（无 radix prefix 匹配）：
+              chunked prefill 第二次调度时，init_next_round_input 调用时 tree_cache=None，
+              不会重新 match prefix。prefix_indices 由上一轮 cache_unfinished_req 直接设置
+              （取全部 kv_indices，不做 page-aligned 截断）。
+              如果上一轮 extend 没填满一个 page，prefix_len 就不是 page_size 的倍数 → Part 1 > 0，
+              将拼接到自己之前分配的半满 page 后面。
+
+            首次 prefill（无历史 prefix）的 prefix_len = 0，也是 page_size 的倍数 → Part 1 = 0。
 
           Part 2: 填充完整的新 page（从 free_pages 取）
             每个完整 page 的所有 slot 编号为 page_number * page_size + offset_in_page。
