@@ -119,6 +119,8 @@ def get_last_access_time() -> float64:
 class LRUList:
     def __init__(self, is_swa_list: bool = False):
         self.is_swa_list = is_swa_list
+        # 每个 TreeNode 有两套 prev/next 指针，同一物理节点同时在两条链上：
+        # 通过 is_swa_list 控制读写哪套指针
         if self.is_swa_list:
             self.prv = "swa_prev"
             self.nxt = "swa_next"
@@ -128,18 +130,35 @@ class LRUList:
             self.nxt = "next"
             self.lock_ref = "full_lock_ref"
         # Initialize dummy head and tail nodes
-        self.head = TreeNode()  # Most recently used side
-        self.tail = TreeNode()  # Least recently used side
+        self.head = TreeNode()  # Most recently used side → MRU 端
+        self.tail = TreeNode()  # Least recently used side → LRU 端
         setattr(self.head, self.nxt, self.tail)  # self.head.next = self.tail
         setattr(self.tail, self.prv, self.head)  # self.tail.prev = self.head
+        #用于 O(1) 判断节点是否在链表中（in_list），以及 insert_mru 的去重断言。
         self.cache = {}
+        """
+        
+          head (dummy)                                    tail (dummy)
+          ┌──────┐    ┌──────┐    ┌──────┐    ┌──────┐    ┌──────┐
+          │ MRU  │←──→│ N_3  │←──→│ N_7  │←──→│ N_1  │←──→│ LRU  │
+          └──────┘    └──────┘    └──────┘    └──────┘    └──────┘
+           最近访问                                    最久未访问
+        
+          cache = {3: N_3, 7: N_7, 1: N_1}   ← O(1) 查找节点是否存在
+
+        """
 
     def _add_node(self, node):
         """Helper to add node right after head (most recently used)"""
+        # 插入到 head 之后 → MRU 端。
         self._add_node_after(self.head, node)
 
     def _add_node_after(self, old_node, new_node):
         """Helper to add node right after old_node"""
+        '''
+        Before:  old ←→ next
+        After:   old ←→ new ←→ next
+        '''
         setattr(new_node, self.prv, old_node)  # new_node.prev = old_node
         setattr(
             new_node, self.nxt, getattr(old_node, self.nxt)
@@ -151,6 +170,12 @@ class LRUList:
 
     def _remove_node(self, node):
         """Helper to remove node from linked list"""
+        """
+        Before:  prev ←→ node ←→ next
+        After:   prev ←→ next
+                 node.prev = None  ← 断开引用，避免循环引用
+                 node.next = None
+        """
         setattr(
             getattr(node, self.prv), self.nxt, getattr(node, self.nxt)
         )  # node.prev.next = node.next
@@ -173,6 +198,11 @@ class LRUList:
         """
         Move a (existing) node to most recently used position
         """
+        """ 已有节点移到 MRU 
+        断言: node.id 在 cache 中
+        断言: swa_lru_list 不允许 reset tombstone 节点
+        操作: remove → add to head
+        """
         assert node.id in self.cache, f"Resetting node {node.id=} not in lru list"
         assert (
             not self.is_swa_list or not node.swa_tombstone
@@ -185,6 +215,15 @@ class LRUList:
         Move an (existing) node and its parents to most recently used position. Child node is
         more recently used than parent node.
         """
+        ''' 逐个把匹配路径上的节点从链表原位置摘出来，重新挂到 MRU 端，且保证子节点比父节点更 MRU 
+        匹配路径: Root → A → B → C → D
+        操作顺序（从 D 往 Root 走）:
+          1. D 摘出，放到 head 后:    head ←→ D ←→ tail
+          2. C 摘出，放到 D 后:       head ←→ D ←→ C ←→ tail
+          3. B 摘出，放到 C 后:       head ←→ D ←→ C ←→ B ←→ tail
+          4. A 摘出，放到 B 后:       head ←→ D ←→ C ←→ B ←→ A ←→ tail
+        结果: D(MRU) → C → B → A(LRU)
+        '''
         prev_node = self.head
         while node != root_node:
             # for swa lru list, only reset non-tombstone nodes
@@ -201,36 +240,45 @@ class LRUList:
         """
         Insert a (new) node as most recently used
         """
+
+        # 断言: swa_lru_list 不允许插入 tombstone 节点
         assert (
             not self.is_swa_list or not node.swa_tombstone
         ), f"Inserting swa tombstone node in swa lru list: {node.id=}"
+        # 断言: node.id 不在 cache 中（不是重复插入）
         assert (
             node.id not in self.cache
         ), f"Inserting node {node.id=} already in lru list, existing node: {self.cache[node.id].id=}"
-        self.cache[node.id] = node
+        # 操作: cache[id] = node, 挂到 head 后面
+        self.cache[node.id] = node # insert_mru 时加入
         self._add_node(node)
 
     def remove_node(self, node: TreeNode):
         """
         Remove node from lru list
         """
+        # 断言: node.id 在 cache 中
         assert node.id in self.cache, f"Removing node {node.id=} not in lru list"
+        # 断言: swa_lru_list 不允许移除 tombstone 节点
         assert (
             not self.is_swa_list or not node.swa_tombstone
         ), f"Removing swa tombstone node from swa lru list: {node.id=}"
-        del self.cache[node.id]
+        # 操作: del cache[id], 从链表中摘除
+        del self.cache[node.id] # remove_node 时删除
         self._remove_node(node)
 
     def get_lru_no_lock(self) -> Optional[TreeNode]:
         """
         Get the least recently used node that is not locked
         """
+        ''' get_lru_no_lock() → 从 tail 往前找第一个 lock_ref == 0 的节点 '''
         return self.get_prev_no_lock(self.tail, check_id=False)
 
     def get_leaf_lru_no_lock(self) -> Optional[TreeNode]:
         """
         Get the least recently used leaf node that is not locked
         """
+        ''' get_leaf_lru_no_lock() → 从 tail 往前找第一个叶子且 lock_ref == 0 的节点 '''
         return self.get_prev_leaf_no_lock(self.tail, check_id=False)
 
     def get_prev_no_lock(
@@ -239,15 +287,17 @@ class LRUList:
         """
         Get the previous (i.e. more recently used) node that is not locked
         """
+        ''' → 从 tail 往前找第一个 lock_ref == 0 的节点。 
+        关键：驱逐时跳过被锁节点。 被锁的节点有请求在用，不能驱逐。'''
         if check_id:
             assert (
                 node.id in self.cache
             ), f"Getting prev of node {node.id=} not in lru list"
-        x = getattr(node, self.prv)  # x = node.prev
-        while getattr(x, self.lock_ref) > 0:
+        x = getattr(node, self.prv)  # x = node.prev (从 LRU 端开始)
+        while getattr(x, self.lock_ref) > 0:  # 跳过被锁住的节点
             x = getattr(x, self.prv)  # x = x.prev
         # if x is the head, it means there is no node in the lru list without lock
-        if x == self.head:
+        if x == self.head: # 没有未锁的节点
             return None
         return x
 
@@ -255,12 +305,15 @@ class LRUList:
         """
         Get the previous (i.e. more recently used) leaf node that is not locked
         """
+        ''' → 从 tail 往前找第一个叶子且 lock_ref == 0 的节点 
+        Full 驱逐只删叶子，因为删叶子只需要从 parent 的 children 中移除，不影响树的其他部分。删内部节点需要处理子树，代价太大。
+        '''
         if check_id:
             assert (
                 node.id in self.cache
             ), f"Getting prev of node {node.id=} not in lru list"
         x = getattr(node, self.prv)  # x = node.prev
-        while getattr(x, self.lock_ref) > 0 or len(x.children) > 0:
+        while getattr(x, self.lock_ref) > 0 or len(x.children) > 0: # 多了 children 检查
             x = getattr(x, self.prv)  # x = x.prev
         # if x is the head, it means there is no leaf node in the lru list without lock
         if x == self.head:
@@ -411,7 +464,9 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 best_match_node=self.root_node,
             )
 
+        #
         value, last_node, best_value_len = self._match_prefix_helper(key)
+        # LRUList 不存数据，只回答一个问题：内存不够时，该驱逐谁？
         return self._match_post_processor(params, value, last_node, best_value_len)
 
     def insert(self, params: InsertParams) -> InsertResult:
@@ -421,6 +476,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         key = params.key
         value = params.value
         prev_prefix_len = params.prev_prefix_len
+        #
         swa_evicted_seqlen = params.swa_evicted_seqlen
 
         key, value = key.maybe_to_bigram_view(self.is_eagle, value)
@@ -430,6 +486,8 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         else:
             value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
 
+        # insert 时最复杂的逻辑是处理 tombstone 节点的修复。
+        # 当新请求重新写入了一段之前被 SWA 驱逐的 KV，需要更新 tombstone 节点的 value
         prefix_len = self._insert_helper(
             self.root_node, key, value, prev_prefix_len, swa_evicted_seqlen
         )
@@ -742,7 +800,6 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
         if self.disable:
             return DecLockRefResult()
-        # 解锁时用 UUID 控制范围
         dec_lock_swa = not skip_swa
         while node != self.root_node:
             assert (
@@ -767,8 +824,10 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                     self.swa_evictable_size_ += len(node.value)
                     self.swa_protected_size_ -= len(node.value)
                 node.swa_lock_ref -= 1
+                # 解锁时用 UUID 控制范围
                 if swa_uuid_for_lock and node.swa_uuid == swa_uuid_for_lock:
-                    # 到边界了，停止解锁 SWA
+                    # 到边界了，停止解锁 SWA，但是Full还是要继续
+                    # 因为边界以外，该req没有加锁过
                     dec_lock_swa = False
 
             node = node.parent
@@ -832,7 +891,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                     # Internal: standard protected -> evictable.
                     self.swa_evictable_size_ += len(node.value)
             node.swa_lock_ref -= 1
-            # 边界节点不能释放，可能包含其他req的资源
+            # 到边界了，停止解锁 SWA
             if swa_uuid_for_lock and node.swa_uuid == swa_uuid_for_lock:
                 break
             node = node.parent
@@ -901,6 +960,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         child_key = key.child_key(self.page_size)
 
         value = []
+        # 初始化为 Inf！！！！
         # for path connected to root without tombstone, always match, so set to inf
         match_len_since_tombstone = float("inf") # 从 root 出发没有 tombstone
         best_value_len = 0
@@ -972,6 +1032,9 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         node_update = last_node
         # update time for matched nodes, and make nodes closer to root to be least recently used
         # this allows swa to evict nodes closer to root first
+        # match_prefix → 刷新 LRU（标记"刚用过"）
+        # 时机：每次前缀匹配成功后。
+        # 效果：匹配路径上的所有节点移到 MRU 端，子节点比父节点更 MRU
         self.full_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
         self.swa_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
 
@@ -1156,6 +1219,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             # This is needed because it is possible that the last sliding window size tokens
             # contains tombstone. If this is the case and we don't update the kv value, then
             # the prefill prefix matching will stuck.
+            # 匹配已有节点时，如果节点是 tombstone 且在我们负责的范围内：
             if update_kv_after_len < total_prefix_length + prefix_len:
                 # For page_size > 1 and chunked prefill case, update_kv_after_len may be not page-aligned due to a trailing partial page
                 # (kept in the request but not inserted into the radix tree) appended to prefix_indices.
@@ -1169,21 +1233,24 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                     if swa_evicted_seqlen <= total_prefix_length:
                         # Branch 1: all swa tokens of value[:prefix_len] are not evicted, so we can insert it to the tree directly.
                         # Free full tokens in the original tree node.
-                        self.token_to_kv_pool_allocator.free(node.value[:prefix_len])
+                        # Branch 1: 全部 SWA 都没有被驱逐，直接恢复
+                        self.token_to_kv_pool_allocator.free(node.value[:prefix_len]) # 释放旧 full KV
                         # Overwrite the new value in request to the tree node.
-                        node.value = value[:prefix_len].clone()
-                        node.swa_tombstone = False
+                        node.value = value[:prefix_len].clone() # 写入新 full KV
+                        node.swa_tombstone = False # 取消 tombstone
                         self.swa_lru_list.insert_mru(node)
                         self.swa_evictable_size_ += len(node.value)
                     elif swa_evicted_seqlen < total_prefix_length + prefix_len:
                         # Branch 2: part of swa tokens of value[:prefix_len] are evicted, so we need to split the node and insert the value to new node.
+                        # Branch 2: 部分 SWA 被驱逐，需要 split
                         start_update_idx = swa_evicted_seqlen - total_prefix_length
                         self.token_to_kv_pool_allocator.free(
                             node.value[start_update_idx:prefix_len]
                         )
-                        self._split_node(node.key, node, start_update_idx)
+                        self._split_node(node.key, node, start_update_idx) # 切分
                         # Here node is the new node after split, so we can overwrite the value to the new node.
                         # The old node is still swa tombstone and the full token is not freed.
+                        # 前半段仍 tombstone，后半段恢复
                         node.value = value[start_update_idx:prefix_len].clone()
                         self.token_to_kv_pool_allocator.free(value[:start_update_idx])
                         node.swa_tombstone = False
@@ -1191,7 +1258,8 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                         self.swa_evictable_size_ += len(node.value)
                     else:
                         # Branch 3: all swa tokens of value[:prefix_len] are evicted, so we don't need to update the node.
-                        self.token_to_kv_pool_allocator.free(value[:prefix_len])
+                        # Branch 3: 全部 SWA 都被驱逐，无法恢复
+                        self.token_to_kv_pool_allocator.free(value[:prefix_len])# 释放新来的 value
                 else:
                     # The node is not tombstone, so we don't need to update the node.
                     self.token_to_kv_pool_allocator.free(value[:prefix_len])
