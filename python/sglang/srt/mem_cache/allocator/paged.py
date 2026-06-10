@@ -152,6 +152,39 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         extend_num_tokens: int,
         num_new_pages: int = None,
     ):
+        """
+        分配确实是整页分配，但"页没满"不是分配造成的，而是前缀匹配（prefix）造成的。
+        关键：prefix_len 不一定对齐到 page 边界
+        page_size = 16
+
+        请求 A 第一次 prefill: 50 个 token
+          → 分配 ceil(50/16) = 4 个 page (page 0-3)
+          → Page 0: [0-15]   满
+          → Page 1: [16-31]  满
+          → Page 2: [32-47]  满
+          → Page 3: [48-63]  只用了 [48-49]，剩余 [50-63] 空着
+
+        此时 page 3 只有 2 个 token，但整页已分配给请求 A。
+
+        请求 A 第二次 extend（decode 或继续 prefill）:
+          prefix_len = 50（上次已有的）
+          seq_len = 200
+
+          Page 3 的 [50-63] 还空着 → Part 1: 先填满 page 3 的 [50-63]
+          不需要新 page，slot 直接接 last_loc+1
+
+        prefix_len=50, seq_len=200, page_size=16
+         ←── 已有(prefix) ──→←──────── 新增(extend) ────────→
+        Page 2: [████████████████] 满
+        Page 3: [████████░░░░░░░░] ← Part 1: 填 [50-63] (6个空位)
+        Page 4: [░░░░░░░░░░░░░░░░] ← Part 2: 整页从 free_pages 分配
+        Page 5: [░░░░░░░░░░░░░░░░] ← Part 2: 整页从 free_pages 分配
+          ...
+        Page 12:[░░░░░░░░░░░░░░░░] ← Part 2: 整页从 free_pages 分配
+        Page 13:[██████████░░░░░░] ← Part 3: 新 page，只填 [0-9]
+
+        █ = 已有KV, ░ = 待填充, 实心 = 新写入
+        """
         if self.debug_mode:
             assert torch.all(
                 (last_loc + 1) % self.page_size == prefix_lens % self.page_size

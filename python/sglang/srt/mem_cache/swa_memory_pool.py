@@ -41,6 +41,7 @@ class SWAKVPool(BaseSWAKVPool):
         full_attention_layer_ids: List[int],
         enable_kvcache_transpose: bool,
         device: str,
+        #
         token_to_kv_pool_class: KVCache = MHATokenToKVPool,
         **kwargs,
     ):
@@ -58,7 +59,7 @@ class SWAKVPool(BaseSWAKVPool):
         self.layer_transfer_counter = None
 
         kwargs["page_size"] = page_size
-        kwargs["enable_memory_saver"] = False
+        kwargs["enable_memory_saver"] = False # 不支持kv offload？
         kwargs["head_num"] = head_num
         kwargs["head_dim"] = head_dim
         kwargs["device"] = device
@@ -69,7 +70,8 @@ class SWAKVPool(BaseSWAKVPool):
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
             maybe_init_custom_mem_pool(device=self.device)
         )
-
+        # 对外伪装成一个 KVCache，对内路由到两个子池。
+        # 上层代码（attention kernel）只需要调 get_key_buffer(layer_id) 和 set_kv_buffer(layer, loc, k, v)，不需要知道 full/SWA 的存在。
         self.swa_kv_pool = token_to_kv_pool_class(
             size=size_swa,
             dtype=dtype,
@@ -86,11 +88,28 @@ class SWAKVPool(BaseSWAKVPool):
             **kwargs,
         )
         # {layer_id: (index, is_swa_layer)}
+        # # 例: 模型有 32 层, layer 0-15 是 full, layer 16-31 是 SWA
+        # layers_mapping = {
+        #     0:  (0, False),    # global layer 0 → full pool 的第 0 层
+        #     1:  (1, False),    # global layer 1 → full pool 的第 1 层
+        #     ...
+        #     16: (0, True),     # global layer 16 → swa pool 的第 0 层
+        #     17: (1, True),     # global layer 17 → swa pool 的第 1 层
+        #     ...
+        # }
         self.layers_mapping: Dict[int, Tuple[int, bool]] = {}
         for full_attn_layer_id, global_layer_id in enumerate(full_attention_layer_ids):
             self.layers_mapping[global_layer_id] = (full_attn_layer_id, False)
         for swa_layer_id, global_layer_id in enumerate(swa_attention_layer_ids):
             self.layers_mapping[global_layer_id] = (swa_layer_id, True)
+
+        """
+        mapping 中的三个值
+        mapping 值	    含义      	         场景
+             0	     没有 SWA KV	        token 在 window 外，SWA 已被 free_swa() 回收
+            >0	     对应的 swa slot	    正常映射
+            -1	      末尾哨兵	        alloc_decode 中 last_loc=-1 需要映射到 swa last_loc=-1
+        """
         self.full_to_swa_index_mapping: Optional[torch.Tensor] = None
         self._cached_swa_loc: Optional[torch.Tensor] = None
         self._cached_loc_key: Optional[tuple] = None
@@ -166,10 +185,26 @@ class SWAKVPool(BaseSWAKVPool):
             return self.full_kv_pool.get_kv_buffer(layer_id_pool)
 
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor) -> torch.Tensor:
+        """""""""
+        req_to_token 存的是 full pool 的 slot 索引:
+        req_to_token[req_idx] = [3, 7, 12, 25, 30, ...]
+        Full 层直接用: full_kv_pool[slot]
+        SWA 层需要翻译: swa_slot = full_to_swa_index_mapping[slot]
+                        swa_kv_pool[swa_slot]
+        """
         assert self.full_to_swa_index_mapping is not None
         # data_ptr() (not untyped_storage().data_ptr()) encodes the offset, so
         # views at different positions within the same storage get distinct keys.
         # -1 in kv_indices maps to -1 via the sentinel appended to the mapping.
+        """
+        Forward pass 中:
+          Layer 16 (SWA): translate_loc_from_full_to_swa(loc) → 查表，缓存
+          Layer 17 (SWA): translate_loc_from_full_to_swa(loc) → 同一 loc，命中缓存
+          Layer 18 (SWA): ... 命中缓存
+        
+        Allocator 分配/释放后:
+          invalidate_loc_cache() → 清缓存，下次重新查表
+        """
         key = (kv_indices.data_ptr(), kv_indices.numel())
         if key != self._cached_loc_key:
             if self._cached_loc_key is not None:
@@ -177,6 +212,13 @@ class SWAKVPool(BaseSWAKVPool):
                     "translate_loc_from_full_to_swa: loc tensor changed mid-forward "
                     "without invalidate_loc_cache() — possible missing call site"
                 )
+            """
+            mapping 中的三个值
+            mapping 值	    含义      	         场景
+                 0	     没有 SWA KV	        token 在 window 外，SWA 已被 free_swa() 回收
+                >0	     对应的 swa slot	    正常映射
+                -1	      末尾哨兵	        alloc_decode 中 last_loc=-1 需要映射到 swa last_loc=-1
+            """
             self._cached_swa_loc = self.full_to_swa_index_mapping[kv_indices].to(
                 torch.int32
             )

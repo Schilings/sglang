@@ -473,23 +473,27 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.disable:
             return InsertResult(prefix_len=0)
 
-        key = params.key
-        value = params.value
+        key = params.key  # 请求的 token_ids
+        value = params.value  # 来自 req_to_token 中的 slot 索引
         prev_prefix_len = params.prev_prefix_len
-        #
         swa_evicted_seqlen = params.swa_evicted_seqlen
 
         key, value = key.maybe_to_bigram_view(self.is_eagle, value)
-        key = key.page_aligned(self.page_size)
+        key = key.page_aligned(self.page_size)  # 对齐到 page 边界
+
         if value is not None:
-            value = value[: len(key)]
+            value = value[:len(key)]  # 截断到和 key 同长
         else:
             value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
 
         # insert 时最复杂的逻辑是处理 tombstone 节点的修复。
         # 当新请求重新写入了一段之前被 SWA 驱逐的 KV，需要更新 tombstone 节点的 value
         prefix_len = self._insert_helper(
-            self.root_node, key, value, prev_prefix_len, swa_evicted_seqlen
+            self.root_node,  # ① node: 起点，总是从 root 开始
+            key,  # ② key: 要插入的 token 序列（page-aligned 的 RadixKey）
+            value,  # ③ value: 对应的 KV pool slot 索引（torch.Tensor）
+            prev_prefix_len,  # ④ update_kv_after_len: 上次 match_prefix 匹配到了多长
+            swa_evicted_seqlen,  # ⑤ swa_evicted_seqlen: 这个请求的 SWA 从哪个位置开始被驱逐
         )
         return InsertResult(prefix_len=prefix_len)
 
@@ -1148,7 +1152,10 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         new_node = TreeNode()
         new_node.children = {key[split_len:].child_key(self.page_size): child}
         new_node.parent = child.parent
+        # 继承复制swa_tombstone
         new_node.swa_tombstone = child.swa_tombstone
+        # lock_ref 整体复制给了 new_node，child 的 lock_ref 没有清零。
+        # 这意味着 split 后 child 的 lock_ref 被复制了——new_node 和 child 暂时共享同一组 lock 计数。
         new_node.full_lock_ref = child.full_lock_ref
         new_node.swa_lock_ref = child.swa_lock_ref
         new_node.key = child.key[:split_len]
@@ -1187,6 +1194,8 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         node: TreeNode,
         key: RadixKey,
         value,
+        # prev_prefix_len → update_kv_after_len — 上次匹配到哪
+        # 表示上一次 match_prefix 返回了多少个 token 的前缀
         update_kv_after_len: int,
         swa_evicted_seqlen: int = 0,
     ) -> int:
@@ -1202,6 +1211,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
         child_key = key.child_key(self.page_size)
 
+        # 这次match到的prefix长度
         total_prefix_length = 0
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
@@ -1219,11 +1229,15 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             # This is needed because it is possible that the last sliding window size tokens
             # contains tombstone. If this is the case and we don't update the kv value, then
             # the prefill prefix matching will stuck.
-            # 匹配已有节点时，如果节点是 tombstone 且在我们负责的范围内：
+            # 这次match到的prefix长度 比 上一次 长
+            # 如果 update_kv_after_len >= total_prefix_length + prefix_len，
+            # 说明这个节点完全在"上次旧匹配"的范围内，本次没有新 KV 可以覆盖它，就不碰。
             if update_kv_after_len < total_prefix_length + prefix_len:
                 # For page_size > 1 and chunked prefill case, update_kv_after_len may be not page-aligned due to a trailing partial page
                 # (kept in the request but not inserted into the radix tree) appended to prefix_indices.
+                # 这个节点在"本次新计算"的范围内，tombstone 修复才有意义
                 if node.swa_tombstone:
+                    # 可以用新计算的 KV 替换掉被 tombstone 的旧 KV
                     assert (
                         node.swa_lock_ref == 0
                     ), f"tombstone swa_lock_ref should always be 0, {node.full_lock_ref=}, {node.swa_lock_ref=}, {node.id=}"
