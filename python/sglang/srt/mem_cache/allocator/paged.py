@@ -153,37 +153,34 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         num_new_pages: int = None,
     ):
         """
-        分配确实是整页分配，但"页没满"不是分配造成的，而是前缀匹配（prefix）造成的。
-        关键：prefix_len 不一定对齐到 page 边界
-        page_size = 16
+        为一批请求的 extend 部分（prefill 新 token）分配 KV slot 索引。
 
-        请求 A 第一次 prefill: 50 个 token
-          → 分配 ceil(50/16) = 4 个 page (page 0-3)
-          → Page 0: [0-15]   满
-          → Page 1: [16-31]  满
-          → Page 2: [32-47]  满
-          → Page 3: [48-63]  只用了 [48-49]，剩余 [50-63] 空着
+        分配策略: 整页分配，一个 page 包含 page_size 个连续 slot。
+        extend 部分的三段式填充（由 alloc_extend_kernel 执行）:
 
-        此时 page 3 只有 2 个 token，但整页已分配给请求 A。
+          Part 1: 填充旧 page 的剩余空间（不消耗新 page）
+            当 prefix_len 不对齐到 page_size 时，前缀最后一个 page 还有空位，
+            这些 slot 之前已经整页分配给该请求，直接用 last_loc+1 接上。
 
-        请求 A 第二次 extend（decode 或继续 prefill）:
-          prefix_len = 50（上次已有的）
-          seq_len = 200
+            重要: 从 radix cache 匹配前缀时，prefix_len 一定是 page_size 的倍数
+            （因为 radix tree 中的节点 value 长度都是 page-aligned 的），
+            此时 Part 1 = 0，不会执行。因此不会出现"填别的请求的 page"的问题——
+            因为共享的 radix cache page 总是满的，没有剩余空间可填。
 
-          Page 3 的 [50-63] 还空着 → Part 1: 先填满 page 3 的 [50-63]
-          不需要新 page，slot 直接接 last_loc+1
+            Part 1 仅在 chunked prefill 场景下才有意义：同一个请求上一次 extend
+            没填满一个 page，这次继续填，填的是自己之前分配的半满 page。
 
-        prefix_len=50, seq_len=200, page_size=16
-         ←── 已有(prefix) ──→←──────── 新增(extend) ────────→
-        Page 2: [████████████████] 满
-        Page 3: [████████░░░░░░░░] ← Part 1: 填 [50-63] (6个空位)
-        Page 4: [░░░░░░░░░░░░░░░░] ← Part 2: 整页从 free_pages 分配
-        Page 5: [░░░░░░░░░░░░░░░░] ← Part 2: 整页从 free_pages 分配
-          ...
-        Page 12:[░░░░░░░░░░░░░░░░] ← Part 2: 整页从 free_pages 分配
-        Page 13:[██████████░░░░░░] ← Part 3: 新 page，只填 [0-9]
+          Part 2: 填充完整的新 page（从 free_pages 取）
+            每个完整 page 的所有 slot 编号为 page_number * page_size + offset_in_page。
 
-        █ = 已有KV, ░ = 待填充, 实心 = 新写入
+          Part 3: 填充新 page 的前半段（与 Part 2 最后一个 page 共享）
+            seq_len 不对齐时，最后一个 page 只填前几个 slot。
+
+        新 page 数 = ceil(seq_len/page_size) - ceil(prefix_len/page_size)
+        两侧都用 ceil，差值自动排除了"半满的旧 page"（已在 prefix 的 ceil 中计入）。
+
+        执行顺序: 先让 kernel 写好 out_indices（基于 free_pages 快照），
+        再检查 free_pages 是否足够。不够则返回 None，调用方需 evict 后重试。
         """
         if self.debug_mode:
             assert torch.all(
@@ -191,6 +188,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
 
         bs = len(prefix_lens)
+        # 如果 free_pages 可能不够，先排序合并碎片
         if self.need_sort and extend_num_tokens // self.page_size + bs + 1 > len(
             self.free_pages
         ):
@@ -200,6 +198,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             (extend_num_tokens,), dtype=torch.int64, device=self.device
         )
 
+        # 调用 Triton kernel 并行计算每个请求的 out_indices
+        # kernel 内部按三段式填充：Part1(旧page剩余) + Part2(完整新page) + Part3(新page前半段)
         alloc_extend_kernel[(bs,)](
             prefix_lens,
             seq_lens,
@@ -213,15 +213,18 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
 
+        # 计算需要的新 page 数: ceil(seq/ps) - ceil(prefix/ps)
         if num_new_pages is None:
             num_new_pages = get_num_new_pages(
                 seq_lens=seq_lens_cpu,
                 page_size=self.page_size,
                 prefix_lens=prefix_lens_cpu,
             )
+        # 检查空闲 page 是否足够，不够则返回 None（调用方需 evict 后重试）
         if num_new_pages > len(self.free_pages):
             return None
 
+        # 消费掉已使用的 page
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
 
@@ -231,6 +234,13 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
     ):
+        """
+        为一批 decode 请求各分配 1 个 KV slot 索引。
+
+        两种情况:
+          1. seq_len 没有跨越 page 边界 → 不需要新 page，直接用 last_loc + 1
+          2. seq_len 跨越 page 边界 → 需要从 free_pages 取一个新 page，用其第一个 slot
+        """
         if self.debug_mode:
             assert torch.all(
                 (last_loc + 2) % self.page_size == seq_lens % self.page_size
@@ -241,6 +251,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.merge_and_sort_free()
 
         out_indices = torch.empty((bs,), dtype=torch.int64, device=self.device)
+        # decode kernel: 每个请求只分配 1 个 slot
+        # 如果当前 page 有空位 → last_loc + 1；否则 → 新 page 的第一个 slot
         alloc_decode_kernel[(bs,)](
             seq_lens,
             last_loc,
@@ -253,6 +265,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.debug_mode:
             assert len(torch.unique(out_indices)) == len(out_indices)
 
+        # 计算 decode 需要的新 page 数（跨越 page 边界的请求数）
         num_new_pages = get_num_new_pages(
             seq_lens=seq_lens_cpu,
             page_size=self.page_size,
