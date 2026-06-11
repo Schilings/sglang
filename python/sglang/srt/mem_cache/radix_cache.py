@@ -513,6 +513,15 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
     def cache_unfinished_req(self, req: Req, chunked=False):
         """将未完成请求的 KV 缓存写入前缀树。
 
+        【调用时机 — 仅 prefill/extend 阶段，decode 不调用】:
+        本函数只在以下两处被调用：
+          1. process_batch_result_prefill（prefill 完成后，batch_result_processor.py:238）
+          2. stash_chunked_request（chunked req 暂存时，scheduler.py:2417，传 chunked=True）
+        decode 每步生成 1 个 token，但不调用本函数（process_batch_result_decode 中无调用）。
+        原因：decode 的 KV 只是默默写入 req_to_token_pool，不入树也不释放。
+        直到请求完成时由 cache_finished_req 一次性入树。
+        所以不存在"每次 decode 只多 1 token 就 insert"的浪费问题。
+
         【同 batch 内的 KV 共享机制】:
         batch_result_processor 中以 for 循环串行调用本函数，因此同一 batch 内
         先处理的 req 会先入树，后处理的 req 在 insert 时可能匹配到前者的节点。

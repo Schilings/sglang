@@ -2414,6 +2414,9 @@ class Scheduler(
             self.handle_embedding_request(tokenized_req)
 
     def stash_chunked_request(self, req: Req):
+        # chunked req 暂存时，将已计算的 KV 缓存写入 radix tree。
+        # 这是 cache_unfinished_req 的两个调用点之一（另一个是 process_batch_result_prefill）。
+        # 传 chunked=True：不增加 hit_count，防止同一请求在多个 chunk 中虚增。
         maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
     def _build_hisparse_decode_batch(self, reqs):

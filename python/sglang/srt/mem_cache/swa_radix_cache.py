@@ -440,15 +440,22 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         self._record_all_cleared_event()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
-        """Find the matching prefix from the radix tree.
-        Args:
-            params: MatchPrefixParams containing key.
-        Returns:
-            A tuple of a tensor of matching prefix token IDs and
-            the last node that contains the prefix values. Note that
-            this API can modify the internal state of the Radix tree.
-            The last node create a new child if the prefix is shorter
-            than the last node's value.
+        """在 radix tree 中查找与 key 匹配的最长前缀。
+
+        【与 RadixCache.match_prefix 的核心区别】：
+        RadixCache 的 match_prefix 匹配到多长就返回多长，因为没有 tombstone 的概念。
+        SWARadixCache 的 match_prefix 需要额外考虑 SWA 安全性：
+        - 树中可能有 swa_tombstone 节点（SWA KV 被驱逐但 full KV 还在的"半死"节点）
+        - tombstone 节点的 SWA KV 已丢失，如果请求复用了 tombstone 节点的前缀，
+          在 SWA attention 中会读到空数据，导致计算错误
+        - 因此 match_prefix 必须截断：只返回"从 root 到最后一个 tombstone 之后，
+          连续非 tombstone 节点长度 ≥ sliding_window_size"的部分
+        - 这个截断由 _match_prefix_helper 返回的 best_value_len 实现，
+          _match_post_processor 做 value[:best_value_len] 截断
+
+        返回值：
+          device_indices: 截断后的 KV slot 索引（可能比实际匹配到的短）
+          last_device_node: 匹配链中最后一个节点（未截断的）
         """
 
         key = self._match_pre_processor(params)
@@ -464,10 +471,15 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 best_match_node=self.root_node,
             )
 
-        # page size对齐，匹配到的prefix长度是page size对齐的
+        # _match_prefix_helper 返回三个值（RadixCache 只返回两个）：
+        #   value: 匹配链上所有节点的 value 列表
+        #   last_node: 匹配链的最后一个节点
+        #   best_value_len: SWA 安全截断长度（tombstone 约束下最多能返回多少 token）
         value, last_node, best_value_len = self._match_prefix_helper(key)
-        # LRUList 不存数据，只回答一个问题：内存不够时，该驱逐谁？
-        # 然后 _match_post_processor 做截断：value = value[:best_value_len]
+        # _match_post_processor：
+        #   1. 刷新双 LRU（full_lru_list + swa_lru_list）
+        #   2. 刷新 last_access_time
+        #   3. 截断 value = value[:best_value_len]（SWA 安全截断）
         return self._match_post_processor(params, value, last_node, best_value_len)
 
     def insert(self, params: InsertParams) -> InsertResult:
@@ -1349,12 +1361,9 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 node = new_node  # split 后 node 指向新创建的父节点
 
             # ─── 判断是否可以修复 tombstone ───
-            # 条件: 本节点的任意 token 必须在"本次新计算"的范围内。
-            # 什么叫"本次新计算"？
-            #   请求 prefill 时，match_prefix 先匹配已有 KV，extend 再计算新 KV。
-            #   update_kv_after_len = match 匹配到的 token 数。
-            #   只有 position ≥ update_kv_after_len 的 token 是本次 fresh compute 的。
-            #   如果整个节点都 ≤ update_kv_after_len → 全是 match 给的旧 KV → 跳过。
+            #  update_kv_after_len = req.cache_protected_len 是req确定的已经在radix cache内的长度
+            #  req每次调度都会重复cache_unfinished_req， insert会在其中重复调用，cache_protected_len又会在insert后重复更新
+            #  这个条件：意味着这次调度后比上一次多匹配到了更长的prefix
             if update_kv_after_len < total_prefix_length + prefix_len:
                 if node.swa_tombstone:
                     # tombstone 节点：full KV 还在，但 swa KV 已被驱逐。

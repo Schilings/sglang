@@ -235,6 +235,10 @@ class SchedulerBatchResultProcessor:
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
+                        # prefill 完成后，将 KV 缓存写入 radix tree。
+                        # 这是 cache_unfinished_req 的两个调用点之一（另一个是 stash_chunked_request）。
+                        # decode 阶段不调用 cache_unfinished_req（见 process_batch_result_decode），
+                        # 所以不存在每次 decode 只多 1 token 就 insert 的浪费。
                         maybe_cache_unfinished_req(req, self.tree_cache)
                         if self.server_args.enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
@@ -590,6 +594,13 @@ class SchedulerBatchResultProcessor:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
+        """处理 decode 阶段的 batch 结果。
+
+        【注意】本函数不调用 cache_unfinished_req！
+        decode 每步只生成 1 个 token，KV 只是默默写入 req_to_token_pool，
+        不入树也不释放冗余 slot。直到请求完成时由 cache_finished_req 一次性入树。
+        这避免了 page_size > 1 时每次 decode 只多 1 token 却触发 insert 的浪费。
+        """
         if result.copy_done is not None:
             result.copy_done.synchronize()
         if result.routed_experts_output is not None:
