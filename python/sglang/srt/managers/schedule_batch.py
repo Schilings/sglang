@@ -700,8 +700,19 @@ class Req(ReqDllmMixin):
         self.multi_item_delimiter_indices = multi_item_delimiter_indices
 
         # For req-level memory management
+        # kv_committed_len: 当前请求已确认使用的 KV cache 长度（token 数）
+        #   - extend 完成后设为 seq_len（第1921行）
+        #   - 每次 decode 完成后 +1（第2505行）
+        #   - 不一定是 page-aligned 的
+        #   - 在 cache_finished_req / cache_unfinished_req 中用于确定需要入树的 token 范围
+        # kv_allocated_len: 当前请求已分配的 KV cache 长度（token 数）
+        #   - 通常等于 kv_committed_len，但 speculative decoding 时可能大于（预分配了未用到的 slot）
+        #   - 用于计算下一次 decode 需要新分配多少 slot
         self.kv_committed_len = 0
         self.kv_allocated_len = 0
+        # 防止重复释放的标志位
+        # kv_committed_freed: pop_committed_kv_cache() 只能调用一次
+        # kv_overallocated_freed: pop_overallocated_kv_cache() 只能调用一次
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
 
@@ -990,14 +1001,24 @@ class Req(ReqDllmMixin):
         return self.output_ids
 
     def _cache_commit_len(self) -> int:
-        # Report only the prompt prefix so thinking + answer fall into the
-        # overallocated range and are reclaimed by release_kv_cache. #22373.
+        """计算实际需要提交（commit）的 KV cache 长度。
+
+        正常情况直接返回 kv_committed_len。
+        特殊情况：strip_thinking_cache 模式下，thinking tokens 的 KV 不入树，
+        只提交 prompt prefix 部分的长度，让 thinking + answer 的 KV 在
+        release_kv_cache 时被当作 overallocated 回收。
+        """
         if get_global_server_args().strip_thinking_cache and self.reasoning_tokens > 0:
             return min(self.kv_committed_len, len(self.origin_input_ids))
         return self.kv_committed_len
 
     def pop_committed_kv_cache(self) -> int:
-        """Return the length of committed KV cache and mark them as freed."""
+        """返回已提交的 KV cache 长度，并标记为已释放（防止重复释放）。
+
+        被 cache_finished_req / cache_unfinished_req 调用，
+        返回值用于确定 token_ids 的截取范围：
+          token_ids = (origin_input_ids + output_ids)[:kv_committed_len]
+        """
         assert (
             not self.kv_committed_freed
         ), f"Committed KV cache already freed ({self.kv_committed_len=})"

@@ -432,58 +432,81 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         return InsertResult(prefix_len=prefix_len)
 
     def cache_finished_req(self, req: Req, is_insert: bool = True):
-        """Cache request when it finishes."""
-        # In deterministic mode, disable finished request insertion to radix cache
-        # deterministic mode 不允许结束推理的请求进行insert
+        """请求完成后的 KV 缓存处理。
+
+        与 cache_unfinished_req 的区别：
+        - finished req 不需要再纠正 req_to_token_pool 映射（请求已结束，不会再 decode）
+        - finished req 不需要再更新 req.prefix_indices / req.last_node
+        - finished req 只需：入树 + 释放冗余 slot + 释放锁
+
+        流程：
+          1. 取出 committed 的 KV slot 索引
+          2. is_insert=True → 插入 radix tree（让后续请求可 match）；=False → 直接释放
+          3. 释放 page-unaligned 的尾部（页不对齐部分不存入树）
+          4. dec_lock_ref 释放请求持有的树锁
+        """
+        # deterministic mode 下不允许已完成的请求入树，避免不同采样策略之间的 KV 污染
         if self.disable_finished_insert:
             is_insert = False
 
-        # 1. 计算需要缓存的长度
+        # 步骤1: 计算 KV 中已提交（committed）的长度，并弹出记录
+        # committed 指的是已经完成 forward 计算并写入 KV cache 的部分
         kv_committed_len = req.pop_committed_kv_cache()
         if self.disable:
+            # cache 被禁用时，直接释放所有 KV slot
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_committed_len
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
             return
 
-        # 2. 取出缓存的token ids
+        # 步骤2: 拼接 origin_input_ids + output_ids，截取 committed 长度
+        # 完整的 token 序列 = prompt tokens + generated output tokens
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
 
-        # 3. 计算完的token ids对应的kv indices已经存储在了kv pool中，获取其索引
+        # 步骤3: 从 req_to_token_pool 取出这些 token 对应的 KV 物理槽位索引
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
 
-        # 4. key和value，节点中key是token ids，value其kv值在kv pool的index
-        # 节点中key是token ids，value其kv值在kv pool的index，其中key需要截断为page_size的倍数
-        # ！！！！！其中key需要截断为page_size的倍数 ----> 因此可以认为TreeNode中的key的长度全都是page_size的倍数！！！！
+        # 步骤4: 构造入树的 key 和 value
+        # key = token_ids 截断为 page_size 的倍数（树中只存 page-aligned 的内容）
+        # value = 对应的 KV 物理槽位索引
         radix_key = RadixKey(
             token_ids, req.extra_key, is_bigram=self.is_eagle
         ).page_aligned(self.page_size)
 
-        key_len = len(radix_key)
+        key_len = len(radix_key)  # page-aligned 后的长度
         values = kv_indices[:key_len].to(dtype=torch.int64, copy=True)
 
-        # Radix Cache takes one ref in memory pool
         if is_insert:
             priority = getattr(req, "priority", 0) or 0
+            # 将 token_ids 和 kv_indices 插入前缀树
+            # insert 内部会匹配已有节点，匹配到的部分不会重复创建
+            # result.prefix_len 表示匹配到的已有前缀长度
             result = self.insert(
                 InsertParams(key=radix_key, value=values, priority=priority)
             )
-            # Free the duplicates that were already in the tree
+            # 释放冗余 KV slot
+            # [cache_protected_len, prefix_len) 这段前缀在树中已存在，
+            # 本 req 自己分配的 slot 就是冗余的，释放掉
+            # （与 cache_unfinished_req 步骤2 同理）
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : result.prefix_len]
             )
         else:
+            # 不入树，直接释放 cache_protected_len 之后新增的所有 slot
             self.token_to_kv_pool_allocator.free(
                 kv_indices[req.cache_protected_len : key_len]
             )
 
-        # free the unaligned tail
+        # 释放 unaligned tail：不满一个 page 的尾部 token
+        # 这些 token 无法入树（树只存 page-aligned 内容），且请求已结束不再需要
+        # PagedAllocator.free 会自动按 page 粒度对齐释放
         self.token_to_kv_pool_allocator.free(kv_indices[key_len:])
 
-        # Remove req slot release the cache lock
+        # 释放请求持有的树锁（lock_ref -1）
+        # 请求完成后不再需要保护其 KV 不被驱逐
         if req.last_node is not None:
             self.dec_lock_ref(req.last_node)
 
@@ -516,6 +539,10 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         radix_key = RadixKey(
             token_ids, req.extra_key, is_bigram=self.is_eagle
         ).page_aligned(self.page_size)
+        # 只有 page-aligned 的部分才会入树，不满一个 page 的尾部 token 不入树
+        # 例如 page_size=16，25 个 token → radix_key 长度=16，token 16~24 不入树
+        # 这些 partial page 的 KV indices 保留在 req.prefix_indices 尾部，
+        # 由下一个 chunk 的 cache_unfinished_req 或最终的 cache_finished_req 处理
         values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
 
         # 步骤1: insert 将 token_ids 和 kv_indices 插入前缀树
@@ -543,7 +570,11 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         )
 
         # 步骤3: 重新 match_prefix 获取树中最新的 KV indices
-        # 因为 insert 可能改变了树结构（如拆分了节点），需要重新匹配
+        # 为什么不直接用 insert 的返回值？insert 只返回 prefix_len（一个 int），
+        # 不返回对应的 KV indices。而 match_prefix 返回 device_indices（tensor），
+        # 这是步骤4 req_to_token_pool.write 所需要的。
+        # 此外 insert 可能拆分了节点（prefix_len < len(node.key) 时），
+        # match_prefix 能拿到拆分后最新的节点索引。
         match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
         new_indices, new_last_node = (
             match_result.device_indices,
@@ -763,6 +794,9 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         # Skip the hit count update for chunked requests to avoid self-referencing
         # inflation where a chunked request increments hit_count on nodes it created
         # in previous chunks.
+        # chunked=True 时不增加 hit_count，防止同一个请求在多个 chunk 中
+        # 反复匹配到自己上一个 chunk 创建的节点，导致 hit_count 虚增。
+        # 虚增会让驱逐策略误以为该节点很热门，从而错误地推迟驱逐。
         if chunked:
             return
         node.hit_count += 1
@@ -822,6 +856,11 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
                 new_node.priority = max(new_node.priority, priority)
+                # chunked=True 时，不增加节点的 hit_count。
+                # 原因是：chunked req 会在多个 round 中反复 cache_unfinished_req。
+                # 如果每次都 +1 hit_count，那么这个请求自己在上一个 chunk 创建的节点，
+                # 在下一个 chunk 的 insert 中又被自己匹配到，hit_count 就会被自己虚增（self-referencing inflation），
+                # 让驱逐策略误以为这个节点很热门。
                 self._inc_hit_count(new_node, chunked)
                 node = new_node
             else:
