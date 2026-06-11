@@ -1875,30 +1875,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
           │           └─ [prefix_len, seq_len): out_cache_loc（新分配 KV）
           └─→ 返回 out_cache_loc, req_pool_indices
         """
-        # Prefill Batch标识
+        # ── 1. 设置 forward mode ──
         self.forward_mode = ForwardMode.EXTEND
 
         if self.is_dllm():
-            # For DLLM, we use a separate forward mode
             self.forward_mode = ForwardMode.DLLM_EXTEND
 
-        # Init tensors
+        # ── 2. 收集各请求的元数据 ──
         reqs = self.reqs
-        # 每个请求的input_ids
+        # 每个请求本次要计算的 token ids（去掉已匹配的 prefix 部分）
         input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
-        # 每个请求的seq_len
+        # 各请求维度参数: [seq_len, prompt总长, prefix长度, 本次extend长度]
         seq_lens = [len(r.fill_ids) for r in reqs]
-        # 每个请求的prompt len
         orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
-        # 每个请求的prefix len
         prefix_lens = [len(r.prefix_indices) for r in reqs]
-        # 该batch所有请求的即将计算的token数总和
         extend_lens = [r.extend_input_len for r in reqs]
 
+        # ── 3. 把 input_ids 搬到 pinned CPU，后续 H2D 由 resolve_forward_inputs 延迟执行 ──
         _pin = is_pin_memory_available(self.device)
-        # Stay on pinned CPU; H2D is deferred to forward stream via
-        # resolve_forward_inputs.
         pinned_input_ids = flatten_arrays_to_pinned_cpu(input_ids, _pin)
         seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin).to(
             self.device, non_blocking=True
@@ -1908,24 +1903,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             orig_seq_lens, dtype=torch.int32, pin_memory=_pin
         ).to(self.device, non_blocking=True)
 
-        # Set batch fields needed by alloc_for_extend
+        # 写入 batch 字段，供 alloc_for_extend 使用
         self.prefix_lens = prefix_lens
         self.extend_lens = extend_lens
         self.seq_lens = seq_lens_tensor
         self.seq_lens_cpu = seq_lens_cpu
         self.extend_num_tokens = extend_num_tokens
 
-        # Allocate memory
+        # ── 4. 分配 KV slot ──
+        # 内部流程: maybe_evict_swa → evict → alloc_extend → write_cache_indices
         out_cache_loc, req_pool_indices_tensor, req_pool_indices_cpu = alloc_for_extend(
             self
         )
 
-        # Set fields
+        # ── 5. 逐请求处理 extend 相关的元数据 ──
         input_embeds = []
         all_replace_embeds: List[torch.Tensor] = []
         all_replace_positions: List[int] = []
         has_replace_embeds = False
-        input_id_pointer = 0
+        input_id_pointer = 0                                          # 在拼接后的 input_ids 中的偏移
         input_id_lens = [len(input_id) for input_id in input_ids]
         extend_input_logprob_token_ids = []
         multimodal_inputs = []
@@ -1936,31 +1932,29 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         for i, (req, seq_len, pre_len) in enumerate(zip(reqs, seq_lens, prefix_lens)):
             assert seq_len - pre_len == req.extend_input_len
 
-            req.extend_batch_idx += 1
+            req.extend_batch_idx += 1                                 # 记录该请求第几次被 extend 调度
 
-            # update req-level memory management fields
+            # 更新请求级内存管理字段
             req.kv_committed_len = seq_len
             req.kv_allocated_len = seq_len
 
-            # If input_embeds are available, store them
+            # 5a. 提取 input_embeds（如果有）
             if req.input_embeds is not None:
-                # Slice to match extend_input_len — PrefillAdder truncates
-                # fill_ids/extend_input_len on chunk overflow but not input_embeds.
+                # PrefillAdder 截断 fill_ids 但不管 input_embeds，手动切片对齐
                 input_embeds.extend(
                     req.input_embeds[pre_len : pre_len + req.extend_input_len]
                 )
 
+            # 5b. 处理位置覆盖（positional embed overrides）
             if req.positional_embed_overrides is not None:
-                # Override positions are absolute in the full sequence.
-                # Convert to extend-tensor coordinates by subtracting pre_len,
-                # then skip any that fall within the cached prefix.
+                # 覆盖位置是全局绝对位置，需转为 extend 内的相对坐标
                 embeds_to_add = []
                 for embed_idx, pos in enumerate(
                     req.positional_embed_overrides.positions
                 ):
-                    extend_pos = pos - pre_len
+                    extend_pos = pos - pre_len                         # 转为 extend 内偏移
                     if extend_pos < 0 or extend_pos >= req.extend_input_len:
-                        continue  # Outside current extend chunk, skip
+                        continue                                      # 落在 prefix 里或超出当前 chunk，跳过
                     embeds_to_add.append((embed_idx, input_id_pointer + extend_pos))
                 if embeds_to_add:
                     has_replace_embeds = True
@@ -1973,59 +1967,40 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             multimodal_inputs.append(req.multimodal_inputs)
 
-            # Only calculate cached_tokens once. Once retracted, the 'retracted_stain'
-            # flag will always True
+            # 5c. 统计缓存命中（cached_tokens）
             if not req.retracted_stain:
                 new_cached = pre_len - req.already_computed
                 req.cached_tokens += new_cached
 
-                # Calculate detailed breakdown of cached tokens by source (for HiCache)
-                # Only compute once on FIRST chunk - subsequent chunks in chunked prefill
-                # would incorrectly count previously computed tokens as cache hits.
+                # HiCache: 按来源拆分为 device / host / storage 三部分
+                # 只在第一个 chunk 统计，后续 chunk 会错误地把已计算 token 算作 cache hit
                 if not req._cache_breakdown_computed:
-                    # At this point, prefix_indices has been extended with host data
-                    # via init_load_back in schedule_policy, so:
-                    # - len(prefix_indices) = device_original + host_loaded
-                    # - host_hit_length = total tokens from host cache (including storage-prefetched)
-                    # - storage_hit_length = tokens loaded from storage backend (L3 hits)
-                    # - device_portion = len(prefix_indices) - host_hit_length
-                    #
-                    # Storage hits are now tracked via scheduler after prefetch completes.
-                    # storage_hit_length is set by scheduler.pop_prefetch_loaded_tokens()
                     host_total = req.host_hit_length
-                    # Clamp storage to host_total to handle edge cases
-                    storage_portion = min(host_total, req.storage_hit_length)
-                    host_portion = host_total - storage_portion
-                    device_portion = max(0, len(req.prefix_indices) - host_total)
+                    storage_portion = min(host_total, req.storage_hit_length)  # L3 hit
+                    host_portion = host_total - storage_portion                 # host 内存 hit
+                    device_portion = max(0, len(req.prefix_indices) - host_total) # device 池 hit
 
                     req.cached_tokens_device = device_portion
                     req.cached_tokens_host = host_portion
                     req.cached_tokens_storage = storage_portion
                     req._cache_breakdown_computed = True
 
-                req.already_computed = seq_len
+                req.already_computed = seq_len                        # 更新已计算进度
             req.is_retracted = False
 
+            # 5d. Mamba 扩展缓存准备
             if get_global_server_args().enable_mamba_extra_buffer():
                 track_entry = self._mamba_radix_cache_v2_req_prepare_for_extend(req)
                 mamba_track_mask_cpu.append(track_entry.track_mask)
                 mamba_track_indices_cpu.append(track_entry.track_index)
                 mamba_track_seqlens_cpu.append(track_entry.track_seqlen)
 
+            # 5e. 收集 input logprob 所需的 token ids
             if self.return_logprob:
-                # Find input logprob token ids.
-                # First, find a global index within origin_input_ids and slide it by 1
-                # to compute input logprobs. It is because you need the next token
-                # to compute input logprobs. E.g., (chunk size 2)
-                #
-                # input_logprobs = [1, 2, 3, 4]
-                # fill_ids = [1, 2]
-                # extend_input_logprob_token_id = [2, 3]
-                #
-                # Note that it can also overflow. In this case, we pad it with 0.
-                # input_logprobs = [1, 2, 3, 4]
-                # fill_ids = [3, 4]
-                # extend_input_logprob_token_id = [4, 0]
+                # 需要"下一个 token" 来计算当前 token 的 logprob:
+                #   fill_ids = [1, 2], origin_input_ids = [1, 2, 3, 4]
+                #   → extend_input_logprob_token_id = [2, 3]（shift 1）
+                # 超出 origin_input_ids 的用 0 补齐
                 global_start_idx, global_end_idx = (
                     len(req.prefix_indices),
                     len(req.fill_ids),
@@ -2034,7 +2009,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     logprob_start_len = len(req.origin_input_ids)
                 else:
                     logprob_start_len = req.logprob_start_len
-                # Apply logprob_start_len
                 if global_start_idx < logprob_start_len:
                     global_start_idx = logprob_start_len
 
@@ -2043,8 +2017,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 ]
                 extend_input_logprob_token_ids.extend(logprob_token_ids)
 
-                # We will need req.extend_input_len - req.extend_logprob_start_len number of
-                # tokens, and logprob_token_ids is for input logprob, so pad the rest of them by 0.
+                # padding: 补齐到 extend_input_len 长度
                 extend_input_logprob_token_ids.extend(
                     [0]
                     * (
@@ -2054,12 +2027,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     )
                 )
 
+        # ── 6. 后处理: logprob / replace embeds / 写入 batch 字段 ──
         if self.return_logprob:
             extend_input_logprob_token_ids = torch.tensor(
                 extend_input_logprob_token_ids
             )
-            # Clamp placeholder or out-of-range token IDs (e.g., multimodal hashes)
-            # so they stay within the vocab boundary before being sent to GPU.
             extend_input_logprob_token_ids.clamp_(0, self.model_config.vocab_size - 1)
         else:
             extend_input_logprob_token_ids = None
@@ -2076,11 +2048,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             replace_positions_tensor = None
 
         self.input_ids = None
-        self.prefill_input_ids_cpu = pinned_input_ids
-        self.req_pool_indices = req_pool_indices_tensor
+        self.prefill_input_ids_cpu = pinned_input_ids                     # input tokens on pinned CPU
+        self.req_pool_indices = req_pool_indices_tensor                   # 每个请求在 req_to_token_pool 中的行索引
         self.req_pool_indices_cpu = req_pool_indices_cpu
-        self.orig_seq_lens = orig_seq_lens_tensor
-        self.out_cache_loc = out_cache_loc
+        self.orig_seq_lens = orig_seq_lens_tensor                         # 原始 prompt 长度
+        self.out_cache_loc = out_cache_loc                                # extend 部分分配的 KV slot 索引
         self.input_embeds = (
             torch.tensor(input_embeds, pin_memory=_pin).to(
                 self.device, non_blocking=True
@@ -2090,6 +2062,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         self.replace_embeds = replace_embeds_tensor
         self.replace_positions = replace_positions_tensor
+
+        # ── 7. 多模态输入搬到 GPU ──
         for mm_input in multimodal_inputs:
             if mm_input is None:
                 continue
@@ -2111,32 +2085,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_logprob_start_lens = [r.extend_logprob_start_len for r in reqs]
         self.extend_input_logprob_token_ids = extend_input_logprob_token_ids
 
-        # 暂时不考虑mamba
+        # ── 8. Mamba 扩展缓冲区 ──
         if get_global_server_args().enable_mamba_extra_buffer():
             self.mamba_track_indices = torch.tensor(
-                mamba_track_indices_cpu,
-                dtype=torch.int64,
-                device=self.device,
+                mamba_track_indices_cpu, dtype=torch.int64, device=self.device,
             )
             self.mamba_track_mask = torch.tensor(
-                mamba_track_mask_cpu,
-                dtype=torch.bool,
-                device=self.device,
+                mamba_track_mask_cpu, dtype=torch.bool, device=self.device,
             )
             self.mamba_track_seqlens = torch.tensor(
-                mamba_track_seqlens_cpu,
-                dtype=torch.int64,
-                device=self.device,
+                mamba_track_seqlens_cpu, dtype=torch.int64, device=self.device,
             )
 
-        # Collect mamba init info for deferred ops on forward stream
         if any(req.mamba_pool_idx is not None for req in reqs):
             self._collect_deferred_mamba_cow_and_clear(reqs)
 
+        # ── 9. Encoder-decoder 模式: 准备 encoder 信息 ──
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_extend(input_ids, seq_lens)
 
-        # Build sampling info
+        # ── 10. 构建采样信息 ──
         self.sampling_info = SamplingBatchInfo.from_schedule_batch(
             self,
             self.model_config.vocab_size,

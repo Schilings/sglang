@@ -306,66 +306,43 @@ def alloc_req_slots(
 def alloc_for_extend(
     batch: ScheduleBatch,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """为 extend batch 分配 KV cache 并写入 req_to_token_pool。
+
+       Q: 这个函数做了什么？
+       A: 四步流水线: 回收 SWA → 分配 pool 行 → 分配 KV 物理 slot → 写入。
+
+       Q: 分配的 slot 什么时候写入 req_to_token_pool？
+       A: 就在本函数末尾，write_cache_indices 将 prefix(已有KV) + extend(新分配) 一起写入。
     """
-    为 extend batch 分配 KV cache 并写入 req_to_token_pool。
-
-    调用链:
-    prepare_for_extend          (schedule_batch.py:1837)
-      │  docstring 记录了完整调用链 + 三步说明
-      ├─→ alloc_for_extend      (common.py:287)
-      │     │  docstring 说明三步流程 + 每步行内注释
-      │     ├─ maybe_evict_swa()         — 回收超窗 SWA
-      │     ├─ alloc_paged_token_slots_extend  (common.py:212)
-      │     │     │  docstring 解释为什么 num_tokens 往上多估
-      │     │     ├─ evict_from_tree_cache      — 不够就驱逐
-      │     │     └─ allocator.alloc_extend     — 三段式分页分配 (paged.py 已有注释)
-      │     └─ write_cache_indices     (common.py:62)
-      │           │  docstring 说明写入两段 + 每行行内注释
-      │           ├─ [0, prefix_len): prefix_tensors（已有 KV）
-      │           └─ [prefix_len, seq_len): out_cache_loc（新分配 KV）
-      └─→ 返回 out_cache_loc, req_pool_indices
-
-    三步:
-      1. maybe_evict_swa — 回收超出 sliding window 的 SWA token
-      2. alloc_paged_token_slots_extend — 按 page 分配新 KV slot（内含 evict 逻辑）
-      3. write_cache_indices — 将 prefix + extend 的 KV 索引写入 req_to_token_pool
-
-    Returns:
-        out_cache_loc: [extend_num_tokens] 新分配的 KV slot 索引
-        req_pool_indices_device: [num_reqs] 各请求在 req_to_token_pool 中的行号（GPU）
-        req_pool_indices_cpu: [num_reqs] 同上（CPU mirror）
-    """
-    # 步骤0: 回收超出滑动窗口的 SWA token，释放 swa_kv_pool 空间
+    # ── 1. 回收超出滑动窗口的 SWA token ──
     batch.maybe_evict_swa()
 
-    # 每个请求的 prefix_indices（已有 KV 的 slot 索引）
-    prefix_tensors = [r.prefix_indices for r in batch.reqs]
+    # ── 2. 准备 prefix / lens 参数 ──
+    prefix_tensors = [r.prefix_indices for r in batch.reqs]       # 每个请求已有的 prefix slot
 
-    # 构造 GPU/CPU tensor
     prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
     extend_lens_cpu = torch.tensor(batch.extend_lens, dtype=torch.int64)
     prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
     extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
 
-    # 步骤1: 在 req_to_token_pool 中为每个请求分配一行
-    # req_pool_indices: [num_reqs] 每个请求在 req_to_token_pool 中的行索引
+    # 为每个请求分配 req_to_token_pool 中的一行
     req_pool_indices = alloc_req_slots(
         batch.req_to_token_pool, batch.reqs, batch.tree_cache
     )
     req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 
-    # 步骤2: 为所有新增 token 分配 KV pool 中的物理 slot
+    # ── 3. 分配 KV pool 物理 slot ──
     if batch.tree_cache.page_size == 1:
-        # page_size=1: 无需分页，直接按 token 分配
+        # 简单场景: 按 token 直接分配，无需分页
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     else:
-        # page_size>1: 分页分配。last_loc = 每个请求的前缀最后一个 token 的 slot 索引
+        # 分页场景: last_loc 是每个请求 prefix 的最后一个 slot，用于判断旧 page 是否还有空位
         last_loc = [
             (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
             for t in prefix_tensors
         ]
-        # → alloc_paged_token_slots_extend → evict → allocator.alloc_extend (三段式)
+        # 内部分配: evict → alloc_extend（三段式: Part1旧page剩余 + Part2完整新page + Part3新page前段）
         out_cache_loc = alloc_paged_token_slots_extend(
             tree_cache=batch.tree_cache,
             prefix_lens=prefix_lens_device,
@@ -376,8 +353,10 @@ def alloc_for_extend(
             extend_num_tokens=batch.extend_num_tokens,
         )
 
-    # 步骤3: 将分配好的 KV 索引写入 req_to_token_pool
-    #        prefix 部分写 prefix_tensors（已有 KV），extend 部分写 out_cache_loc（新分配）
+    # ── 4. 写入 req_to_token_pool ──
+    # 每个请求一行，分两段:
+    #   [0, prefix_len): prefix_tensors   — 已有的 KV slot（来自 radix cache）
+    #   [prefix_len, seq_len): out_cache_loc — 新分配的 extend slot
     write_cache_indices(
         out_cache_loc,
         req_pool_indices_device,

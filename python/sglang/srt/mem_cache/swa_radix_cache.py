@@ -653,7 +653,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             InsertParams(
                 key=radix_key,
                 value=values,
-                prev_prefix_len=old_prefix_len,
+                prev_prefix_len=old_prefix_len, # = req.cache_protected_len 上次 match 时的 prefix 长度
             )
         )
         new_prefix_len = result.prefix_len  # insert 后树中已有 prefix 的长度
@@ -666,7 +666,8 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             match_result.last_device_node,
         )
 
-        # 确保 insert 没有"损失"已匹配的 prefix
+        # 与RadixCache相比，少了token_to_kv_pool_allocator.free
+        # Oh不，free放在了_insert_helper函数里
         assert old_prefix_len <= len(new_indices), f"{old_prefix_len=}, {new_indices=}"
         assert new_prefix_len <= len(new_indices), f"{new_prefix_len=}, {new_indices=}"
 
@@ -678,7 +679,6 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             (req.req_pool_idx, slice(old_prefix_len, len(new_indices))),
             new_indices[old_prefix_len:],
         )
-
         req.cache_protected_len = len(new_indices)
 
         # 步骤4: 更新锁 —— 从旧的 last_node 释放，在新 last_node 上加锁
@@ -1362,8 +1362,6 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
             # ─── 判断是否可以修复 tombstone ───
             #  update_kv_after_len = req.cache_protected_len 是req确定的已经在radix cache内的长度
-            #  req每次调度都会重复cache_unfinished_req， insert会在其中重复调用，cache_protected_len又会在insert后重复更新
-            #  这个条件：意味着这次调度后比上一次多匹配到了更长的prefix
             if update_kv_after_len < total_prefix_length + prefix_len:
                 if node.swa_tombstone:
                     # tombstone 节点：full KV 还在，但 swa KV 已被驱逐。
