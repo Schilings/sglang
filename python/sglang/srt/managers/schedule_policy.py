@@ -699,6 +699,13 @@ class PrefillAdder:
         )
 
     def add_chunked_req(self, req: Req):
+        """将分块 prefilled 的请求加入当前 batch 的下一 chunk。
+
+        注意：这里不调用 match_prefix！Chunk 2+ 直接读取 req.prefix_indices
+        （由上一 chunk 末尾的 cache_unfinished_req 存入），跳过冗余的 radix tree 遍历。
+        调度器在调用本方法前先执行 init_next_round_input() 且不传 tree_cache 参数，
+        确保 fill_ids 被重置但 prefix match 被跳过。
+        """
         # 然后来得到 -> 还能计算多少token
         # 比较 剩余budget桶容量 和 设置的最大token数限制容量 最小值
         if self.dllm_config is not None:

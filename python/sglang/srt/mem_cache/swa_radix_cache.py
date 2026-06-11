@@ -464,12 +464,30 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 best_match_node=self.root_node,
             )
 
-        #
+        # page size对齐，匹配到的prefix长度是page size对齐的
         value, last_node, best_value_len = self._match_prefix_helper(key)
         # LRUList 不存数据，只回答一个问题：内存不够时，该驱逐谁？
+        # 然后 _match_post_processor 做截断：value = value[:best_value_len]
         return self._match_post_processor(params, value, last_node, best_value_len)
 
     def insert(self, params: InsertParams) -> InsertResult:
+        """将请求的 KV 插入 radix tree，返回实际插入的 prefix 长度。
+
+        参数：
+          key                — 请求的 token_ids，已 page-aligned
+          value              — 每个 token 在 full_kv_pool 中的 slot 索引
+          prev_prefix_len     — 上次 match_prefix 匹配到了多少个 token
+                                只有 position ≥ prev_prefix_len 的 KV 是本次新计算的，
+                                之前的 KV 是上次 match 给的旧数据，不能用来覆盖 tombstone
+          swa_evicted_seqlen  — 该请求的 SWA KV 从哪个 position 开始被驱逐了
+                                决定了 tombstone 节点是否能被修复
+
+        整体流程（详见 _insert_helper）：
+          1. 从 root 出发遍历树，找到已有节点匹配到的前缀部分
+          2. 对每个已有节点，如果它是 tombstone 且在"本次新计算"范围内，
+             尝试用新 KV 修复它（三个分支：全部恢复 / 部分恢复+split / 无法恢复）
+          3. 遍历结束后，把树中不存在的后缀（key 剩余部分）新建节点追加到树上
+        """
         if self.disable:
             return InsertResult(prefix_len=0)
 
@@ -491,27 +509,39 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         prefix_len = self._insert_helper(
             self.root_node,  # ① node: 起点，总是从 root 开始
             key,  # ② key: 要插入的 token 序列（page-aligned 的 RadixKey）
-            value,  # ③ value: 对应的 KV pool slot 索引（torch.Tensor）
+            value,  # ③ value: 对应每个 token 的 KV pool slot 索引（torch.Tensor）
             prev_prefix_len,  # ④ update_kv_after_len: 上次 match_prefix 匹配到了多长
-            swa_evicted_seqlen,  # ⑤ swa_evicted_seqlen: 这个请求的 SWA 从哪个位置开始被驱逐
+            swa_evicted_seqlen,  # ⑤ swa_evicted_seqlen: 该请求 SWA 从哪个位置开始被驱逐
         )
         return InsertResult(prefix_len=prefix_len)
 
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:
-        """Cache request when it finishes."""
+        """Cache request when it finishes.
+
+        请求完成后调用。将 KV 插入 radix tree（可选），释放锁，回收内存。
+
+        流程:
+          1. 取出 committed 的 KV slot 索引
+          2. is_insert=True → 插入 radix tree（让后续请求可 match）；=False → 直接释放
+          3. 释放 page-unaligned 的尾部（页不对齐部分不存入树）
+          4. dec_lock_ref 释放请求持有的锁
+        """
         kv_committed_len = req.pop_committed_kv_cache()
         if self.disable:
+            # radix cache 禁用 → 直接释放所有 KV slot
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_committed_len
             ]
             self.token_to_kv_pool_allocator.free(kv_indices)
             return
 
+        # 构造要插入树的 token_ids 和对应的 KV slot 索引
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
         ]
 
+        # page-aligned：只插入页对齐的部分，尾部未对齐的会单独释放
         radix_key = RadixKey(
             token_ids, req.extra_key, is_bigram=self.is_eagle
         ).page_aligned(self.page_size)
@@ -519,9 +549,10 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
         old_prefix_len = req.cache_protected_len
 
-        # Radix Cache takes one ref in memory pool
-        # Note: the insert function already frees the overlapped kv_indices
         if is_insert:
+            # 将 KV 加入 radix tree 共享池。
+            # insert 内部会释放 values 中与树已有节点重叠的部分。
+            # 传入 swa_evicted_seqlen：如果请求的 SWA 已被驱逐，tombstone 节点可被修复。
             self.insert(
                 InsertParams(
                     key=radix_key,
@@ -531,45 +562,81 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 )
             )
         else:
+            # 不插入树（如 skip_radix_cache_insert=True），直接释放新增部分
             self.token_to_kv_pool_allocator.free(
                 kv_indices[old_prefix_len:page_aligned_len]
             )
 
-        # free the unaligned tail
+        # 释放未对齐的尾部（不在树中，无法共享）
         self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
 
-        # Remove req slot release the cache lock
+        # 释放请求持有的树锁。因为请求已完成，不再需要保护其 KV 不被驱逐。
         self.dec_lock_ref(
             req.last_node,
             DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
-            skip_swa=req.swa_prefix_lock_released,
+            skip_swa=req.swa_prefix_lock_released,  # decode 中已提前释放 SWA 锁则跳过
         )
         req.swa_prefix_lock_released = False
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
-        """Cache request when it is unfinished."""
+        """Cache request when it is unfinished.
+
+        chunked prefill 时，该方法会将当前已计算的 KV 存入 req.prefix_indices，
+        后续 chunk 不再做冗余的 match_prefix：
+          - disable=True:  prefix_indices = 从 pool 直接取 kv_indices
+          - disable=False: prefix_indices = insert 后重新 match 得到的 new_indices
+                            + kv_indices 的尾部（如果有未对齐部分）
+        Chunk 2+ 在 PrefillAdder.add_chunked_req 中直接读取 req.prefix_indices，
+        不再调用 match_prefix，节省一次 radix tree 遍历。
+        """
         if self.disable:
+            # 直接取 req_to_token_pool 中该请求的全部 KV slot 索引
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : len(req.fill_ids)
             ]
 
+            # 存入 prefix_indices，下一 chunk 直接用，不查 radix tree
             # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
             req.prefix_indices = kv_indices
             return
+
+        # ═══════════════════════════════════════════════════════════════
+        # disable=False（radix cache 启用）的路径
+        # 目标: 把当前计算的 KV 插入 radix tree，让后续请求可以匹配；同时更新请求的锁。
+        # ═══════════════════════════════════════════════════════════════
 
         token_ids = req.fill_ids
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
 
+        # 构造 page-aligned 的 radix key 和对应的 value
         radix_key = RadixKey(
             token_ids, req.extra_key, is_bigram=self.is_eagle
         ).page_aligned(self.page_size)
+        # value也page-aligned了
         values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
-        old_prefix_len = req.cache_protected_len
+        old_prefix_len = req.cache_protected_len  # 上次 match 时的 prefix 长度
 
-        # Radix Cache takes one ref in memory pool
-        # Note: the insert function already frees the overlapped kv_indices
+        # ═══════════════════════════════════════════════════════════════
+        # insert + 重新 match 的意义：让后续请求能 hit 到当前请求的前缀
+        # ═══════════════════════════════════════════════════════════════
+        # 场景 A: 两个相同 prompt 的请求先后到达
+        #   Req1: match_prefix → 空 → prefill 完 → insert 入树
+        #   Req2: match_prefix → 命中 Req1 的节点 → 只 decode，不用 prefill
+        #
+        # 场景 B: chunked prefill，同一请求的后续 chunk
+        #   Chunk1: match_prefix → 空 → prefill 128 tokens → insert 入树
+        #   Chunk2: match_prefix → 命中 128 tokens → 只 prefill 后缀
+        #
+        # 场景 C: 同一 batch 内的两个请求互相不可见
+        #   match_prefix 在 alloc_for_extend 之前调用，此时树里还没有这批 KV，
+        #   所以同一批 request 不能互相借前缀。
+        # ═══════════════════════════════════════════════════════════════
+
+        # 步骤1: 把 KV 插入 radix tree
+        # insert 会释放 values 中与树已有节点重叠的部分（避免 double-alloc），
+        # 并尝试修复 tombstone 节点。
         result = self.insert(
             InsertParams(
                 key=radix_key,
@@ -577,17 +644,24 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 prev_prefix_len=old_prefix_len,
             )
         )
-        new_prefix_len = result.prefix_len
+        new_prefix_len = result.prefix_len  # insert 后树中已有 prefix 的长度
 
-        # The prefix indices could be updated, reuse it
+        # 步骤2: 重新 match_prefix —— 因为 insert 可能 split/merge 了节点，
+        #   树结构变了，需要重新获取当前树中"标准"的 KV slot 索引
         match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
         new_indices, new_last_node = (
             match_result.device_indices,
             match_result.last_device_node,
         )
 
+        # 确保 insert 没有"损失"已匹配的 prefix
         assert old_prefix_len <= len(new_indices), f"{old_prefix_len=}, {new_indices=}"
         assert new_prefix_len <= len(new_indices), f"{new_prefix_len=}, {new_indices=}"
+
+        # 步骤3: 把 re-match 得到的新 indices 写回 req_to_token_pool
+        #   为什么要写回？insert 可能 free 了旧 KV slot 并用树中的替换了它们，
+        #   req_to_token_pool 中存的 old_prefix_len 之后的 indices 可能已失效。
+        #   只更新 old_prefix_len 之后的部分（之前的已验证一致，不需要动）。
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(old_prefix_len, len(new_indices))),
             new_indices[old_prefix_len:],
@@ -595,16 +669,21 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
 
         req.cache_protected_len = len(new_indices)
 
+        # 步骤4: 更新锁 —— 从旧的 last_node 释放，在新 last_node 上加锁
+        #   dec_lock_ref: 释放之前 match_prefix 时加的锁
+        #   inc_lock_ref: 在 re-match 得到的新 last_node 上加锁
         self.dec_lock_ref(
             req.last_node,
             DecLockRefParams(swa_uuid_for_lock=req.swa_uuid_for_lock),
-            skip_swa=req.swa_prefix_lock_released,
+            skip_swa=req.swa_prefix_lock_released,  # 如果 SWA 锁已提前释放则跳过
         )
         req.swa_prefix_lock_released = False
         result = self.inc_lock_ref(new_last_node)
-        swa_uuid_for_lock = result.swa_uuid_for_lock
+        swa_uuid_for_lock = result.swa_uuid_for_lock  # 记录新的 SWA 锁 UUID
 
-        # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
+        # 步骤5: 保存 prefix_indices，供下一 chunk 直接使用
+        #   如果 new_indices 长度 < kv_indices（有未对齐的尾部没插入树），
+        #   把尾部也拼上，保证 prefix_indices 覆盖该请求全部已有 token。
         if len(new_indices) < len(kv_indices):
             req.prefix_indices = torch.cat(
                 [new_indices, kv_indices[len(new_indices) :]]
@@ -966,8 +1045,8 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         value = []
         # 初始化为 Inf！！！！
         # for path connected to root without tombstone, always match, so set to inf
-        match_len_since_tombstone = float("inf") # 从 root 出发没有 tombstone
-        best_value_len = 0
+        match_len_since_tombstone = float("inf") # token 数 判断"最后一段连续非 tombstone"是否 ≥ sliding_window_size
+        best_value_len = 0 # 节点数	截断 value 列表，决定保留哪些节点的 value
         best_last_node = node
         enable_compact = envs.SGLANG_OPT_SWA_RADIX_CACHE_COMPACT.get()
         while len(key) > 0 and child_key in node.children.keys():
@@ -981,23 +1060,26 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             # 这是 tombstone 影响前缀匹配安全性的关键逻辑。
             if child.swa_tombstone:
                 # update best_value_len and best_last_node if needed
+                # 遇到 tombstone 时，检查 "上一个非 tombstone 连续段" 是否 ≥ window
+                # 第一次遇到tombstone肯定是True：
                 if match_len_since_tombstone >= self.sliding_window_size:
                     best_value_len = len(value)
-                    best_last_node = node
+                    best_last_node = node # ← 记录对应的父节点
                 # reset match_len_since_tombstone if we hit a tombstone node
                 match_len_since_tombstone = 0 # 重置计数
 
+            # page size对齐，匹配到的prefix长度是page size对齐的
             prefix_len = child.key.match(key, page_size=self.page_size)
             if prefix_len < len(child.key):
-                # 部分匹配
                 new_node = self._split_node(child.key, child, prefix_len)
+                # 无论 tombstone 与否，value 都追加
                 value.append(new_node.value)
                 if not new_node.swa_tombstone:
                     match_len_since_tombstone += len(new_node.value)
                 node = new_node
                 break
             else:
-                # 完全匹配
+                # 无论 tombstone 与否，value 都追加
                 value.append(child.value)
                 if not child.swa_tombstone:
                     match_len_since_tombstone += len(child.value)
@@ -1008,9 +1090,10 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                     child_key = key.child_key(self.page_size)
 
         # handle best_value_len and best_last_node, for the case that last node is fully matched
+        # 循环结束后，如果最后一段连续非 tombstone ≥ window：
         if match_len_since_tombstone >= self.sliding_window_size:
-            best_value_len = len(value)
-            best_last_node = node
+            best_value_len = len(value) # 全部都可以用
+            best_last_node = node # ← 记录对应的父节点
 
         return value, best_last_node, best_value_len
 
@@ -1043,6 +1126,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         self.swa_lru_list.reset_node_and_parents_mru(node_update, self.root_node)
 
         # This last_access_time is for sanity check, can be deleted after validation in production
+        # 刷新last access time
         cur_time = get_last_access_time()
         while node_update:
             node_update.last_access_time = cur_time
@@ -1051,6 +1135,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             )
             node_update = node_update.parent
 
+        # 做截断：value = value[:best_value_len]
         value = value[:best_value_len]
         if value:
             value = torch.cat(value)
@@ -1194,13 +1279,44 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         node: TreeNode,
         key: RadixKey,
         value,
-        # prev_prefix_len → update_kv_after_len — 上次匹配到哪
-        # 表示上一次 match_prefix 返回了多少个 token 的前缀
         update_kv_after_len: int,
         swa_evicted_seqlen: int = 0,
     ) -> int:
-        # Update the last access time from root to leaf, so that
-        # swa will tombstone the node closer to root first
+        """插入 KV 到 radix tree 的递归辅助函数。
+
+        参数：
+          node                 — 当前遍历到的树节点（初始为 root）
+          key                  — 剩余待插入的 token 序列（page-aligned）
+          value                — 剩余 token 对应的 KV pool slot 索引
+          update_kv_after_len  — 上次 match_prefix 匹配到的 token 数。
+                                 只有 key 中 position ≥ update_kv_after_len 的 token
+                                 是"本次新计算的"，才能用来修复 tombstone 节点。
+                                 之前的 token 是 match 给的旧 KV，不能用于覆盖。
+          swa_evicted_seqlen   — 该请求从哪个 position 开始 SWA KV 被驱逐了。
+                                 决定了 tombstone 节点能否被恢复。
+
+        返回：
+          树中已有的 prefix 长度（token 数），即本次匹配到的已有节点覆盖的 token 数。
+
+        两阶段逻辑：
+          ┌─────────────────────────────────────────────────────────────┐
+          │ 阶段1: 遍历已有节点（while 循环）                             │
+          │   沿树向下走，key 前缀匹配到的每个已有节点：                     │
+          │     a) 如果节点在"本次新计算"范围内且是 tombstone：             │
+          │        尝试用新 KV 修复（三个分支）                              │
+          │     b) 如果节点不在"本次新计算"范围内或不是 tombstone：          │
+          │        释放 value 中重叠部分（树中已有，不需要重复存）             │
+          │     c) 更新 key/value 指针，继续向下一层匹配                     │
+          │                                                              │
+          │ 阶段2: 创建新节点（while 后的 if len(key) 块）                  │
+          │   key 剩余部分在树中不存在 → 新建节点追加到树上                   │
+          │   如果 swa_evicted_seqlen 落在新部分中间：                       │
+          │     前半段建为 tombstone 节点（SWA 已被驱逐）                    │
+          │     后半段建为正常节点                                          │
+          └─────────────────────────────────────────────────────────────┘
+        """
+        # 每次 insert 都更新该节点的访问时间并移到 LRU 的 MRU 端。
+        # 这样越靠近 root 的节点越"旧"，SWA 驱逐时会从 root 方向优先 tombstone。
         node.last_access_time = get_last_access_time()
         if node != self.root_node:
             self.full_lru_list.reset_node_mru(node)
@@ -1209,100 +1325,116 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         if len(key) == 0:
             return 0
 
+        # child_key = key 的前 page_size 个 token 的哈希（用作子节点查找 key）
         child_key = key.child_key(self.page_size)
 
-        # 这次match到的prefix长度
-        total_prefix_length = 0
+        # ═══════════════════════════════════════════════════════════════
+        # 阶段1: 沿树向下走，逐节点匹配已有的前缀
+        # ═══════════════════════════════════════════════════════════════
+        total_prefix_length = 0  # 当前已匹配到的 token 总数（从 key[0] 开始算）
         while len(key) > 0 and child_key in node.children.keys():
+            # 进入子节点
             node = node.children[child_key]
+            # 刷新该节点的 LRU（每走过一次就标记为"刚用过"）
             node.last_access_time = get_last_access_time()
             self.full_lru_list.reset_node_mru(node)
             if not node.swa_tombstone:
                 self.swa_lru_list.reset_node_mru(node)
+            # 计算当前节点的 key 与待插入 key 匹配了多长
             prefix_len = node.key.match(key, page_size=self.page_size)
 
+            # 如果只匹配了节点 key 的一部分 → 需要把节点拆开
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
-                node = new_node
+                node = new_node  # split 后 node 指向新创建的父节点
 
-            # if tombstone after update_kv_after_len, update node.value to be the input value.
-            # This is needed because it is possible that the last sliding window size tokens
-            # contains tombstone. If this is the case and we don't update the kv value, then
-            # the prefill prefix matching will stuck.
-            # 这次match到的prefix长度 比 上一次 长
-            # 如果 update_kv_after_len >= total_prefix_length + prefix_len，
-            # 说明这个节点完全在"上次旧匹配"的范围内，本次没有新 KV 可以覆盖它，就不碰。
+            # ─── 判断是否可以修复 tombstone ───
+            # 条件: 本节点的任意 token 必须在"本次新计算"的范围内。
+            # 什么叫"本次新计算"？
+            #   请求 prefill 时，match_prefix 先匹配已有 KV，extend 再计算新 KV。
+            #   update_kv_after_len = match 匹配到的 token 数。
+            #   只有 position ≥ update_kv_after_len 的 token 是本次 fresh compute 的。
+            #   如果整个节点都 ≤ update_kv_after_len → 全是 match 给的旧 KV → 跳过。
             if update_kv_after_len < total_prefix_length + prefix_len:
-                # For page_size > 1 and chunked prefill case, update_kv_after_len may be not page-aligned due to a trailing partial page
-                # (kept in the request but not inserted into the radix tree) appended to prefix_indices.
-                # 这个节点在"本次新计算"的范围内，tombstone 修复才有意义
                 if node.swa_tombstone:
-                    # 可以用新计算的 KV 替换掉被 tombstone 的旧 KV
-                    assert (
-                        node.swa_lock_ref == 0
-                    ), f"tombstone swa_lock_ref should always be 0, {node.full_lock_ref=}, {node.swa_lock_ref=}, {node.id=}"
-                    assert (
-                        swa_evicted_seqlen % self.page_size == 0
-                    ), f"swa_evicted_seqlen must be page aligned, {swa_evicted_seqlen=}, {self.page_size=}"
+                    # tombstone 节点：full KV 还在，但 swa KV 已被驱逐。
+                    # 如果新请求重新 prefill 了这段，我们可以用新 KV 把节点"复活"。
+                    assert node.swa_lock_ref == 0  # tombstone 不应该还有 SWA 锁
+                    assert swa_evicted_seqlen % self.page_size == 0
+
+                    # 节点占据的 position 区间: [total_prefix_length, total_prefix_length + prefix_len)
+                    # swa_evicted_seqlen 决定其中哪些 token 的 SWA KV 还存在：
+
                     if swa_evicted_seqlen <= total_prefix_length:
-                        # Branch 1: all swa tokens of value[:prefix_len] are not evicted, so we can insert it to the tree directly.
-                        # Free full tokens in the original tree node.
-                        # Branch 1: 全部 SWA 都没有被驱逐，直接恢复
-                        self.token_to_kv_pool_allocator.free(node.value[:prefix_len]) # 释放旧 full KV
-                        # Overwrite the new value in request to the tree node.
-                        node.value = value[:prefix_len].clone() # 写入新 full KV
-                        node.swa_tombstone = False # 取消 tombstone
-                        self.swa_lru_list.insert_mru(node)
+                        # Branch 1: 整个节点的 SWA KV 都还在，全部恢复！
+                        # 例: 节点 [128,144) 的 SWA 在 position 100 时被回收、但在 128 之后又需要了
+                        self.token_to_kv_pool_allocator.free(node.value[:prefix_len])  # 释放旧的 full KV
+                        node.value = value[:prefix_len].clone()  # 写入新计算的 full KV
+                        node.swa_tombstone = False               # 取消 tombstone 标记
+                        self.swa_lru_list.insert_mru(node)       # 重新加入 SWA LRU
                         self.swa_evictable_size_ += len(node.value)
+
                     elif swa_evicted_seqlen < total_prefix_length + prefix_len:
-                        # Branch 2: part of swa tokens of value[:prefix_len] are evicted, so we need to split the node and insert the value to new node.
-                        # Branch 2: 部分 SWA 被驱逐，需要 split
-                        start_update_idx = swa_evicted_seqlen - total_prefix_length
+                        # Branch 2: SWA KV 只被驱逐了一部分 → 拆成两半！
+                        # 例: 节点 [128,160)，swa_evicted_seqlen=144
+                        #     前半 [128,144): SWA 仍被驱逐 → 保持 tombstone
+                        #     后半 [144,160): SWA 还在 → 可以恢复
+                        start_update_idx = swa_evicted_seqlen - total_prefix_length  # 144-128=16
                         self.token_to_kv_pool_allocator.free(
-                            node.value[start_update_idx:prefix_len]
+                            node.value[start_update_idx:prefix_len]  # 释放后半段旧 full KV
                         )
-                        self._split_node(node.key, node, start_update_idx) # 切分
-                        # Here node is the new node after split, so we can overwrite the value to the new node.
-                        # The old node is still swa tombstone and the full token is not freed.
-                        # 前半段仍 tombstone，后半段恢复
-                        node.value = value[start_update_idx:prefix_len].clone()
-                        self.token_to_kv_pool_allocator.free(value[:start_update_idx])
+                        self._split_node(node.key, node, start_update_idx)  # 切出前半段
+                        # split 后 node 变成后半段节点（新创建的），前半段保持 tombstone
+                        node.value = value[start_update_idx:prefix_len].clone()  # 写入新 full KV
+                        self.token_to_kv_pool_allocator.free(value[:start_update_idx])  # 释放前半段新 value
                         node.swa_tombstone = False
                         self.swa_lru_list.insert_mru(node)
                         self.swa_evictable_size_ += len(node.value)
+
                     else:
-                        # Branch 3: all swa tokens of value[:prefix_len] are evicted, so we don't need to update the node.
-                        # Branch 3: 全部 SWA 都被驱逐，无法恢复
-                        self.token_to_kv_pool_allocator.free(value[:prefix_len])# 释放新来的 value
+                        # Branch 3: 整个节点的 SWA KV 都已被驱逐，无法恢复
+                        # 例: 节点 [128,144)，swa_evicted_seqlen=200
+                        #     → 释放新来的 value（重复了），树中的 tombstone 保持原样
+                        self.token_to_kv_pool_allocator.free(value[:prefix_len])
+
                 else:
-                    # The node is not tombstone, so we don't need to update the node.
+                    # 节点正常（非 tombstone），树中已有完整的 full+swa KV
+                    # 新来的 value 与树中已有 KV 重复 → 释放新 value，避免 double-alloc
+                    #
+                    # 典型场景：同一 batch 的两个相同 prompt 请求
+                    #   Req1 prefill 完 → cache_unfinished_req → insert 入树
+                    #   Req2 prefill 完 → cache_unfinished_req → insert：
+                    #     发现树中已有 Req1 的节点（非 tombstone）
+                    #     → 释放 Req2 冗余分配的 KV slot
+                    #     → re-match 后 req_to_token[Req2] 指向 Req1 的物理 KV
+                    #     → 两个请求共享同一块物理 KV，显存不浪费
                     self.token_to_kv_pool_allocator.free(value[:prefix_len])
 
+            # 指针推进：去掉已匹配的前缀，继续向下匹配
             total_prefix_length += prefix_len
             key = key[prefix_len:]
             value = value[prefix_len:]
 
             if len(key):
-                child_key = key.child_key(self.page_size)
+                child_key = key.child_key(self.page_size)  # 下一层子节点的查找 key
 
+        # ═══════════════════════════════════════════════════════════════
+        # 阶段2: key 还有剩余（树中没有对应节点）→ 创建新节点
+        # ═══════════════════════════════════════════════════════════════
         if len(key):
-            # Layout: |--- total_prefix_length ---|--- len(key) ---|
-            #         ^                           ^                ^
-            #         0              total_prefix_length     total_length
+            # 此时 key 和 value 中剩余的数据布局：
+            #   |── total_prefix_length ──|──── len(key) ────|
+            #   ^                          ^                   ^
+            #   0               total_prefix_length     total_length
             #
-            # Cases based on swa_evicted_seqlen position:
-            # 1. swa_evicted_seqlen <= total_prefix_length:
-            #    Already handled in the while loop above. All of len(key) is non-tombstone.
-            # 2. total_prefix_length < swa_evicted_seqlen < total_length:
-            #    Split: [total_prefix_length, swa_evicted_seqlen) as tombstone,
-            #           [swa_evicted_seqlen, total_length) as non-tombstone.
-            # 3. swa_evicted_seqlen == total_length:
-            #    All remaining tokens are evicted. Free value and return without
-            #    creating a node (leaf nodes must not be tombstone).
-            #    Note: the -page_size fix in _evict_swa prevents this case from
-            #    occurring in normal operation. This check is a defensive guard
-            #    against unexpected eviction states from other code paths.
+            # swa_evicted_seqlen 落在哪决定了这段新建节点的 tombstone 状态：
+            #   Case A: 落在前面 → 全部非 tombstone（阶段1已搞定，直接走 Case A）
+            #   Case B: 落在中间 → 前半 tombstone + 后半正常
+            #   Case C: 落在末尾 → 全部 tombstone，但叶节点不能是 tombstone，只能丢弃
+
             if swa_evicted_seqlen == total_prefix_length + len(key):
+                # Case C: 所有剩余 token 的 SWA 都已不可用，不建节点。
+                # （正常情况不会走到这里，_evict_swa 的 -page_size 保护了尾部）
                 self.token_to_kv_pool_allocator.free(value)
                 return total_prefix_length
 
@@ -1310,6 +1442,8 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                 swa_evicted_seqlen > total_prefix_length
                 and swa_evicted_seqlen < total_prefix_length + len(key)
             ):
+                # Case B: swa_evicted_seqlen 切在剩余部分中间
+                # 前半段 → tombstone 节点（SWA 已驱逐，只有 full KV 可用）
                 swa_tombstone_len = swa_evicted_seqlen - total_prefix_length
                 node = self._add_new_node(
                     node,
@@ -1317,14 +1451,16 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
                     value[:swa_tombstone_len],
                     swa_tombstone=True,
                 )
+                # 后半段继续往下，和 Case A 一样建正常节点
                 key = key[swa_tombstone_len:]
                 value = value[swa_tombstone_len:]
 
+            # Case A / Case B 后半段: 建为非 tombstone 的正常叶节点
             new_leaf = self._add_new_node(node, key, value, swa_tombstone=False)
 
             if envs.SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT.get():
-                # Cap the leaf at one (page-aligned) sliding window so a future
-                # inc_lock_ref only protects `sliding_window_size` tokens of SWA pool.
+                # 限制叶节点大小 ≤ sliding_window_size。
+                # 目的：inc_lock_ref 时只 lock 窗口内的 SWA token，不锁超出窗口的历史 token。
                 self._maybe_split_leaf_for_swa_lock(new_leaf)
 
         return total_prefix_length
@@ -1336,15 +1472,24 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         value: torch.Tensor,
         swa_tombstone: bool = False,
     ) -> TreeNode:
+        """在 radix tree 上创建一个新节点并加入 LRU。
+
+        参数:
+          swa_tombstone=True → 只加入 full_lru_list（SWA KV 已被驱逐，不可驱逐 SWA 侧）
+          swa_tombstone=False → 同时加入 full_lru_list 和 swa_lru_list
+        """
         assert len(key) > 0, f"key should not be empty"
         new_node = TreeNode()
         new_node.parent = parent
         new_node.key = key
-        new_node.value = value.clone()
+        new_node.value = value.clone()  # clone 防止外部引用修改
         new_node.swa_tombstone = swa_tombstone
+        # 挂到父节点的 children 字典上
         parent.children[key.child_key(self.page_size)] = new_node
+        # 加入 full LRU（所有节点都在 full LRU 中）
         self.full_lru_list.insert_mru(new_node)
         self.full_evictable_size_ += len(value)
+        # tombstone 节点只加入 full LRU，不加入 swa LRU（SWA KV 已不存在）
         if not swa_tombstone:
             self.swa_lru_list.insert_mru(new_node)
             self.swa_evictable_size_ += len(value)

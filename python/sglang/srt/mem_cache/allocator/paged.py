@@ -287,16 +287,30 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return out_indices
 
     def free(self, free_index: torch.Tensor):
+        """释放 token-level 的 KV slot 索引。
+
+        【为什么敢用 free_index // page_size 直接转 page 索引？】
+        虽然入参是 token 级别的索引，但调用方保证了 page 对齐安全性：
+        1. 树中的节点全由 RadixKey.page_aligned() 生成，长度是 page_size 的倍数，
+           因此 evict 或 cache_unfinished_req 释放树节点的 value 时，indices 恰好对应完整的 page
+        2. cache_protected_len 也是 page-aligned 的（来自 match_prefix 返回的树中 value 长度），
+           所以 kv_indices[cache_protected_len : new_prefix_len] 切片也是完整 page
+        3. 唯一例外是 unaligned tail（不满一个 page 的尾部），但它独属于一个 req，不会共享，
+           所以释放整个 page 不会影响其他 req
+        综上：不会出现"同一个 page 内部分在用、部分被 free"的情况。
+        """
         if free_index.numel() == 0:
             return
 
         if self.is_not_in_free_group:
+            # token index → page index，torch.unique 去重同一 page 的多个 token
             free_page_indices = torch.unique(free_index // self.page_size)
             if self.need_sort:
                 self.release_pages = torch.cat((free_page_indices, self.release_pages))
             else:
                 self.free_pages = torch.cat((free_page_indices, self.free_pages))
         else:
+            # free_group 模式：先攒着，等 free_group_end 时统一处理
             self.free_group.append(free_index)
 
         if self.debug_mode:

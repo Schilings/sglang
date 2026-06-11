@@ -488,7 +488,18 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             self.dec_lock_ref(req.last_node)
 
     def cache_unfinished_req(self, req: Req, chunked=False):
-        """Cache request when it is unfinished."""
+        """将未完成请求的 KV 缓存写入前缀树。
+
+        【同 batch 内的 KV 共享机制】:
+        batch_result_processor 中以 for 循环串行调用本函数，因此同一 batch 内
+        先处理的 req 会先入树，后处理的 req 在 insert 时可能匹配到前者的节点。
+        例如：Req1 和 Req2 有相同 prompt，调度时各分配了完整的 KV slot，
+        但 Req1 先入树后，Req2 的 insert 能匹配到 Req1 的前缀，
+        此时 insert 返回的 prefix_len > 0，下面 free 会释放 Req2 的冗余 slot，
+        match_prefix + write 会把 Req2 的 req_to_token 映射纠正指向 Req1 的 slot。
+        所以：同 batch 内的 KV 共享不是在调度时（match_prefix）完成的，
+        而是在 cache_unfinished_req 串行执行时完成的。
+        """
         if self.disable:
             return
 
@@ -507,7 +518,11 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         ).page_aligned(self.page_size)
         values = kv_indices[: len(radix_key)].to(dtype=torch.int64, copy=True)
 
-        # Radix Cache takes one ref in memory pool
+        # 步骤1: insert 将 token_ids 和 kv_indices 插入前缀树
+        # 如果树中已有相同前缀（如本 batch 中先处理的 req 已入树），
+        # _insert_helper 会匹配到已有节点，返回 prefix_len > 0
+        # 此时 value 中对应 prefix 的部分不会被存入新节点（已存在），
+        # 只有未匹配的 suffix 部分会创建新节点并写入 value
         result = self.insert(
             InsertParams(
                 key=radix_key,
@@ -517,11 +532,18 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             )
         )
         new_prefix_len = result.prefix_len
+
+        # 步骤2: 释放冗余 KV slot
+        # kv_indices 是本 req 调度时分配的 slot，new_prefix_len 是 insert 匹配到的已有前缀长度
+        # 如果 new_prefix_len > cache_protected_len，说明树中已有这段前缀的 KV，
+        # 本 req 自己分配的这段 slot 就是冗余的，释放掉
+        # （同 batch 中 Req2 匹配到 Req1 的前缀时，slot_100~199 被释放就在这里）
         self.token_to_kv_pool_allocator.free(
             kv_indices[req.cache_protected_len : new_prefix_len]
         )
 
-        # The prefix indices could be updated, reuse it
+        # 步骤3: 重新 match_prefix 获取树中最新的 KV indices
+        # 因为 insert 可能改变了树结构（如拆分了节点），需要重新匹配
         match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
         new_indices, new_last_node = (
             match_result.device_indices,
@@ -531,15 +553,17 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
             radix_key
         ), f"{len(new_indices)=}, {len(radix_key)=}"
 
+        # 步骤4: 用树中的 KV indices 覆盖本 req 的 req_to_token 映射
+        # 这样本 req 的 prefix 部分就指向了树中共享的 slot（可能是别的 req 的 slot）
+        # 而非自己调度时分配的冗余 slot（已在步骤2释放）
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
             new_indices[req.cache_protected_len :],
         )
 
-        # The cache_protected_len is not always equal to len(req.prefix_indices)
-        # since for page_size > 1, the partial part is added to req.prefix_indices, but that part of kv indices is not added to the tree.
-        # It should be freed in the next cache_unfinished_req and final cache_finished_req to avoid memory leak.
-        # So we introduce this `cache_protected_len` field to make sure the partial part can be freed correctly.
+        # cache_protected_len 记录当前 req 在树中受保护的长度
+        # page_size > 1 时，partial page 的 kv indices 虽然存入了 req.prefix_indices
+        # 但没有入树，因此需要在下一次 cache_unfinished_req 或 cache_finished_req 中释放
         req.cache_protected_len = len(new_indices)
 
         # req的last node可能变成了另一个
@@ -751,6 +775,15 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         priority: int = 0,
         chunked: bool = False,
     ):
+        """遍历树找到匹配前缀 → 拆分未完全匹配的节点 → 为剩余部分建新节点。
+
+        【与 SWARadixCache 的区别】:
+        RadixCache 不管理物理 KV pool，节点中不存 KV slot 索引（仅存 token id 作测试用）。
+        因此不存在"释放同 batch 重复请求的冗余 KV slot"的逻辑——
+        物理 slot 的分配与释放在 alloc_for_extend / write_cache_indices 层统一处理。
+        SWARadixCache 因为有 tombstone 修复机制，需要在 _insert_helper 中
+        直接操作 token_to_kv_pool_allocator 来 free/overwrite 物理 slot。
+        """
         # Convert None priority to 0
         if priority is None:
             priority = 0

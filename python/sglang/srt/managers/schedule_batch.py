@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from srt.dllm.config import DllmConfig
+from srt.utils import flatten_arrays_to_pinned_cpu, is_pin_memory_available, ceil_align
+
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -1040,6 +1043,13 @@ class Req(ReqDllmMixin):
         tree_cache: Optional[BasePrefixCache] = None,
         cow_mamba: Optional[bool] = None,
     ):
+        """重置请求的 fill_ids，可选地重新做 prefix match。
+
+        两个调用路径：
+          - 新请求首次调度：tree_cache 不为 None → 执行 match_prefix 匹配 radix tree
+          - chunked req 下一 chunk：tree_cache 为 None → 只重置 fill_ids，跳过 match_prefix，
+            后续由 add_chunked_req 直接使用 req.prefix_indices（已由 cache_unfinished_req 存入）
+        """
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
             self.determine_dllm_phase()
@@ -1825,6 +1835,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.logprob_start_len = max(req.logprob_start_len, encoder_len)
 
     def prepare_for_extend(self):
+        """
+        为 prefill（extend）batch 做最终准备：分配 KV slot、写入 req_to_token_pool。
+
+        调用链:
+        prepare_for_extend          (schedule_batch.py:1837)
+          │  docstring 记录了完整调用链 + 三步说明
+          ├─→ alloc_for_extend      (common.py:287)
+          │     │  docstring 说明三步流程 + 每步行内注释
+          │     ├─ maybe_evict_swa()         — 回收超窗 SWA
+          │     ├─ alloc_paged_token_slots_extend  (common.py:212)
+          │     │     │  docstring 解释为什么 num_tokens 往上多估
+          │     │     ├─ evict_from_tree_cache      — 不够就驱逐
+          │     │     └─ allocator.alloc_extend     — 三段式分页分配 (paged.py 已有注释)
+          │     └─ write_cache_indices     (common.py:62)
+          │           │  docstring 说明写入两段 + 每行行内注释
+          │           ├─ [0, prefix_len): prefix_tensors（已有 KV）
+          │           └─ [prefix_len, seq_len): out_cache_loc（新分配 KV）
+          └─→ 返回 out_cache_loc, req_pool_indices
+        """
         # Prefill Batch标识
         self.forward_mode = ForwardMode.EXTEND
 
