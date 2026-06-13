@@ -173,9 +173,10 @@ def alloc_token_slots(
     evict_from_tree_cache(tree_cache, num_tokens)
 
     state = None
+    # 如果需要备份，在alloc前备份好，一般用于投机解码回退
     if backup_state:
         state = allocator.backup_state()
-
+    # 简单场景: 按 token 直接分配，无需分页
     out_cache_loc = allocator.alloc(num_tokens)
 
     if out_cache_loc is None:
@@ -291,6 +292,7 @@ def alloc_req_slots(
             if tree_cache is not None and tree_cache.supports_mamba():
                 mamba_num = max(0, mamba_state_needed - mamba_available_size)
                 tree_cache.evict(EvictParams(num_tokens=0, mamba_num=mamba_num))
+    # req_to_token_pool内应该会处理chunked req的情况
     req_pool_indices = req_to_token_pool.alloc(reqs)
 
     if req_pool_indices is None:
@@ -318,6 +320,7 @@ def alloc_for_extend(
     batch.maybe_evict_swa()
 
     # ── 2. 准备 prefix / lens 参数 ──
+    # req的prefix_indices在req.init_next_round的适合会match prefix得到
     prefix_tensors = [r.prefix_indices for r in batch.reqs]       # 每个请求已有的 prefix slot
 
     prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
@@ -334,7 +337,7 @@ def alloc_for_extend(
 
     # ── 3. 分配 KV pool 物理 slot ──
     if batch.tree_cache.page_size == 1:
-        # 简单场景: 按 token 直接分配，无需分页
+        # 简单场景: evict->alloc, 按 token 直接分配，无需分页
         out_cache_loc = alloc_token_slots(batch.tree_cache, batch.extend_num_tokens)
     else:
         # 分页场景: last_loc 是每个请求 prefix 的最后一个 slot，用于判断旧 page 是否还有空位
@@ -342,7 +345,7 @@ def alloc_for_extend(
             (t[-1:] if len(t) > 0 else torch.tensor([-1], device=batch.device))
             for t in prefix_tensors
         ]
-        # 内部分配: evict → alloc_extend（三段式: Part1旧page剩余 + Part2完整新page + Part3新page前段）
+        # 内部分配: evict → alloc_extend（三段式: Part1处理chunked req的旧page剩余 + Part2完整新page + Part3新page前段）
         out_cache_loc = alloc_paged_token_slots_extend(
             tree_cache=batch.tree_cache,
             prefix_lens=prefix_lens_device,
