@@ -450,12 +450,29 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
 
 
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
-    # MambaRadixCache may alloc mamba state before alloc KV cache
+    """释放已完成请求的 KV cache，并将 KV 写入 radix tree 供后续请求复用。
+
+    整体流程：
+    1. Mamba 模型的特殊处理：可能先分配 mamba state 再分配 KV cache，
+       此时 req_pool_idx 为 None，仅释放 mamba pool
+    2. 调用 cache_finished_req 将 KV 插入 radix tree（prefix cache）
+    3. 处理 overallocated KV（speculative decode / strip_thinking 可能多分配）
+       将多余的 KV slot 归还到 token_to_kv_pool_allocator
+    4. 释放 Mamba state（如果 cache 不管理 Mamba）
+    5. 释放 req_to_token_pool 中的 slot
+
+    Args:
+        req: 已完成/待完成的请求
+        tree_cache: radix tree 前缀缓存实例
+        is_insert: 是否将 KV 插入 radix tree。默认 True；
+                   skip_radix_cache_insert 标记的请求会跳过。
+    """
+    # MambaRadixCache 可能在分配 KV cache 之前先分配了 mamba state，
+    # 此时 req_pool_idx 为 None，仅需释放 mamba pool
     if req.req_pool_idx is None:
         assert (
             tree_cache.supports_mamba()
         ), "Only MambaRadixCache allow freeing before alloc"
-        # TODO (csy, hanming): clean up this early allocation logic
         if req.mamba_pool_idx is not None:
             tree_cache.req_to_token_pool.mamba_pool.free(
                 req.mamba_pool_idx.unsqueeze(-1)
@@ -463,38 +480,45 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.mamba_pool_idx = None
         return
 
+    # 将已完成的 KV 序列写入 radix tree，供后续请求 prefix cache 命中复用
     tree_cache.cache_finished_req(
         req,
         is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
     )
 
-    # StreamingSession.cache_finished_req handles speculative tail trim
-    # and bookkeeping flag sync internally, then sets req_pool_idx = None.
+    # cache_finished_req 内部会处理 speculative decode 的尾部裁剪和标记同步，
+    # 完成后将 req_pool_idx 置为 None。如果已为 None 则无需后续释放。
     if req.req_pool_idx is None:
         return
 
+    # 处理 overallocated KV：
+    # - speculative decode：可能预分配了超过实际使用的 KV slot
+    # - strip_thinking_cache：思考阶段 token 的 KV 故意标记为 overallocated（#22373）
+    # start_p 到 end_p 区间即为需要归还的冗余 KV slot
     start_p, end_p = req.pop_overallocated_kv_cache()
 
     global_server_args = get_global_server_args()
     page_size = global_server_args.page_size
     spec_algo = global_server_args.speculative_algorithm
 
-    # strip_thinking_cache intentionally reports output tokens as overallocated
-    # so they fall into the free path below (#22373).
+    # 非 speculative 且非 strip_thinking 场景不应有 overallocated KV
     if spec_algo is None and not global_server_args.strip_thinking_cache:
         assert (
             start_p == end_p
         ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"
 
+    # page_size > 1 时按 page 对齐，整页释放
     if page_size > 1:
         start_p = ceil_align(start_p, page_size)
 
+    # 归还冗余的 KV slot 到 allocator
     if start_p < end_p:
         indices_to_free = tree_cache.req_to_token_pool.req_to_token[req.req_pool_idx][
             start_p:end_p
         ]
         tree_cache.token_to_kv_pool_allocator.free(indices_to_free)
-    # If the prefix cache doesn't manage mamba states, we must free them here.
+
+    # 如果 prefix cache 不管理 Mamba state，需要手动释放
     if isinstance(tree_cache.req_to_token_pool, HybridReqToTokenPool) and (
         not tree_cache.supports_mamba()
     ):
@@ -502,6 +526,8 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.mamba_pool_idx is not None
         ), "mamba state is freed while the tree cache does not manage mamba states"
         tree_cache.req_to_token_pool.free_mamba_cache(req)
+
+    # 最终释放 req_to_token_pool 中的 slot
     tree_cache.req_to_token_pool.free(req)
 
 

@@ -1301,14 +1301,32 @@ class Req(ReqDllmMixin):
         return False
 
     def update_finish_state(self, new_accepted_len: int = 1):
+        """检查并设置请求的结束状态，按优先级依次判断：
+
+        1. 已结束 → 直接返回
+        2. 外部触发结束（to_finish，如 abort/stop） → 设置 finished_reason
+        3. output 长度达到 max_new_tokens 上限 → FINISH_LENGTH
+        4. grammar 约束已终止（如 JSON schema 已闭合） → FINISH_MATCHED_TOKEN
+        5. 命中 EOS / stop token → FINISH_MATCHED_TOKEN
+        6. vocab boundary 结束（如遇到预定义的边界 token 集合）
+        7. 生成文本包含 stop string → FINISH_MATCHED_STR
+
+        满足任一条件即设置 finished_reason，后续 self.finished() 返回 True。
+
+        Args:
+            new_accepted_len: 本次新接受的 token 数。普通 decode 为 1，
+                              speculative decode 可能 > 1。
+        """
         if self.finished():
             return
 
+        # 外部触发结束（如用户 abort、超时等）
         if self.to_finish:
             self.finished_reason = self.to_finish
             self.to_finish = None
             return
 
+        # 达到 max_new_tokens 长度限制
         if len(self.output_ids) >= self.sampling_params.max_new_tokens:
             self.finished_reason = FINISH_LENGTH(
                 length=self.sampling_params.max_new_tokens
@@ -1316,19 +1334,24 @@ class Req(ReqDllmMixin):
             self.finished_len = self.sampling_params.max_new_tokens
             return
 
+        # grammar 约束终止（如 JSON schema 已完成、regex 已匹配完毕）
         if self.grammar is not None:
             if self.grammar.is_terminated():
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
                 return
 
+        # 取最近新接受的 token（speculative decode 时可能 > 1）
         new_accepted_tokens = self.output_ids[-new_accepted_len:]
 
+        # 命中 EOS token 或 stop token
         if self._check_token_based_finish(new_accepted_tokens):
             return
 
+        # 命中 vocab boundary（预定义的边界 token 集合）
         if self._check_vocab_boundary_finish(new_accepted_tokens):
             return
 
+        # 生成文本中包含 stop string
         if self._check_str_based_finish():
             return
 
@@ -1449,6 +1472,16 @@ class Req(ReqDllmMixin):
         )
 
     def update_reasoning_tokens(self, token_id, think_end_id):
+        """更新推理（reasoning/思考）阶段的 token 计数。
+
+        用于 DeepSeek-R1 等支持"先思考再回答"的模型：
+        - 模型会先输出思考内容，再输出最终回答，两者之间由 think_end_id 标记分隔。
+        - 本方法在每生成一个新 token 时被调用，在输出序列中搜索 think_end_id：
+          * 找到了 → 记录思考阶段 token 总数，标记 reasoning 结束，后续不再计数
+          * 没找到 → 将当前所有新 token 计入 reasoning_tokens 累加
+
+        这样业务侧可以区分"思考耗时"和"回答耗时"，分别展示或计费。
+        """
         if self._is_reasoning_over:
             return
 
@@ -1456,10 +1489,12 @@ class Req(ReqDllmMixin):
             token_id = [token_id]
 
         try:
+            # 在新生成的 token 中找到了 think_end_id，思考阶段结束
             end_pos = token_id.index(think_end_id)
-            self.reasoning_tokens += end_pos + 1
+            self.reasoning_tokens += end_pos + 1  # +1 因为 index 是 0-based
             self._is_reasoning_over = True
         except ValueError:
+            # 未找到 think_end_id，思考仍在继续，累加全部新 token
             self.reasoning_tokens += len(token_id)
 
     def __repr__(self):
@@ -2437,32 +2472,46 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return ret
 
     def prepare_for_decode(self):
-        # Decode Batch标识
+        """为 decode 阶段的 forward pass 准备 batch。
+
+        在一次 prefill 完成后，或连续 decode 迭代之间调用。
+        整体流程：
+        1. 切换到 DECODE 模式，清理 prefill 残余状态
+        2. 处理 speculative decode（V2 用 Eagle draft，其他 spec 提前返回）
+        3. 更新 frequency/presence penalty 的 token 累积
+        4. 将上一步生成的 output_ids 作为新一轮的 input_ids
+        5. 为每个 req 分配 1 个新 token 的 KV cache slot
+        6. 更新 seq_lens、decode_batch_idx 等元数据
+        7. Mamba/HiSparse 特殊处理
+        """
+        # ---- Step 1: 切换到 DECODE 模式 ----
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
-        # Decode embeds the last output token via embed_tokens; clear the stale
-        # prefill-time tensor so it doesn't leak into ForwardBatch.
+
+        # Decode 阶段用 embed_tokens 对最后一个 output token 做嵌入，
+        # 清掉 prefill 时使用的 input_embeds，防止泄漏到 ForwardBatch
         self.input_embeds = None
 
-        # Clear context parallel metadata - CP is only for prefill, not decode
+        # Context Parallel（CP）只在 prefill 使用，decode 不需要
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
             self.attn_cp_metadata = None
 
+        # ---- Step 2: Speculative Decode 处理 ----
         if self.is_spec_v2:
-            # TODO(spec-v2): all spec v2 should go through this path
+            # Spec V2（Eagle）：draft_input 中包含 draft model 需要的信息，
+            # 在此处做 decode 前的预处理
             draft_input: EagleDraftInput = self.spec_info
             draft_input.prepare_for_decode(self)
 
         if not self.spec_algorithm.is_none():
-            # if spec decoding is used, the decode batch is prepared inside
-            # `forward_batch_speculative_generation` after running draft models.
+            # Spec V1 / 非 Eagle V2：batch 的最终准备在
+            # forward_batch_speculative_generation 中 draft model 跑完后进行
             return
 
+        # ---- Step 3: 更新 frequency/presence penalty ----
+        # overlap 调度下 input_ids 只是占位，真实 token 通过 future_map 在 forward 时解析。
+        # 因此这里直接从 Req.output_ids 取最新 token（首次 decode 用 origin_input_ids[-1]）
         if self.sampling_info.penalizer_orchestrator.is_required:
-            # Under overlap batch.input_ids is just a placeholder here -- the
-            # real token is relayed via future_map and resolved at forward
-            # entry. So take the last output token from Req directly
-            # (origin_input_ids[-1] on the first decode, before any output).
             latest_output_ids = torch.tensor(
                 [
                     (
@@ -2479,28 +2528,27 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 latest_output_ids
             )
 
-        # Update fields
-        # Coerce to int64: torch sampling helpers (sampling_from_probs_torch /
-        # top_k_top_p_min_p_sampling_from_probs_torch) return int32 token ids,
-        # but downstream kernels enforce int64 (e.g. DeepSeek-V4 hash_topk).
+        # ---- Step 4: 将上一步 output_ids 变成新一轮 input_ids ----
+        # 强制转 int64：torch sampling 函数（top_k_top_p_min_p_sampling_from_probs 等）
+        # 返回 int32，但下游 kernel（如 DeepSeek-V4 hash_topk）要求 int64
         self.input_ids = self.output_ids.to(torch.int64)
         self.output_ids = None
 
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_decode()
 
-        # Allocate memory
+        # ---- Step 5: 为每个 req 分配 1 个新 token 的 KV cache slot ----
         self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
 
-        # Update req-level memory management fields
+        # ---- Step 6: 更新每个 req 的序列长度和内存管理字段 ----
         for req in self.reqs:
-            req.decode_batch_idx += 1
-            req.kv_committed_len += 1
-            req.kv_allocated_len += 1
+            req.decode_batch_idx += 1       # decode 迭代计数
+            req.kv_committed_len += 1       # 已确认的 KV 长度（用于 radix tree 插入）
+            req.kv_allocated_len += 1       # 已分配的 KV 长度（含 speculative 预留）
 
+        # 更新 batch 级别的序列长度
         if self.enable_overlap:
-            # New-tensor avoids racing model_worker_batch refs queued for
-            # overlap forward.
+            # overlap 模式下创建新 tensor，避免与已排队的 model_worker_batch 引用竞态
             self.seq_lens = self.seq_lens + 1
             self.seq_lens_cpu = self.seq_lens_cpu + 1
             self.orig_seq_lens = self.orig_seq_lens + 1
@@ -2508,9 +2556,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.seq_lens.add_(1)
             self.seq_lens_cpu.add_(1)
             self.orig_seq_lens.add_(1)
-        # Sum is recomputed lazily by ForwardBatch.init_new.
+        # 总和由 ForwardBatch.init_new 惰性重新计算
         self.seq_lens_sum = None
 
+        # ---- Step 7: HiSparse / Mamba 特殊处理 ----
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.map_last_loc_to_buffer(
                 self.seq_lens,
@@ -2528,7 +2577,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             else:
                 set_mamba_track_indices_from_reqs(self)
 
-            # async H2D
+            # 异步 H2D：将 track_mask 从 CPU 传到 GPU
             self.mamba_track_mask = (
                 (self.seq_lens_cpu % get_global_server_args().mamba_track_interval == 0)
                 .pin_memory()

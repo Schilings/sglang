@@ -220,18 +220,32 @@ class SchedulerBatchResultProcessor:
                     # decode req in mixed batch or retracted req
                     continue
 
+                # inflight_middle_chunks 表示 chunked prefill 中还有多少中间 chunk 未处理完。
+                # <= 0 时：prefill 阶段已完全结束，可以进入 decode 阶段；
+                # > 0 时：仍有 pending chunk，走 else 分支递减计数，prefill 尚未完成。
                 if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()
 
                     # req output_ids are set here
                     req.output_ids.append(next_token_id)
 
+                    # 更新推理（reasoning）token 计数。对于需要推理的请求（如 DeepSeek-R1 的思考模式），
+                    # 在 output_ids 中搜索 think_end_id 标记，找到则记录思考阶段已结束，
+                    # 并将思考部分的 token 数量计入 req.reasoning_tokens。
                     self._maybe_update_reasoning_tokens(req, next_token_id)
 
+                    # 检查请求是否满足结束条件，按优先级依次判断：
+                    # 1. 外部触发结束（to_finish）  2. 超过 max_new_tokens 长度限制
+                    # 3. grammar 约束终止（如 JSON schema 完成）  4. 命中 stop token / stop string
+                    # 满足任一条件则设置 finished_reason，后续 req.finished() 返回 True。
                     req.update_finish_state()
                     if req.finished():
+                        # 收集 MoE 模型中每层的专家路由信息（仅当 req 开启了 return_routed_experts）
                         self._maybe_collect_routed_experts(req)
+                        # 收集索引器的 top-k 信息（用于特定模型架构）
                         self._maybe_collect_indexer_topk(req)
+                        # 将已完成请求的 KV 缓存写入 radix tree（供后续请求 prefix cache 复用），
+                        # 并释放该请求占用的内存池 slot
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
@@ -245,6 +259,8 @@ class SchedulerBatchResultProcessor:
 
                     self._maybe_collect_customized_info(i, req, logits_output)
 
+                    # 如果请求需要返回 logprobs，从 prefill 阶段的 logits 输出中
+                    # 提取每个输入 token 的对数概率，存入 req 的返回结构中
                     if batch.return_logprob:
                         logprob_pt = self._apply_prefill_logprobs(
                             req=req,
@@ -256,6 +272,8 @@ class SchedulerBatchResultProcessor:
                             logprob_pt=logprob_pt,
                         )
 
+                    # 如果请求需要返回 hidden states，将 prefill 阶段每层的隐藏状态
+                    # 从 GPU 拷贝到 CPU，追加到 req.hidden_states 中
                     if (
                         req.return_hidden_states
                         and logits_output.hidden_states is not None
@@ -313,6 +331,9 @@ class SchedulerBatchResultProcessor:
                 req.embedding = embeddings[i]
                 if req.return_pooled_hidden_states and phs is not None:
                     req.pooled_hidden_state = phs[i]
+                # inflight_middle_chunks 表示 chunked prefill 中还有多少中间 chunk 未处理完。
+                # <= 0 时：prefill 阶段已完全结束，可以进入 decode 阶段；
+                # > 0 时：仍有 pending chunk，走 else 分支递减计数，prefill 尚未完成。
                 if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()
                     # Dummy output token for embedding models
@@ -596,11 +617,21 @@ class SchedulerBatchResultProcessor:
     ):
         """处理 decode 阶段的 batch 结果。
 
+        与 prefill 不同，decode 每步只生成 1 个 token（非 speculative 模式）。
         【注意】本函数不调用 cache_unfinished_req！
         decode 每步只生成 1 个 token，KV 只是默默写入 req_to_token_pool，
-        不入树也不释放冗余 slot。直到请求完成时由 cache_finished_req 一次性入树。
+        不入树也不释放冗余 slot。直到请求完成时由 release_kv_cache -> cache_finished_req 一次性入树。
         这避免了 page_size > 1 时每次 decode 只多 1 token 却触发 insert 的浪费。
+
+        整体流程：
+        1. 同步/收尾 GPU→CPU 的异步操作（copy_done, routed_experts, indexer_topk）
+        2. 将输出的 next_token_ids 转为 Python list（含 speculative decode 处理）
+        3. 更新指标（生成 token 数、spec 正确数、CUDA graph 命中数）
+        4. 遍历 batch 中的每个 req，分别做 decode 后处理
+        5. 将生成结果通过 output_streamer 推送给客户端
+        6. 上报 decode 统计
         """
+        # ---- Step 1: 同步异步操作，收尾 GPU 输出 ----
         if result.copy_done is not None:
             result.copy_done.synchronize()
         if result.routed_experts_output is not None:
@@ -610,12 +641,15 @@ class SchedulerBatchResultProcessor:
             result.indexer_topk_output.finalize()
             result.indexer_topk_output = None
 
+        # ---- Step 2: 提取核心输出 ----
         logits_output, next_token_ids, can_run_cuda_graph = (
             result.logits_output,
             result.next_token_ids,
             result.can_run_cuda_graph,
         )
 
+        # 将 next_token_ids 标准化为 Python list；
+        # speculative V2 时还会合并重叠的 draft tokens
         next_token_ids, next_token_logprobs = self._normalize_decode_outputs(
             batch=batch,
             result=result,
@@ -623,6 +657,7 @@ class SchedulerBatchResultProcessor:
             next_token_ids=next_token_ids,
         )
 
+        # ---- Step 3: 更新指标 ----
         self.metrics_reporter.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
             self.metrics_reporter.update_spec_metrics(
@@ -633,52 +668,66 @@ class SchedulerBatchResultProcessor:
                 value=can_run_cuda_graph
             )
 
+        # ---- Step 4: 逐请求后处理 ----
+        # free_group_begin/end 将多个 free 操作打包成一次 GPU kernel launch，
+        # 减少 kernel launch 开销
         self.token_to_kv_pool_allocator.free_group_begin()
 
-        # Spec V1 handles output_ids, update_finish_state, grammar, and reasoning tokens
-        # in the verify phase. Non-spec and V2 handle them here in post-processing.
+        # Spec V1 在 verify 阶段已经处理了 output_ids、finish_state、grammar、reasoning；
+        # 非 spec 和 V2 则在下面统一处理。
         is_spec_v1 = not batch.spec_algorithm.is_none() and not batch.is_spec_v2
 
         for i, req in enumerate(batch.reqs):
             req: Req
 
+            # overlap 调度下，已完成或被撤回的请求跳过（token 会在 release_kv_cache 中释放）
             if (self.enable_overlap or self.enable_overlap_mlx) and (
                 req.finished() or req.is_retracted
             ):
-                # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
-                # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 continue
 
+            # ---- Spec V1 分支：verify 阶段已完成主要处理，这里只补收尾 ----
             if is_spec_v1:
                 self._mamba_prefix_cache_update(req, batch, result, i)
                 req.time_stats.set_last_decode_finish_time()
+                # 请求完成时的资源回收（multi-modal feature 释放、expert/indexer 信息收集）
                 self._handle_finished_req(req, i, logits_output)
+                # 收集 hidden states（如开启）
                 if req.return_hidden_states and logits_output.hidden_states is not None:
                     req.hidden_states.append(
                         logits_output.hidden_states[i].cpu().clone().tolist()
                     )
+                # 同步 grammar 结束状态
                 if req.grammar is not None:
                     req.grammar.finished = req.finished()
                 continue
 
-            # Non-spec and V2: full post-processing
+            # ---- 非 Spec / Spec V2 分支：完整的 decode 后处理 ----
+            # 1. 将新生成的 token(s) 追加到 output_ids
             next_token_id = next_token_ids[i]
             new_accepted_len = 1
             if batch.spec_algorithm.is_none():
+                # 普通 decode：每次只生成 1 个 token
                 req.output_ids.append(next_token_id)
             else:
+                # Spec V2：一次可能接受多个 draft token
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
 
+            # 2. 更新推理（reasoning）token 计数（如 DeepSeek-R1 思考模式）
             self._maybe_update_reasoning_tokens(req, next_token_id)
 
-            # Update Mamba last track seqlen
+            # 3. 更新 Mamba 模型的 track 状态
             self._mamba_prefix_cache_update(req, batch, result, i)
             req.time_stats.set_last_decode_finish_time()
+
+            # 4. 检查结束条件（max_new_tokens / stop token / stop string / grammar）
             req.update_finish_state(new_accepted_len)
 
+            # 5. 处理已完成请求的资源回收
             self._handle_finished_req(req, i, logits_output)
 
+            # 6. 可选数据收集：logprobs、hidden states、grammar
             if req.return_logprob:
                 self._apply_decode_logprobs(
                     req=req,
@@ -699,9 +748,11 @@ class SchedulerBatchResultProcessor:
                     req=req, next_token_id=next_token_id, batch=batch
                 )
 
+        # ---- Step 5: 流式输出结果给客户端 ----
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
         self.token_to_kv_pool_allocator.free_group_end()
 
+        # ---- Step 6: 上报 decode 统计 ----
         self.metrics_reporter.forward_ct_decode = (
             self.metrics_reporter.forward_ct_decode + 1
         ) % (1 << 30)
@@ -819,6 +870,17 @@ class SchedulerBatchResultProcessor:
         i: int,
         logits_output: LogitsProcessorOutput,
     ):
+        """请求完成时的统一后处理入口。
+
+        根据是否启用 disaggregation decode offload 走两条路径：
+        1. offload 模式：将 KV 异步搬迁到 CPU，搬迁完成后回调 release_kv_cache
+        2. 普通模式：直接释放 KV cache，清理 multi-modal 特征、收集 MoE/indexer 信息
+
+        不论请求是否 finished 都调用：
+        - 未 finished 但开启了 offload：也会触发 offload（为后续 decode 腾空间）
+        - 已 finished：释放多模态输入特征（节省内存），收集 expert/indexer 信息
+        """
+        # 未完成但开启了 offload：将 KV 从 GPU 异步搬运到 CPU
         if (
             self.server_args.disaggregation_decode_enable_offload_kvcache
             and not req.finished()
@@ -826,24 +888,28 @@ class SchedulerBatchResultProcessor:
             self.decode_offload_manager.offload_kv_cache(req)
 
         if req.finished():
-            # delete feature to save memory
+            # 释放多模态输入特征以节省内存（session 场景保留，复用时不需重新加载）
             if req.multimodal_inputs is not None and req.session is None:
                 req.multimodal_inputs.release_features()
+            # 收集 MoE 路由信息和 indexer top-k
             self._maybe_collect_routed_experts(req)
             self._maybe_collect_indexer_topk(req)
 
             if self.server_args.disaggregation_decode_enable_offload_kvcache:
-                # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
+                # offload 模式：异步将 KV 搬到 CPU，传输完成后回调 finalize_release_on_finish
                 if not self.decode_offload_manager.offload_kv_cache(req):
                     self.decode_offload_manager.finalize_release_on_finish(req)
             else:
+                # 普通模式：同步释放 KV cache
                 if self.server_args.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
+                # 在释放前给模型 worker 一次预处理机会（如 speculative decode 尾部裁剪）
                 prepare_release = getattr(
                     self.model_worker, "prepare_for_kv_cache_release", None
                 )
                 if callable(prepare_release):
                     prepare_release(req)
+                # 将 KV 写入 radix tree 供后续复用，然后释放内存池 slot
                 release_kv_cache(req, self.tree_cache)
 
             req.time_stats.set_completion_time()
