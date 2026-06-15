@@ -977,7 +977,7 @@ class PrefillAdder:
                 # Non-chunked prefill
                 # budget桶未满的时候，该请求可以完全prefill计算
                 self.can_run_list.append(req)
-
+                #
                 self._req_inc_lock_ref(req)
                 # 更新budget桶信息
                 self._update_prefill_budget(

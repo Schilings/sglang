@@ -2747,6 +2747,7 @@ class Scheduler(
 
             # 核心：匹配前缀，获取前缀的kv indices
             req.init_next_round_input(self.tree_cache)
+            # radix cache的 incr lock ref发生在 adder.add_one_req，因为你prefix match了，不代表你被调度了
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),

@@ -631,6 +631,12 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         return self._total_size_helper()
 
     def evict(self, params: EvictParams) -> EvictResult:
+        """
+        ⚠️ScheduleBatch::update_running_batch
+            -> ScheduleBatch::check_decode_mem
+                -> evict_from_tree_cache
+                    -> tree_cache.evict
+        """
         if self.disable:
             return EvictResult()
 
@@ -672,6 +678,8 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         return EvictResult(num_tokens_evicted=num_evicted)
 
     def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
+        # req.init_next_round_input(self.tree_cache)：匹配前缀，获取前缀的kv indices
+        # radix cache的 incr lock ref发生在 adder.add_one_req，因为prefix match了，不代表你被调度了
         if self.disable:
             return IncLockRefResult(delta=0)
 
@@ -691,6 +699,10 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
     def dec_lock_ref(
         self, node: TreeNode, params: Optional[DecLockRefParams] = None
     ) -> DecLockRefResult:
+        """
+        在cache_finished_req会调用 -->  dec_lock_ref(req.last_node)
+        不马上回收，减少引用计数，没有引用了
+        """
         if self.disable:
             return DecLockRefResult(delta=0)
         # 沿着匹配链把所有node的引用都-1
