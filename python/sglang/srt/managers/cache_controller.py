@@ -50,33 +50,92 @@ device_module = get_device_module()
 
 
 class LayerLoadingEvent:
+    """单次 KV cache 加载操作的逐层 CUDA event 追踪器。
+
+    每一层的 Host→Device 拷贝完成后，在 load_stream 上 record 一个 CUDA event，
+    使得 compute stream 可以通过 wait_event() 按层粒度等待，实现传输与计算的重叠。
+    """
     def __init__(self, num_layers: int):
         self._num_layers = num_layers
+        # 第 i 层拷贝完成后，load_events[i] 会被 record
         self.load_events = [device_module.Event() for _ in range(num_layers)]
-        self.start_event = device_module.Event()  # start event on controller stream
+        # start event on controller stream，用于 load_stream 等待调度器就绪
+        self.start_event = device_module.Event()
 
     def complete(self, layer_index: int):
+        """在 load_stream 上 record 第 layer_index 层拷贝完成的 event。"""
         assert 0 <= layer_index < self._num_layers
         self.load_events[layer_index].record()
 
     def wait(self, layer_index: int):
+        """在当前 stream（compute stream）上等待第 layer_index 层的拷贝完成。"""
         device_module.current_stream().wait_event(self.load_events[layer_index])
 
     @property
     def finish_event(self):
+        """最后一层的 event，代表整个加载操作完成。"""
         return self.load_events[-1]
 
 
 class LayerDoneCounter:
+    """逐层加载完成追踪器，实现 KV cache Host→GPU 异步传输与注意力计算的逐层同步。
+
+    核心目的：让计算不必等全部层拷贝完毕，而是每层 KV 就绪即可开始计算，从而 overlap 传输延迟。
+
+    三层结构：
+      - LayerLoadingEvent: 单次加载操作的逐层 CUDA event，第 i 层拷贝完成后 complete(i) 记录 event
+      - LayerDoneCounter: 管理 3 个 LayerLoadingEvent 的循环缓冲，支持 producer-consumer 模式
+
+    工作流程（以 start_loading 为例）：
+      1. update_producer()  → 获取下一个可用的 event slot（producer_index 轮转）
+      2. 在 load_stream 上逐层拷贝 KV：
+           for i in range(layer_num):
+               host→device 拷贝第 i 层
+               producer_event.complete(i)   ← 在 load_stream 上记录第 i 层完成的 CUDA event
+      3. 返回 producer_id 给调度器
+      4. 调度器 set_consumer(producer_id) → 绑定当前等待的 event slot
+      5. 计算 prefill 时，wait_until(layer_threshold) →
+         在 compute stream 上等待第 layer_threshold 层的 CUDA event
+         → 该层 KV 就绪后计算立刻开始，不必等全部层拷贝完成
+
+    为什么是 3 个 counter（三缓冲）：
+      - slot A: 当前批次正在被 consumer 等待
+      - slot B: 下一批次的 load 正在执行
+      - slot C: 确保上一批次完成且 event 已 query 就绪可复用
+      update_producer 中的断言 finish_event.query() 保证了复用前该 slot 的所有层拷贝确实已完成。
+
+    上层使用接口（LayerLoadingEvent 是内部实现，上层无需直接操作）：
+      - HiCacheController.start_loading()：
+          调用 update_producer() 获取 slot → 在 load_stream 上逐层拷贝并 complete(i)
+          → 返回 producer_id
+      - TpWorker.register_hicache_layer_transfer_counter(counter)：
+          注册 counter 引用到 model runner，使 model runner 可调用 set_consumer / wait_until
+      - ModelRunner 前向计算（各 memory_pool 的 get_key/value_buffer）：
+          每层计算前调用 wait_until(layer_id) → compute stream 等该层 KV 拷贝完成
+      - HiRadixCache.is_load_back_event_done(consumer_index)：
+          通过 events[consumer_index].finish_event.query() 检查整个加载是否完成
+      - HiRadixCache.ready_to_load_host_cache()：
+          封装 start_loading()，返回 consumer_index 给调度器
+      - Scheduler：
+          调度时 new_batch.hicache_consumer_index = ready_to_load_host_cache()
+          → batch 运行时通过 set_consumer 绑定 → 各层前向时 wait_until
+    """
     def __init__(self, num_layers: int):
         self.num_layers = num_layers
-        # extra producer and consumer counters for overlap mode
+        # 三缓冲：slot A 被 consumer 等待 / slot B 正在 load / slot C 已完成可复用
         self.num_counters = 3
         self.events = [LayerLoadingEvent(num_layers) for _ in range(self.num_counters)]
+        # producer: 当前 load 操作使用的 event slot 索引，-1 表示尚未开始
         self.producer_index = -1
+        # consumer: 当前 compute 等待的 event slot 索引，-1 表示无需等待
         self.consumer_index = -1
 
     def update_producer(self):
+        """轮转到下一个 event slot 供 load 操作使用。
+
+        断言保证该 slot 的上一次加载已全部完成（finish_event.query()），
+        否则复用会导致 consumer 等到错误的事件。
+        """
         self.producer_index = (self.producer_index + 1) % self.num_counters
         assert self.events[
             self.producer_index
@@ -86,19 +145,42 @@ class LayerDoneCounter:
         return self.producer_index
 
     def set_consumer(self, index: int):
+        """绑定 consumer 等待的 event slot，通常为 start_loading() 返回的 producer_id。"""
         self.consumer_index = index
 
     def wait_until(self, threshold: int):
+        """在 compute stream 上等待 consumer slot 的第 threshold 层拷贝完成。
+
+        compute stream 会阻塞直到 load stream 上第 threshold 层的 KV 已就绪，
+        从而实现逐层 overlap：该层 KV 到位后计算立刻开始，不必等全部层拷贝完成。
+        """
         if self.consumer_index < 0:
             return
         self.events[self.consumer_index].wait(threshold)
 
     def reset(self):
+        """重置 producer/consumer 索引，用于 cache reset 时清理状态。"""
         self.producer_index = -1
         self.consumer_index = -1
 
 
 class CacheOperation:
+    """GPU↔Host 之间一次 KV cache 搬运操作的描述符。
+
+    无论是 write（GPU→Host）还是 load（Host→GPU），都用 CacheOperation 描述，
+    主要记录：搬运哪些 slot（host_indices / device_indices）、属于哪个树节点、优先级。
+
+    生命周期：
+      1. HiCacheController.write()/load() 将操作 append 到 write_queue / load_queue
+      2. flush_write()/start_loading() 调用 merge_ops() 将队列中多个操作合并为一个
+      3. 合并后在 load_stream/write_stream 上执行 DMA 拷贝
+      4. 拷贝完成后生成 HiCacheAck 入 ack_write_queue / ack_load_queue
+
+    merge_ops 设计：
+      同一批次可能有多个小操作（每个对应一个树节点），merge_ops 将它们
+      cat 为一次大 DMA，减少 kernel launch 开销。合并后 node_ids 保留
+      所有原始节点 ID，用于 ack 时逐节点回调。
+    """
 
     counter = 0
 
@@ -109,9 +191,13 @@ class CacheOperation:
         node_id: int,
         priority: Optional[int] = None,
     ):
+        # Host 端 KV pool 的 slot 索引
         self.host_indices = host_indices
+        # Device 端 KV pool 的 slot 索引
         self.device_indices = device_indices
+        # 操作涉及的树节点 ID 列表（merge 后可能包含多个）
         self.node_ids = [node_id]
+        # 传输数据缓冲区（可选，用于 storage backend）
         self.data = None
 
         self.id = CacheOperation.counter
@@ -121,6 +207,7 @@ class CacheOperation:
 
     @staticmethod
     def merge_ops(ops: List[CacheOperation]) -> CacheOperation:
+        """将多个 CacheOperation 合并为一个，cat host/device indices 以减少 DMA 次数。"""
         assert len(ops) > 0
         if len(ops) == 1:
             return ops[0]
@@ -128,6 +215,7 @@ class CacheOperation:
         host_indices = torch.cat([op.host_indices for op in ops])
         device_indices = torch.cat([op.device_indices for op in ops])
         node_ids = []
+        # 取最高优先级（数值最小），确保高优先级操作不会被低优先级拖慢
         priority = min(op.priority for op in ops)
         for op in ops:
             node_ids.extend(op.node_ids)
@@ -136,22 +224,69 @@ class CacheOperation:
         return merged_op
 
     def __lt__(self, other: CacheOperation):
+        """按 priority 排序，数值越小优先级越高。"""
         return self.priority < other.priority
 
 
 class HiCacheAck(NamedTuple):
+    """DMA 搬运完成的确认凭据，由 flush_write / start_loading 生成，由 HiRadixCache 消费。
+
+    生产端（HiCacheController）：
+      - flush_write() 完成后生成 ack 入 ack_write_queue
+      - start_loading() 完成后生成 ack 入 ack_load_queue
+
+    消费端（HiRadixCache）：
+      - writing_check() 遍历 ack_write_queue，对每个 ack：
+          1. finish_event.query() / synchronize() 等待 DMA 完成
+          2. 遍历 node_ids，从 ongoing_write_through 中 pop 出对应树节点
+          3. 确认 KV 已到 host → 触发 write_backup_storage（如有 storage 层）→ dec_lock_ref
+      - loading_check() 遍历 ack_load_queue，对每个 ack：
+          1. finish_event.query() 检查 DMA 是否完成
+          2. 遍历 node_ids，从 ongoing_load_back 中 pop 出对应树节点
+          3. dec_lock_ref 释放保护
+
+    字段说明：
+      - start_event:  DMA 拷贝的起始 CUDA event（可用于 stream 同步）
+      - finish_event: DMA 拷贝的结束 CUDA event（query/synchronize 判断拷贝是否完成）
+      - node_ids:     本次 DMA 涉及的树节点 ID 列表（merge 后可能包含多个节点）
+    """
     start_event: device_module.Event
     finish_event: device_module.Event
     node_ids: List[int]
 
 
 class TransferBuffer:
-    """
-    Overlapping buffer preparation and transfer operations to improve throughput.
+    """基于有界 Queue 的线程安全缓冲区，设计用于 GPU↔Host 传输操作的生产者-消费者解耦。
+
+    核心设计：
+      - 有界队列（maxsize=buffer_count）：当队列满时 put() 阻塞，自动反压生产者
+      - stop_event：外部线程安全停止信号。put() 在队列满时轮询检查 stop_event，
+        收到停止信号后立即退出，避免 shutdown 时死锁
+      - 1 秒轮询超时：put/get 都用 timeout=1 轮询，而非无限阻塞，以便及时响应 stop_event
+
+    put() 的阻塞语义：
+      正常模式（block=True）：队列满时反复重试（每次等 1s），直到成功入队或 stop_event 被设置
+      非阻塞模式（block=False）：队列满时立即返回（丢弃），不重试
+
+    get() 的语义：
+      队列空时返回 None，不阻塞等待 stop_event（因为消费者通常在循环中调用，空队列是正常情况）
+
+    当前使用状况：
+      HiCacheController 中创建了 write_buffer / load_buffer 两个实例，但当前 write/load
+      操作实际走的是 write_queue / load_queue（List[CacheOperation]）+ merge_ops 的同步路径，
+      TransferBuffer 的 put/get 尚未被调用，仅 clear() 在 reset() 中使用。
+      该类可能是为未来的异步双缓冲流水线预留的。
+
+    预期的异步流水线用法（当前未启用）：
+      1. 生产者线程：HiRadixCache.evict() → controller.write_buffer.put(CacheOperation(...))
+      2. 消费者线程：后台 DMA 线程循环 → op = controller.write_buffer.get() → 执行拷贝
+      3. 好处：拷贝准备（alloc/merge）和 DMA 传输可以在不同线程上重叠执行
+      4. stop_event：controller.reset() 或 shutdown 时设置，让 put/get 安全退出
     """
 
     def __init__(self, stop_event, buffer_count: int = 3) -> None:
         self.stop_event = stop_event
+        # 有界队列，buffer_count 控制流水线深度（默认 3 = 三缓冲）
         self.buffers = Queue(maxsize=buffer_count)
 
     def full(self) -> bool:
@@ -161,6 +296,7 @@ class TransferBuffer:
         return self.buffers.empty()
 
     def put(self, item, block=True, timeout=1) -> None:
+        """将操作入队。队列满时轮询重试，直到成功或 stop_event 被设置。"""
         while not self.stop_event.is_set():
             try:
                 self.buffers.put(item, block=block, timeout=timeout)
@@ -173,6 +309,7 @@ class TransferBuffer:
                 logger.error(e)
 
     def get(self, block=True, timeout=1) -> Optional[CacheOperation]:
+        """从队列取操作。队列空时返回 None，不等待 stop_event。"""
         try:
             return self.buffers.get(block=block, timeout=timeout)
         except Empty:
@@ -185,6 +322,35 @@ class TransferBuffer:
 
 
 class StorageOperation:
+    """Host↔Storage 之间一次 KV cache 搬运操作的描述符（基类）。
+
+    StorageOperation 描述的是第三级存储（磁盘/远端）与 Host 内存之间的 KV 搬运，
+    对应 CacheOperation 描述的是 GPU↔Host 之间的搬运。
+
+    两种子类使用场景：
+      - StorageOperation（本类）：write_storage() 中描述 Host→Storage 的备份操作
+      - PrefetchOperation（子类）：prefetch() 中描述 Storage→Host 的预取操作
+
+    生命周期（以 write_storage 为例）：
+      1. write_storage() 创建 StorageOperation → 放入 backup_queue
+      2. backup_thread 从 backup_queue 取出 → _page_backup() 逐页写入 storage
+      3. 写入完成后 ack_backup_queue 通知上层
+
+    生命周期（以 prefetch 为例）：
+      1. prefetch() 创建 PrefetchOperation → 放入 prefetch_queue
+      2. prefetch_thread 从 prefetch_queue 取出 → 查询 storage hit → 放入 prefetch_buffer
+      3. prefetch_io_aux_thread 从 prefetch_buffer 取出 → _page_transfer() 逐页读回 host
+      4. 调度器通过 is_terminated() / completed_tokens 判断预取进度
+
+    字段说明：
+      - host_indices:  Host 端 KV pool 的 slot 索引（读/写的目标位置）
+      - token_ids:     本次操作涉及的 token ID 列表
+      - last_hash:     前缀路径上最后一个节点的 hash（用于 storage 查询）
+      - hash_value:    本次操作涉及的各页 hash 值列表（逐页检索/写入的 key）
+      - completed_tokens: 已完成的 token 数（逐页递增，用于进度追踪）
+      - prefix_keys:   前缀 hash 列表（用于 storage 的层级索引，逐批次累积）
+    """
+
     counter = 0
 
     def __init__(
@@ -210,6 +376,26 @@ class StorageOperation:
 
 
 class PrefetchOperation(StorageOperation):
+    """Storage→Host 预取操作的描述符，增加了请求级生命周期管理。
+
+    与 StorageOperation（用于备份）的区别：
+      - 绑定了 request_id：标识哪个请求触发了此次预取
+      - 线程安全的终止机制：调度器可在任意时刻 mark_terminate()，IO 线程通过
+        increment() 返回值或 is_terminated() 感知后立即停止传输
+      - 进度追踪：completed_tokens 被 IO 线程 increment()，调度器可查询判断预取进度
+
+    典型交互流程：
+      1. 调度器：operation = controller.prefetch(request_id, ...)
+         → 放入 prefetch_queue，返回 operation 引用
+      2. prefetch_thread：查询 storage 命中情况 → 决定是否值得预取
+         → 值得则放入 prefetch_buffer，否则 revoke
+      3. prefetch_io_aux_thread：从 prefetch_buffer 取出 → _page_transfer() 逐页读回
+         → 每页成功后 operation.increment(page_size)，失败则 mark_terminate()
+      4. 调度器：can_terminate_prefetch(operation) 检查是否可以结束预取
+         → 超时或完成则 terminate_prefetch(operation) → mark_terminate()
+      5. IO 线程下次 increment() 返回 False → 停止传输
+    """
+
     def __init__(
         self,
         request_id: str,
@@ -220,6 +406,7 @@ class PrefetchOperation(StorageOperation):
     ):
         self.request_id = request_id
 
+        # 线程安全的终止标志：调度器设置，IO 线程读取
         self._lock = threading.Lock()
         self._terminated_flag = False
         self.start_time = time.monotonic()
@@ -227,6 +414,7 @@ class PrefetchOperation(StorageOperation):
         super().__init__(host_indices, token_ids, last_hash, prefix_keys=prefix_keys)
 
     def increment(self, num_tokens: int):
+        """IO 线程调用：增加 completed_tokens。返回 False 表示已被终止，调用方应停止传输。"""
         with self._lock:
             if self._terminated_flag:
                 return False
@@ -234,6 +422,7 @@ class PrefetchOperation(StorageOperation):
             return True
 
     def mark_terminate(self):
+        """调度器调用：标记操作为终止。IO 线程下次 increment() 或 is_terminated() 检查时停止。"""
         with self._lock:
             self._terminated_flag = True
 
