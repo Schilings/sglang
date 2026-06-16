@@ -184,6 +184,53 @@ class CacheOperation:
       同一批次可能有多个小操作（每个对应一个树节点），merge_ops 将它们
       cat 为一次大 DMA，减少 kernel launch 开销。合并后 node_ids 保留
       所有原始节点 ID，用于 ack 时逐节点回调。
+
+    ──────── node_id 完整链路: DMA 完成后的回调凭证 ────────
+
+    node_id 不是给 Host/GPU 端用的, 而是 DMA 异步完成后,
+    让 HiRadixCache 能找到对应 radix tree 节点做后续处理的"收据编号"。
+
+    ┌─────────────────────────────────────────────────────────────────┐
+    │  Write 方向 (GPU → Host)                                        │
+    │                                                                 │
+    │  ① HiRadixCache.evict()                                         │
+    │     → controller.write(node_id=node.id)                         │
+    │     → CacheOperation.node_ids = [node.id]                       │
+    │                                                                 │
+    │  ② start_writing() + merge_ops()                                │
+    │     → 多个 write 合并: node_ids = [id1, id2, ...]               │
+    │     → 一次性 DMA 减少 kernel launch                              │
+    │                                                                 │
+    │  ③ DMA 完成 → HiCacheAck(node_ids=[id1, id2, ...])             │
+    │     → 入 ack_write_queue                                        │
+    │                                                                 │
+    │  ④ HiRadixCache.writing_check() 消费 ack                        │
+    │     for ack_id in ack.node_ids:                                 │
+    │       _finish_write_through_ack(ack_id)                         │
+    │         ├─ ongoing_write_through.pop(ack_id) → 找到 TreeNode    │
+    │         ├─ write_through_pending_id = None   → 清除 DMA 等待    │
+    │         ├─ _record_store_event(CPU)          → 记录已到 Host    │
+    │         ├─ write_backup_storage()            → 触发 L3 写入     │
+    │         └─ dec_lock_ref()                    → 释放 evict 锁    │
+    │                                                                 │
+    ├─────────────────────────────────────────────────────────────────┤
+    │  Load 方向 (Host → GPU)                                          │
+    │                                                                 │
+    │  ① HiRadixCache._try_load_from_host()                           │
+    │     → controller.load(node_id=last_hit_node.id)                 │
+    │     → CacheOperation.node_ids = [last_hit_node.id]              │
+    │                                                                 │
+    │  ② start_loading() + merge_ops()                                │
+    │     → 合并后 DMA                                                │
+    │                                                                 │
+    │  ③ DMA 完成 → HiCacheAck(node_ids=[...])                       │
+    │                                                                 │
+    │  ④ HiRadixCache.loading_check() 消费 ack                        │
+    │     for ack_id in ack.node_ids:                                 │
+    │       node = ongoing_load_back.pop(ack_id)                      │
+    │       dec_lock_ref(node)  → 释放 evict 保护锁                   │
+    │                                                                 │
+    └─────────────────────────────────────────────────────────────────┘
     """
 
     counter = 0
@@ -435,7 +482,96 @@ class PrefetchOperation(StorageOperation):
 
 
 class HiCacheController:
+    """分层 KV cache 控制器，管理 GPU↔Host↔Storage 三级存储之间的数据搬运。
 
+        ╔════════════════════════════════════════════════════════════════════════════════════════════════╗
+        ║  整体架构：三级存储层次                                                                            ║
+        ║                                                                                                ║
+        ║   GPU (device)  ←──write/load──→  Host (CPU DRAM)  ←──backup/prefetch──→  Storage (磁盘/远端)    ║
+        ║   mem_pool_device                mem_pool_host                      storage_backend            ║
+        ╚════════════════════════════════════════════════════════════════════════════════════════════════╝
+
+        ─── 宏观：上层如何使用 HiCacheController ───
+
+        HiCacheController 的唯一上层是 HiRadixCache（及 HybridCacheController 子类），
+        调度器/worker 不直接操作 HiCacheController，而是通过 HiRadixCache 间接使用。
+
+        上层调用按场景分为 5 组：
+
+        【场景 1：GPU→Host 写入（evict 时备份 KV）】
+          HiRadixCache.write_backup(node)
+            → controller.write(device_indices=node.value, node_id=node.id)
+              → 分配 host slot → 入 write_queue → start_writing() 合并+DMA
+            → controller.ack_write_queue            ← 写入完成后检查 ack
+
+        【场景 2：Host→GPU 加载（prefill 时恢复 KV）】
+          HiRadixCache.load_back(host_indices, ...)
+            → controller.load(host_indices=...)      ← 分配 device slot + 入 load_queue
+            → HiRadixCache.ready_to_load_host_cache()
+              → controller.start_loading()           ← 合并+逐层DMA → 返回 consumer_index
+            → Scheduler: batch.hicache_consumer_index = consumer_index
+            → TpWorker: set_hicache_consumer(consumer_index)
+              → layer_done_counter.set_consumer(...)
+            → ModelRunner: 每层前向时 wait_until(layer_id)
+
+        【场景 3：Host→Storage 备份（三级持久化）】
+          HiRadixCache.write_backup_storage(node, ...)
+            → controller.write_storage(host_indices, token_ids, hash_value, ...)
+              → 创建 StorageOperation → 入 backup_queue
+            → backup_thread → _page_backup() → storage_backend.batch_set
+            → controller.ack_backup_queue            ← 备份完成后检查 ack
+
+        【场景 4：Storage→Host 预取（请求到达时提前拉取）】
+          HiRadixCache.prefetch_from_storage(request_id, ...)
+            → controller.prefetch(request_id, ...)
+              → 创建 PrefetchOperation → 入 prefetch_queue
+            → prefetch_thread: _storage_hit_query() → 判断是否值得预取
+              → 值得：放入 prefetch_buffer
+              → 不值得：revoke + 释放 host 内存
+            → prefetch_io_aux_thread: _page_transfer() → storage_backend.batch_get
+            → HiRadixCache.can_terminate_prefetch() / terminate_prefetch()
+              → controller.terminate_prefetch(operation) → mark_terminate()
+
+        【场景 5：设备/主机内存释放】
+          controller.evict_device(device_indices)   ← 释放 GPU KV slot
+          controller.evict_host(host_indices)        ← 释放 Host KV slot
+
+        ─── 微观：内部实现拆解 ───
+
+        【L2 层（GPU↔Host）核心数据流】
+          write_queue / load_queue  ─→  merge_ops()  ─→  write_stream/load_stream DMA  ─→  ack_write_queue / ack_load_queue
+          (List[CacheOperation])       (合并为一次大DMA)     (异步CUDA stream)              (List[HiCacheAck])
+
+          - write(): 分配 host slot → CacheOperation 入 write_queue → start_writing() 立即执行
+          - load():  分配 device slot → CacheOperation 入 load_queue（不立即执行，等 start_loading）
+          - start_loading(): merge load_queue → 在 load_stream 逐层拷贝 + LayerDoneCounter 记录 event
+          - writing_check() / loading_check(): 遍历 ack 队列，query/synchronize event → 回调 HiRadixCache
+
+        【L3 层（Host↔Storage）核心数据流】
+          prefetch_queue  ─→  prefetch_thread  ─→  prefetch_buffer  ─→  prefetch_io_aux_thread  ─→  storage read
+          backup_queue    ─→  backup_thread     ─→  storage write
+
+          三个后台线程（daemon）：
+            - prefetch_thread:      查询 storage 命中 → 决定是否预取 → 放入 prefetch_buffer
+            - prefetch_io_aux_thread: 从 prefetch_buffer 取出 → 逐页 DMA 读回 host
+            - backup_thread:         从 backup_queue 取出 → 逐页写入 storage
+
+        【写策略】
+          write_through:          每次命中立刻写 Host（hit_count >= 1 触发 write_backup）
+          write_through_selective: 命中 2 次才写（hit_count >= write_through_threshold）
+          write_back:             仅在 evict 时才写（延迟写入，减少不必要传输）
+
+        【IO 后端】
+          kernel:  使用自定义 CUDA kernel 做 DMA（indices 移到 GPU）
+          direct:  使用 PyTorch 原生索引（indices 移到 CPU）
+          kernel_ascend: NPU 专用
+
+        【线程安全】
+          - stop_event: 控制 write_buffer/load_buffer 的停止（当前未启用异步路径）
+          - storage_stop_event: 独立控制 storage 线程的启停，支持运行时 attach/detach
+          - L2 层（write/load/ack 队列）由调度器主线程单线程访问，无需锁
+          - L3 层（prefetch/backup 队列）由 Queue 自带锁保证线程安全
+        """
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -454,46 +590,142 @@ class HiCacheController:
         storage_backend_extra_config: Optional[dict] = None,
         enable_storage_metrics: bool = False,
     ):
+        """
+        HiCacheController 初始化 —— 构建三层 KV cache 搬运器的全部运行时状态。
+
+        ╔══════════════════════════════════════════════════════════════════════╗
+        ║  成员变量全景图 (按功能分组)                                              ║
+        ╠══════════════════════════════════════════════════════════════════════╣
+        ║                                                                      ║
+        ║  ┌─ ① 分布式通信组 (TP/CP/PP) ────────────────────────────────────┐    ║
+        ║  │  tp_group          TP 通信组 (必须)                            │    ║
+        ║  │  attn_cp_group     Context Parallel 通信组                    │    ║
+        ║  │  attn_tp_group     Attention TP 通信组                        │    ║
+        ║  │  pp_group          Pipeline Parallel 通信组                   │    ║
+        ║  │  prefetch_sync_groups  基于 tp/cp 组派生的 gloo all_reduce 组   │    ║
+        ║  └──────────────────────────────────────────────────────────────┘    ║
+        ║                                                                      ║
+        ║  ┌─ ② 内存池 (L1 GPU / L2 Host / L3 Storage) ────────────────────┐    ║
+        ║  │  mem_pool_device_allocator  GPU KV pool 分配器                 │    ║
+        ║  │  mem_pool_device            GPU KV pool (实际 tensor)         │    ║
+        ║  │  mem_pool_host              Host KV pool (CPU pinned)        │    ║
+        ║  │  storage_backend            L3 存储后端 (disk/remote)          │    ║
+        ║  └──────────────────────────────────────────────────────────────┘    ║
+        ║                                                                      ║
+        ║  ┌─ ③ 策略与配置 ─────────────────────────────────────────────────┐    ║
+        ║  │  write_policy       写回策略 (write_through/selective/back)    │    ║
+        ║  │  page_size          每个 page 的 token 数 (通常 16)             │    ║
+        ║  │  io_backend         L1↔L2 IO 后端 (kernel/direct)             │    ║
+        ║  └──────────────────────────────────────────────────────────────┘    ║
+        ║                                                                      ║
+        ║  ┌─ ④ GPU DMA 引擎 ─────────────────────────────────────────────┐    ║
+        ║  │  write_stream       GPU→Host DMA 流                          │    ║
+        ║  │  load_stream        Host→GPU DMA 流                          │    ║
+        ║  │  write_queue/load_queue  待执行的 CacheOperation 列表          │    ║
+        ║  │  ack_write_queue/ack_load_queue  DMA 完成 ack 列表            │    ║
+        ║  │  layer_done_counter   load 时逐层同步计数器 (三缓冲)             │    ║
+        ║  │  write_buffer/load_buffer  预留的异步双缓冲 (当前未启用)          │    ║
+        ║  └──────────────────────────────────────────────────────────────┘    ║
+        ║                                                                      ║
+        ║  ┌─ ⑤ L3 后台线程 ───────────────────────────────────────────────┐    ║
+        ║  │  storage_stop_event  L3 线程停止信号 (独立于 stop_event)         │    ║
+        ║  │  stop_event          L1↔L2 停止信号                            │    ║
+        ║  │  page_get_func / page_set_func  L3 页读写函数指针               │    ║
+        ║  └──────────────────────────────────────────────────────────────┘    ║
+        ║                                                                      ║
+        ║  ┌─ ⑥ Draft KV (投机解码, best-effort) ──────────────────────────┐    ║
+        ║  │  has_draft           是否启用 draft pool                       │    ║
+        ║  │  mem_pool_device_draft  GPU draft KV pool                    │    ║
+        ║  │  mem_pool_host_draft    Host draft KV pool                   │    ║
+        ║  │  draft_page_get/set_func  L3 draft 读写函数指针                │    ║
+        ║  └──────────────────────────────────────────────────────────────┘    ║
+        ║                                                                      ║
+        ╚══════════════════════════════════════════════════════════════════════╝
+        """
+
+        # ────────────── ① 分布式通信组 ──────────────
+        # tp_group: Tensor Parallel 通信组, 用于 all_reduce(MIN) 同步 prefetch 命中长度
         self.tp_group = tp_group
+        # attn_cp_group: Context Parallel 通信组, 用于长上下文场景下的 TP 同步
         self.attn_cp_group = attn_cp_group
+        # attn_tp_group: Attention TP 通信组, 某些模型架构中 attention 层独立做 TP
         self.attn_tp_group = attn_tp_group
+        # pp_group: Pipeline Parallel 通信组 (当前未使用, 预留)
         self.pp_group = pp_group
+        # prefetch_sync_groups: 由 tp_group/attn_cp_group/attn_tp_group 派生的
+        #   gloo backend ProcessGroup 列表, 用于 CPU tensor 上做 all_reduce(MIN)
+        #   保证 TP 多卡 prefetch 命中长度一致 (详见 prefetch_thread_func 注释)
         self.prefetch_sync_groups: List[torch.distributed.ProcessGroup] = []
+
+        # ────────────── ② 内存池 ──────────────
+        # GPU KV pool 分配器: 管理 GPU 端 slot 分配/释放, start_writing 从此取目标地址
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
+        # GPU KV pool 实际 tensor: 存放 L1 层 KV cache 数据
+        #   如果是 HybridLinearKVPool (SWA+full 混合), 取其 full_kv_pool
         mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
         if isinstance(mem_pool_device, HybridLinearKVPool):
             mem_pool_device = mem_pool_device.full_kv_pool
         self.mem_pool_device = mem_pool_device
+        # Host KV pool: CPU pinned memory, 存放 L2 层 KV cache 数据
         self.mem_pool_host = mem_pool_host
+
+        # ────────────── ③ 策略与配置 ──────────────
+        # write_policy: GPU→Host 写回策略
+        #   write_through           → 每个 write 操作都同时触发 L3 备份
+        #   write_through_selective → 仅对首次出现的 prefix 触发 L3 备份
+        #   write_back              → 仅写回 Host, 不主动备份 L3
         self.write_policy = write_policy
+        # page_size: KV cache page 粒度 (通常 16 tokens)
+        #   影响: hash 计算粒度、L3 存储单元、host_indices 按 page_size 分组
         self.page_size = page_size
+        # io_backend: L1↔L2 DMA 后端
+        #   "kernel"  → 自定义 CUDA kernel (indices 在 GPU 上, 更快)
+        #   "direct"  → PyTorch 原生 copy (indices 在 CPU 上, 通用)
+        #   "kernel_ascend" → NPU 后端
         self.io_backend = io_backend
+
+        # ────────────── L3 存储相关 (初始状态: 未启用) ──────────────
+        # enable_storage: L3 存储是否已启用 (通过 attach_storage_backend 开启)
         self.enable_storage = False
+        # storage_backend: L3 存储后端实例 (mooncake/simm/nixl/hf3fs 等)
         self.storage_backend = None
+        # storage_backend_type: L3 存储后端类型字符串
         self.storage_backend_type = None
+        # enable_storage_metrics: 是否采集 L3 存储指标 (延迟、命中率等)
         self.enable_storage_metrics = enable_storage_metrics
 
-        # Draft KV pool support (best-effort piggyback on target L2/L3 ops).
+        # ────────────── ⑥ Draft KV (投机解码) ──────────────
+        # Draft KV pool 搭载在 target 的 L2/L3 操作上 best-effort 读写,
+        # 不单独占用 IO 线程, 失败也不影响 target 正确性
         self.has_draft = False
         self.mem_pool_device_draft = None
         self.mem_pool_host_draft = None
         self.draft_page_get_func = None
         self.draft_page_set_func = None
 
-        # Default storage page IO functions (may be overridden by attach).
+        # ────────────── ⑤ L3 页 IO 函数指针 ──────────────
+        # page_set_func: L3 写入函数 (host_indices → storage_backend)
+        # page_get_func: L3 读取函数 (storage_backend → host_indices)
+        # 默认使用 _generic_page_set/get (逐页拷贝), attach 时可能替换为零拷贝版本
         self.page_get_func = self._generic_page_get
         self.page_set_func = self._generic_page_set
 
-        # Dedicated stop event for storage background threads (prefetch/backup).
-        # NOTE: Do NOT reuse `self.stop_event` here since it also guards core HiCache
-        # transfer buffers (CPU<->GPU). We want to allow runtime attach/detach of
-        # storage without stopping the whole controller.
+        # ────────────── ⑤ 停止信号 ──────────────
+        # storage_stop_event: 仅控制 L3 后台线程 (prefetch_thread / backup_thread)
+        #   独立于 stop_event, 支持 runtime attach/detach L3 而不影响 L1↔L2 传输
         self.storage_stop_event = threading.Event()
 
+        # ────────────── ④ GPU DMA 引擎 ──────────────
+        # device: "cuda" / "npu" 等, 决定 CUDA/MemoryPool backend
         self.device = self.mem_pool_device.device
+        # layer_num: 模型层数, 决定 layer_done_counter 的大小
+        #   write 时一次性搬全部层, load 时逐层搬+逐层同步
         self.layer_num = self.mem_pool_device.layer_num
+        # layer_done_counter: load 时三缓冲层同步计数器
+        #   compute_stream wait 每一层 load 完成, 而非等全部层搬完
+        #   详见 start_loading() 注释中的时序图
         self.layer_done_counter = LayerDoneCounter(self.layer_num)
         self.mem_pool_device.register_layer_transfer_counter(self.layer_done_counter)
 
@@ -504,21 +736,35 @@ class HiCacheController:
         ]:
             raise ValueError(f"Invalid write policy: {write_policy}")
 
-        # self.write_queue = PriorityQueue[CacheOperation]()
+        # write_queue / load_queue: 待执行的 GPU↔Host 传输操作列表
+        #   由 start_writing/start_loading 填入, 由 write()/load() 消费
+        #   注意: 不是线程安全队列! 在 scheduler 线程中单线程访问
         self.load_queue: List[CacheOperation] = []
         self.write_queue: List[CacheOperation] = []
+        # ack_write_queue / ack_load_queue: DMA 完成 ack 列表
+        #   由 write()/load() 填入, 由上层 evict 或 drain_queues 消费
         self.ack_load_queue: List[HiCacheAck] = []
         self.ack_write_queue: List[HiCacheAck] = []
 
+        # stop_event: L1↔L2 传输停止信号 (不同于 storage_stop_event)
+        #   设置后 write_buffer/load_buffer 的 put/get 不再阻塞
         self.stop_event = threading.Event()
+        # write_buffer / load_buffer: TransferBuffer (有界阻塞队列)
+        #   当前仅 clear() 在 reset() 中被调用, put/get 未启用
+        #   预留用于未来的异步双缓冲流水线
+        #   load_buffer 的 buffer_count=10 > write_buffer 的 1, 因为
+        #   load 是逐层传输, 需要更多缓冲槽位
         self.write_buffer = TransferBuffer(self.stop_event)
         self.load_buffer = TransferBuffer(self.stop_event, buffer_count=10)
 
+        # write_stream: GPU→Host DMA 专用 CUDA 流
+        #   start_writing() 中: wait(start_event) → DMA → record(finish_event)
+        # load_stream:  Host→GPU DMA 专用 CUDA 流
+        #   start_loading() 中: 逐层 DMA + layer_done_counter 通知 compute_stream
         self.write_stream = device_module.Stream()
         self.load_stream = device_module.Stream()
 
-        # If a storage backend is provided at startup, treat it as an implicit attach,
-        # so init/runtime share the same lifecycle semantics and code paths.
+        # 如果启动时指定了 storage_backend, 视为隐式 attach, 走同一套生命周期
         if storage_backend is not None:
             try:
                 self.attach_storage_backend(
@@ -898,8 +1144,38 @@ class HiCacheController:
         priority: Optional[int] = None,
         node_id: int = -1,
     ) -> Optional[torch.Tensor]:
-        """
-        Back up KV caches from device memory to host memory.
+        """Back up KV caches from device memory to host memory.
+
+        GPU (device_indices) ──DMA──→ Host (host_indices)
+                                       ↑ alloc
+
+        调用后立即触发 start_writing()，将本操作与队列中其他操作合并后一次性 DMA。
+        返回 host_indices 供上层（HiRadixCache）记录到 node.host_value。
+
+        ──────── node_id 的作用: DMA 完成后的回调凭证 ────────
+
+        node_id 不是给 Host 端用的，而是 DMA 异步完成后的"收据编号"。
+        GPU→Host DMA 是异步的，发起 write 时 node 正在被搬运，
+        搬完才能做后续动作 (L3 备份、释放 host 锁等)。
+
+        完整链路:
+          ① write(node_id=node.id)
+             → CacheOperation.node_ids = [node_id]
+          ② merge_ops() 合并多个 write
+             → node_ids = [id1, id2, ...]  (一次 DMA 搬多个 node)
+          ③ DMA 完成 → HiCacheAck(node_ids=[id1, id2, ...])
+          ④ HiRadixCache.writing_check() 遍历 ack.node_ids:
+             for ack_id in ack.node_ids:
+                 _finish_write_through_ack(ack_id)
+                   ├─ ongoing_write_through.pop(ack_id)  → 找到 TreeNode
+                   ├─ write_through_pending_id = None    → 清除 DMA 等待标记
+                   ├─ _record_store_event(CPU)           → 记录 KV 已到 Host
+                   ├─ write_backup_storage()             → 触发 L3 写入
+                   └─ dec_lock_ref()                     → 释放 evict 保护锁
+
+        为什么是 node_ids (复数)?
+          merge_ops() 会把多个小 write 合并成一次大 DMA 以减少 kernel launch 开销,
+          合并后 node_ids = [id1, id2, id3], DMA 一次性搬完, ack 时逐个回调。
         """
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
@@ -911,13 +1187,115 @@ class HiCacheController:
         return host_indices
 
     def start_writing(self) -> None:
+        """将 write_queue 中积攒的所有 GPU→Host 写入操作合并后一次性提交 DMA。
+
+        ┌─────────────── 数据流全景 ──────────────────┐
+        │                                           │
+        │  GPU (device)  ──── DMA ────→  Host (CPU) │
+        │  mem_pool_device           mem_pool_host  │
+        │       │                        │          │
+        │   device_indices          host_indices    │
+        └───────────────────────────────────────────┘
+
+        ┌─────────────── 执行流程 ────────────────────┐
+        │                                           │
+        │  write() × N                              │
+        │    │  每次: alloc host slot                │
+        │    │  → CacheOperation 入 write_queue      │
+        │    ▼                                      │
+        │  merge_ops()                              │
+        │    │  cat 所有 host/device indices         │
+        │    │  → 减少多次小 DMA 为一次大 DMA           │
+        │    ▼                                      │
+        │  move_indices()                           │
+        │    │  kernel → indices 放 GPU             │
+        │    │  direct → indices 放 CPU             │
+        │    ▼                                      │
+        │  write_stream 上异步执行:                   │
+        │    ├─ wait(start_event)  ← 等源数据就绪      │
+        │    ├─ backup_from_device_all_layer()      │
+        │    │    全层一次性拷贝 (L0,L1,...,Ln)        │
+        │    ├─ [draft: 同样拷贝 draft KV]            │
+        │    └─ finish_event.record()               │
+        │    ▼                                      │
+        │  HiCacheAck 入 ack_write_queue            │
+        │    │                                      │
+        │    ▼                                      │
+        │  HiRadixCache.writing_check()             │
+        │    finish_event.query()/synchronize()     │
+        │    → 确认 DMA 完成 → 回调树节点               │
+        └───────────────────────────────────────────┘
+
+        ┌─────────── CUDA 流同步时序 ─────────────────────────────┐
+        │                                                       │
+        │  compute stream:  ──● start_event                     │
+        │                            │                          │
+        │  write stream:    ──wait(start)──DMA──● finish_event  │
+        │                                                       │
+        │  ● = event.record()                                   │
+        │  wait = stream.wait_event()                           │
+        └───────────────────────────────────────────────────────┘
+
+        与 start_loading() 的关键区别：
+          ┌──────────────┬──────────────────┬──────────────────────┐
+          │              │ start_writing    │ start_loading        │
+          ├──────────────┼──────────────────┼──────────────────────┤
+          │ 拷贝方式       │ 全层一次性         │ 逐层拷贝              │
+          │ 逐层同步       │ 不需要            │ LayerDoneCounter     │
+          │ 原因          │ 无计算流在等       │ prefill 计算流在等 KV  │
+          │ ack 消费者    │ writing_check()  │ loading_check()      │
+          └──────────────┴──────────────────┴──────────────────────┘
+
+        异步安全性：
+          - start_event: 在 compute stream 上 record → write_stream.wait → 确保源数据已就绪
+          - record_stream(): 防止 CUDA caching allocator 在异步 DMA 完成前回收 indices 张量
+          - finish_event: HiRadixCache.writing_check() 轮询或 synchronize，
+            确认 DMA 完成后才执行后续逻辑（如 dec_lock_ref、write_backup_storage）
+        """
         if len(self.write_queue) == 0:
             return
 
         op = CacheOperation.merge_ops(self.write_queue)
-        # For now, kernel write-back keeps host indices on CPU only for page_first.
-        # More layouts can use this path once their write-back kernels accept CPU
-        # destination indices.
+        # indices 搬运策略: 两条路径, 区别在于 host_indices 和 device_indices 放在 GPU 还是 CPU
+        #
+        # ┌──────────────────────────────────────────────────────────────────────────┐
+        # │  路径选择                                                                │
+        # │                                                                          │
+        # │  条件: io_backend=="kernel" AND layout=="page_first"                      │
+        # │  ┌────────────────────────────────────────────────────────────────────┐  │
+        # │  │ 路径 A: 直接用原始 indices (不走 move_indices)                      │  │
+        # │  │                                                                    │  │
+        # │  │   host_indices   → 保持在 CPU  (原始分配就在 CPU)                  │  │
+        # │  │   device_indices → 保持在 GPU  (原始分配就在 GPU)                  │  │
+        # │  │                                                                    │  │
+        # │  │   原因: page_first 的 kernel 使用 staging buffer 方式:             │  │
+        # │  │     1) GPU kernel 用 device_indices 从 GPU 读取源数据              │  │
+        # │  │     2) 写入 GPU 上的 staging buffer (不直接写 Host)                │  │
+        # │  │     3) staging buffer → Host 的最终 scatter 用 host_indices (CPU)  │  │
+        # │  │     所以 host_indices 不需要搬到 GPU                                │  │
+        # │  └────────────────────────────────────────────────────────────────────┘  │
+        # │                                                                          │
+        # │  其他所有情况 (kernel+layer_first, direct, kernel_ascend, ...)           │
+        # │  ┌────────────────────────────────────────────────────────────────────┐  │
+        # │  │ 路径 B: 走 move_indices()                                         │  │
+        # │  │                                                                    │  │
+        # │  │   kernel + layer_first:                                            │  │
+        # │  │     host_indices   → CPU 搬到 GPU  (kernel 从 GPU 读目标地址)      │  │
+        # │  │     device_indices → 已在 GPU, 不动                                │  │
+        # │  │                                                                    │  │
+        # │  │   direct + layer_first:                                            │  │
+        # │  │     host_indices   → CPU 上 sort 排序 (内存连续性优化)             │  │
+        # │  │     device_indices → GPU 搬到 CPU, 按相同顺序重排                  │  │
+        # │  │                                                                    │  │
+        # │  │   direct + page_first_direct:                                      │  │
+        # │  │     host_indices   → CPU, 不动                                     │  │
+        # │  │     device_indices → GPU 搬到 CPU                                  │  │
+        # │  │                                                                    │  │
+        # │  │   kernel_ascend:                                                   │  │
+        # │  │     host_indices   → 不动                                          │  │
+        # │  │     device_indices → GPU 搬到 CPU                                  │  │
+        # │  └────────────────────────────────────────────────────────────────────┘  │
+        # └──────────────────────────────────────────────────────────────────────────┘
         if self.io_backend == "kernel" and self.mem_pool_host.layout == "page_first":
             host_indices, device_indices = op.host_indices, op.device_indices
         else:
@@ -929,12 +1307,16 @@ class HiCacheController:
         start_event = device_module.Event()
         finish_event = device_module.Event()
 
+        # 在默认流（compute stream）上记录起始点，确保源数据已就绪
         start_event.record()
         with device_module.stream(self.write_stream):
+            # write_stream 等待 compute stream 上的数据产出完成
             start_event.wait(self.write_stream)
+            # 全层一次性 GPU→Host DMA 拷贝
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device, host_indices, device_indices, self.io_backend
             )
+            # 如果有 draft KV pool，同样拷贝（best-effort 搭便车）
             if self.has_draft:
                 self.mem_pool_host_draft.backup_from_device_all_layer(
                     self.mem_pool_device_draft,
@@ -942,15 +1324,25 @@ class HiCacheController:
                     device_indices,
                     self.io_backend,
                 )
+            # 在 write_stream 上记录完成 event
             finish_event.record()
             # NOTE: We must save the host indices and device indices here,
             # this is because we need to guarantee that these tensors are
             # still alive when the write stream is executing.
+            # 防止 CUDA caching allocator 在异步 DMA 未完成时回收这些张量的 GPU 内存
             if host_indices.is_cuda:
                 host_indices.record_stream(self.write_stream)
             if device_indices.is_cuda:
                 device_indices.record_stream(self.write_stream)
 
+        # HiCacheAck 入 ack_write_queue, 由 HiRadixCache.writing_check() 消费:
+        #   for _, finish_event, ack_list in ack_write_queue:
+        #       finish_event.synchronize()           # 等 DMA 完成
+        #       for ack_id in ack_list:              # ack_list = node_ids
+        #           _finish_write_through_ack(ack_id)
+        #             ├─ ongoing_write_through.pop(ack_id) → 找到 TreeNode
+        #             ├─ write_backup_storage()            → 触发 L3 写入
+        #             └─ dec_lock_ref()                    → 释放 evict 锁
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
 
     def load(
@@ -959,8 +1351,17 @@ class HiCacheController:
         priority: Optional[int] = None,
         node_id: int = -1,
     ) -> Optional[torch.Tensor]:
-        """
-        Load KV caches from host memory to device memory.
+        """Load KV caches from host memory to device memory.
+
+        Host (host_indices) ──DMA──→ GPU (device_indices)
+                                       ↑ alloc
+
+        仅入 load_queue，不立即执行 DMA。等 start_loading() 被调度器触发时
+        才合并所有 load 操作 + 逐层拷贝 + LayerDoneCounter 同步。
+        返回 device_indices 供上层分配 GPU slot。
+
+        node_id 作用与 write() 相同: DMA 完成后的回调凭证。
+        loading_check() 拿 node_id 去 ongoing_load_back pop 出节点做 dec_lock_ref。
         """
         device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
         if device_indices is None:
@@ -971,6 +1372,23 @@ class HiCacheController:
         return device_indices
 
     def move_indices(self, host_indices: torch.Tensor, device_indices: torch.Tensor):
+        """根据 io_backend 和 host layout 将 indices 搬到正确的设备 (GPU/CPU)。
+
+        ┌────────────────────────────────────────────────────────────────────┐
+        │  io_backend + layout         │ host_indices     │ device_indices  │
+        │──────────────────────────────│──────────────────│─────────────────│
+        │  kernel (layer_first)        │ CPU → GPU        │ 已在 GPU, 不动  │
+        │  kernel (page_first)         │ 不走此函数, 直接用原始 CPU indices │
+        │  direct + layer_first        │ sort 排序(CPU)   │ CPU + 重排对齐  │
+        │  direct + page_first_direct  │ 不动 (CPU)       │ → CPU           │
+        │  kernel_ascend               │ 不动             │ → CPU           │
+        └────────────────────────────────────────────────────────────────────┘
+
+        layer_first + direct 需要 sort 的原因:
+          layer_first layout 下 Host 内存按 [layer][token] 排列,
+          为保证 DMA 写入时地址连续 (减少 page fault), 需要先 sort host_indices,
+          然后 device_indices 也要按相同顺序重排, 保证 src/dst 索引一一对应。
+        """
         # move indices to GPU if using kernels, to host if using direct indexing
         if self.io_backend == "kernel":
             if not host_indices.is_cuda:
@@ -993,6 +1411,77 @@ class HiCacheController:
             raise ValueError(f"Unsupported io backend")
 
     def start_loading(self) -> int:
+        """将 load_queue 中积攒的所有 Host→GPU 加载操作合并后提交逐层 DMA，返回 consumer_index。
+
+        ┌─────────────── 数据流全景 ──────────────────┐
+        │                                           │
+        │  Host (CPU)  ──── DMA ────→  GPU (device) │
+        │  mem_pool_host             mem_pool_device│
+        │       │                        │          │
+        │   host_indices            device_indices  │
+        └───────────────────────────────────────────┘
+
+        ┌─────────────── 执行流程 ────────────────────┐
+        │                                           │
+        │  load() × N                               │
+        │    │  每次: alloc device slot              │
+        │    │  → CacheOperation 入 load_queue      │
+        │    ▼                                      │
+        │  update_producer()                        │
+        │    │  获取三缓冲中的下一个 event slot         │
+        │    ▼                                      │
+        │  merge_ops()                              │
+        │    │  cat 所有 host/device indices         │
+        │    ▼                                      │
+        │  move_indices()                           │
+        │    │  kernel → indices 放 GPU             │
+        │    │  direct → indices 放 CPU             │
+        │    ▼                                      │
+        │  load_stream 上逐层拷贝:                    │
+        │    for i in range(layer_num):             │
+        │      load_to_device_per_layer(i)          │
+        │      producer_event.complete(i) ← 记录     │
+        │    ▼                                      │
+        │  HiCacheAck 入 ack_load_queue             │
+        │    │                                      │
+        │    └→ 返回 producer_id                     │
+        │       ↓                                   │
+        │  Scheduler: batch.hicache_consumer_index  │
+        │       ↓                                   │
+        │  TpWorker: set_consumer(producer_id)      │
+        │       ↓                                   │
+        │  ModelRunner: wait_until(layer_id) 逐层等  │
+        └───────────────────────────────────────────┘
+
+        ┌──────── 逐层 overlap 时序（核心价值）─────────────────┐
+        │                                                   │
+        │  load_stream:   ──L0──L1──L2──L3──L4──●           │
+        │                        │   │   │   │              │
+        │  compute stream: ──────w───w───w───w──→           │
+        │                       ↓   ↓   ↓   ↓               │
+        │                  attention 计算开始                 │
+        │                                                   │
+        │  L_i = load_to_device_per_layer(i) + complete(i)  │
+        │  w = wait_until(i) → compute stream 等该层就绪      │
+        │  ● = finish_event（最后一层完成 = 整体完成）           │
+        │                                                   │
+        │  效果：计算不必等全部层拷贝完，每层就绪即可开始            │
+        └───────────────────────────────────────────────────┘
+
+        ┌────── 三缓冲（LayerDoneCounter）────────────┐
+        │                                           │
+        │  slot A: consumer 正在等待（当前 batch）     │
+        │  slot B: 正在 load（下一 batch 预取）        │
+        │  slot C: 上一 batch 已完成，可安全复用        │
+        │                                           │
+        │  update_producer() 断言 slot C 的          │
+        │  finish_event.query() == True             │
+        └───────────────────────────────────────────┘
+
+        Returns:
+            producer_id: 传给 set_consumer() 绑定 consumer 等待的 event slot，
+                         -1 表示 load_queue 为空无需加载
+        """
         if len(self.load_queue) == 0:
             return -1
 
@@ -1032,6 +1521,12 @@ class HiCacheController:
             if device_indices.is_cuda:
                 device_indices.record_stream(self.load_stream)
 
+        # HiCacheAck 入 ack_load_queue, 由 HiRadixCache.loading_check() 消费:
+        #   for _, finish_event, ack_list in ack_load_queue:
+        #       finish_event.synchronize()
+        #       for ack_id in ack_list:              # ack_list = node_ids
+        #           node = ongoing_load_back.pop(ack_id)
+        #           dec_lock_ref(node)                → 释放 evict 保护锁
         self.ack_load_queue.append(
             HiCacheAck(
                 start_event=producer_event.start_event,
@@ -1229,6 +1724,34 @@ class HiCacheController:
         return False
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
+        """
+        查询 L3 存储中实际命中了多少 token 的 KV cache，返回 (hash列表, 命中token数)。
+
+        ┌──────────────────────────────────────────────────────────────┐
+        │  逐 page 查询流程                                           │
+        │                                                              │
+        │  token_ids: [t0, t1, ..., tN]                               │
+        │       │                                                      │
+        │       ▼                                                      │
+        │  ┌──────────────────────────────────────┐                   │
+        │  │ 按 STORAGE_BATCH_SIZE 分批:           │                   │
+        │  │   batch0: page0..pageK               │                   │
+        │  │   batch1: pageK+1..page2K            │                   │
+        │  │   ...                                │                   │
+        │  └──────────────────────────────────────┘                   │
+        │       │  每个 batch 内:                                       │
+        │       │  1) 逐 page 计算 hash (滚动哈希, last_hash 链式)     │
+        │       │  2) batch_exists(batch_hashes) → hit_page_num       │
+        │       │  3) hit_page_num < len(batch_hashes)?               │
+        │       │     YES → 命中到此为止, break (prefix 必须连续)       │
+        │       │     NO  → 继续下一个 batch                            │
+        │       ▼                                                      │
+        │  返回: (hash_value[:hit_pages], hit_token_count)             │
+        │                                                              │
+        │  关键: L3 的 KV cache 以 prefix tree 组织，                 │
+        │       命中必须是连续前缀，一旦中间断开就停止                  │
+        └──────────────────────────────────────────────────────────────┘
+        """
         last_hash = operation.last_hash
         tokens_to_fetch = operation.token_ids
         prefix_keys = operation.prefix_keys.copy() if operation.prefix_keys else None
@@ -1260,7 +1783,102 @@ class HiCacheController:
 
     def prefetch_thread_func(self):
         """
-        Manage prefetching operations from storage backend to host memory.
+        L3 预取调度线程 —— 从 prefetch_queue 消费请求，决策是否真正执行 IO。
+
+        ╔══════════════════════════════════════════════════════════════════════╗
+        ║  整体流水线架构 (三线程两队列)                                      ║
+        ╠══════════════════════════════════════════════════════════════════════╣
+        ║                                                                      ║
+        ║  scheduler                                                          ║
+        ║    │  prefetch(req_id, host_indices, tokens, ...)                   ║
+        ║    ▼                                                                ║
+        ║  ┌─────────────────┐                                               ║
+        ║  │ prefetch_queue  │  ← PrefetchOperation 入队                     ║
+        ║  └────────┬────────┘                                               ║
+        ║           │  get()                                                  ║
+        ║           ▼                                                        ║
+        ║  ┌─────────────────────────────────────────────────┐                ║
+        ║  │  prefetch_thread_func  (本函数 — 调度决策层)      │                ║
+        ║  │                                                   │                ║
+        ║  │  1) _storage_hit_query()  → 查 L3 实际命中长度    │                ║
+        ║  │  2) all_reduce(MIN)      → TP 多卡取最小命中     │                ║
+        ║  │  3) 判定: hit >= threshold ?                      │                ║
+        ║  │     ├─ YES → 截断 host_indices, 放入 prefetch_buffer              ║
+        ║  │     └─ NO  → 撤销: 释放 host_mem + 通知 revoke_queue             ║
+        ║  └──────────────────────┬──────────────────────────┘                ║
+        ║                          │  put()                                  ║
+        ║                          ▼                                         ║
+        ║  ┌─────────────────┐                                               ║
+        ║  │ prefetch_buffer │  ← 仅存放通过决策的操作                         ║
+        ║  └────────┬────────┘                                               ║
+        ║           │  get()                                                  ║
+        ║           ▼                                                        ║
+        ║  ┌─────────────────────────────────────────┐                      ║
+        ║  │  prefetch_io_aux_func (IO 执行线程)       │                      ║
+        ║  │    → _page_transfer() 逐 batch 读写 L3    │                      ║
+        ║  │    → 支持 mark_terminate() 提前终止       │                      ║
+        ║  └─────────────────────────────────────────┘                      ║
+        ║                                                                      ║
+        ╚══════════════════════════════════════════════════════════════════════╝
+
+        ──────── 关键机制: all_reduce(MIN) 保证 TP 多卡一致性 ────────
+
+        TP 多卡场景下，每个 rank 独立查询本地 L3，命中长度可能不同:
+
+          rank 0:  L3 命中 1024 tokens (64 pages)
+          rank 1:  L3 命中  960 tokens (60 pages)   ← 丢失了 4 pages
+          rank 2:  L3 命中 1024 tokens (64 pages)
+          rank 3:  L3 命中 1024 tokens (64 pages)
+
+        如果各 rank 各自取各自的命中长度:
+          → rank0/2/3 分配了 64 pages 的 host_indices
+          → rank1 只分配了 60 pages
+          → 同一个 request 在不同 rank 的 page table 不一致 → 后续 load 时错位!
+
+        解决: all_reduce(MIN):
+          min(1024, 960, 1024, 1024) = 960
+          → 所有 rank 统一按 960 tokens (60 pages) 取
+          → page table 在所有 rank 上保持一致
+
+        ┌─────────────────────────────────────────────────────────────┐
+        │  TP 多卡一致性流程                                          │
+        │                                                             │
+        │  rank0  ─┐                                                  │
+        │  rank1  ─┤  all_reduce(MIN)  ──→  统一 hit_count = 960     │
+        │  rank2  ─┤                                                  │
+        │  rank3  ─┘                                                  │
+        │                                                             │
+        │  同步组构建: _create_prefetch_sync_groups()                  │
+        │    → 基于 tp_group / attn_cp_group / attn_tp_group          │
+        │    → 使用 gloo backend (CPU tensor 上的 all_reduce)         │
+        └─────────────────────────────────────────────────────────────┘
+
+        ──────── 阈值判定: prefetch_threshold ────────
+
+        if storage_hit_count < prefetch_threshold:
+            → 撤销: 命中太少不值得 IO 开销
+            → 释放预分配的 host memory
+            → 通知 scheduler 通过 prefetch_revoke_queue
+        else:
+            → 放行: 截断 hash_value / host_indices 到命中部分
+            → 多分配的部分释放回 host mem pool
+            → 操作进入 prefetch_buffer 等待 IO 线程执行
+
+        ┌──────────────────────────────────────────────────────────┐
+        │  阈值判定流程                                            │
+        │                                                          │
+        │  storage_hit_count (all_reduce 后)                      │
+        │       │                                                  │
+        │       ├──── < prefetch_threshold ──→  ❌ REVOKE          │
+        │       │     ├ 释放 host_indices 全部                      │
+        │       │     └ 通知 prefetch_revoke_queue                 │
+        │       │                                                  │
+        │       └──── >= prefetch_threshold ──→  ✅ PROCEED         │
+        │             ├ 截断 hash_value[:hit_pages]                 │
+        │             ├ 截断 host_indices[:hit_count]               │
+        │             ├ 释放多余的 host_indices[hit_count:]         │
+        │             └ 放入 prefetch_buffer                       │
+        └──────────────────────────────────────────────────────────┘
         """
         self.prefetch_buffer = Queue()
         self.prefetch_io_aux_thread = threading.Thread(
@@ -1313,7 +1931,88 @@ class HiCacheController:
         prefix_keys: Optional[List[str]] = None,
     ) -> int:
         """
-        Write KV caches from host memory to storage backend.
+        L3 写入入口 —— 将 Host 上的 KV page 备份到 L3 存储后端。
+
+        ╔══════════════════════════════════════════════════════════════════════╗
+        ║  完整写入链路 (GPU → Host → L3)                                     ║
+        ╠══════════════════════════════════════════════════════════════════════╣
+        ║                                                                      ║
+        ║  ① GPU→Host (DMA)                                                   ║
+        ║     start_writing() → write_stream DMA → finish_event              ║
+        ║                          │                                           ║
+        ║                          ▼                                           ║
+        ║  ② Host 确认 (HiRadixCache 层)                                       ║
+        ║     _finish_write_through_ack()                                     ║
+        ║       ├─ node.write_through_pending_id = None  (清除 DMA 等待标记)    ║
+        ║       ├─ _record_store_event(medium=CPU)        (记录存储事件)        ║
+        ║       └─ write_backup_storage(node)             ←── 触发 L3 写入    ║
+        ║                          │                                           ║
+        ║                          ▼                                           ║
+        ║  ③ L3 写入 (本函数)                                                  ║
+        ║     write_storage(host_indices, token_ids, hash_value, prefix_keys) ║
+        ║       → 创建 StorageOperation → 放入 backup_queue                  ║
+        ║                          │                                           ║
+        ║                          ▼                                           ║
+        ║  ④ backup_thread 消费                                                ║
+        ║     backup_thread_func()                                            ║
+        ║       → _page_backup() 逐 batch 写 L3                               ║
+        ║       → ack_backup_queue 通知完成                                    ║
+        ║                          │                                           ║
+        ║                          ▼                                           ║
+        ║  ⑤ 上层确认 (HiRadixCache 层)                                        ║
+        ║     _drain_backup():                                                ║
+        ║       → ongoing_backup.pop(ack_id)                                  ║
+        ║       → node.release_host()  (L3 备份完成, host mem 可释放)          ║
+        ║                                                                      ║
+        ╚══════════════════════════════════════════════════════════════════════╝
+
+        ┌─────────────────────────────────────────────────────────────────────┐
+        │  调用方: HiRadixCache.write_backup_storage()                       │
+        │                                                                     │
+        │  write_backup_storage 做了两件事:                                    │
+        │                                                                     │
+        │  1) 处理 split: 如果 node 在 DMA 期间被 radix tree split 了，         │
+        │     需要通过 _concat_split_chain() 沿父节点回溯拼接,                   │
+        │     恢复入队时刻的完整 (key, hash_value, host_value)                  │
+        │                                                                     │
+        │     原始 node:  [A|B|C|D]                                           │
+        │     DMA 期间 split:  [A|B]  +  [C|D]                               │
+        │     → concat: 遍历 parent 拼回 [A|B|C|D]                            │
+        │                                                                     │
+        │  2) 构建 prefix_keys:                                               │
+        │     如果 hicache_storage_pass_prefix_keys=True,                     │
+        │     从 root 沿路收集祖先节点的 hash_value 作为前缀,                  │
+        │     用于 L3 后端(如 mooncake)做层级索引                              │
+        │                                                                     │
+        │  3) 调用本函数:                                                     │
+        │     write_storage(host_value, key, hash_value, prefix_keys)         │
+        │     + node.protect_host()  (防止 L3 写完前 host mem 被回收)          │
+        │                                                                     │
+        └─────────────────────────────────────────────────────────────────────┘
+
+        ┌─────────────────────────────────────────────────────────────────────┐
+        │  Host Memory 生命周期 (protect_host / release_host)                  │
+        │                                                                     │
+        │  write_storage() 时刻:                                              │
+        │    → node.protect_host()   host ref+1, 防止 L3 IO 期间被 evict       │
+        │                                                                     │
+        │  ack_backup_queue 确认时刻:                                         │
+        │    → node.release_host()   host ref-1, L3 已有副本, 可安全释放       │
+        │                                                                     │
+        │  如果 L3 写入失败 (backup_skip / batch_set 失败):                    │
+        │    → 仍会 ack, 但 completed_tokens < 预期                           │
+        │    → release_host 仍会执行, 只是该 node 的 L3 副本不完整             │
+        │                                                                     │
+        └─────────────────────────────────────────────────────────────────────┘
+
+        Args:
+            host_indices: Host memory pool 中的 page 索引 (每个 page_size 个 slot 一组)
+            token_ids:   该 node 包含的 token ID 序列
+            hash_value:  每个 page 的 hash 值列表 (None 则由 backup_thread 计算)
+            prefix_keys:  祖先节点的 hash 值列表, 用于 L3 后端层级索引
+
+        Returns:
+            operation.id —— 用于在 ongoing_backup 中追踪, ack 时释放 host ref
         """
         operation = StorageOperation(
             host_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
@@ -1402,6 +2101,36 @@ class HiCacheController:
 
     # Backup batch by batch
     def _page_backup(self, operation):
+        """
+        逐 batch 将 Host KV page 写入 L3 存储后端 (由 backup_thread 调用)。
+
+        ┌──────────────────────────────────────────────────────────────┐
+        │  逐 batch 写入流程                                           │
+        │                                                              │
+        │  hash_value: [h0, h1, h2, ..., hN]                          │
+        │                  │                                           │
+        │                  ▼  按 STORAGE_BATCH_SIZE 分批               │
+        │  ┌─────────────────────────────────────┐                    │
+        │  │ batch 0:  h0..hK                    │                    │
+        │  │   → page_set_func(batch_hashes,      │                    │
+        │  │       batch_host_indices, extra_info) │                    │
+        │  │   → 成功?                              │                    │
+        │  │     ├─ draft_page_set (best-effort)   │                    │
+        │  │     ├─ prefix_keys += batch_hashes    │                    │
+        │  │     ├─ completed_tokens += pages      │                    │
+        │  │     └─ 继续下一 batch                  │                    │
+        │  │   → 失败?                              │                    │
+        │  │     └─ break (后续 batch 跳过)          │                    │
+        │  ├─────────────────────────────────────┤                    │
+        │  │ batch 1:  hK+1..h2K                  │                    │
+        │  │   ...                                  │                    │
+        │  └─────────────────────────────────────┘                    │
+        │                                                              │
+        │  关键: prefix_keys 滚动累加, 供后端做层级索引                  │
+        │        batch0 完成后 prefix_keys += [h0..hK]                 │
+        │        batch1 写入时 extra_info.prefix_keys 已包含 batch0     │
+        └──────────────────────────────────────────────────────────────┘
+        """
         # Backup batch by batch
         prefix_keys = operation.prefix_keys
         for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
@@ -1429,7 +2158,23 @@ class HiCacheController:
 
     def backup_thread_func(self):
         """
-        Manage backup operations from host memory to storage backend.
+        L3 备份后台线程 —— 消费 backup_queue, 逐 operation 调用 _page_backup 写入 L3。
+
+        ┌────────────────────────────────────────────────────────────────┐
+        │  backup_thread 生命周期                                         │
+        │                                                                │
+        │  backup_queue ──→  _page_backup(op)  ──→  ack_backup_queue    │
+        │     │                   │                       │               │
+        │     │                   │  逐 batch 写 L3       │  通知上层     │
+        │     │                   │  completed_tokens++   │  release_host │
+        │     │                   │                       │               │
+        │     │              backup_skip?                  │               │
+        │     │              ├─ YES: 跳过写入               │               │
+        │     │              └─ NO:  正常执行               │               │
+        │                                                                │
+        │  注意: 即使 backup_skip 或写入失败, 仍会 ack,                  │
+        │        上层通过 completed_tokens 判断实际写入量                  │
+        └────────────────────────────────────────────────────────────────┘
         """
         while not self.storage_stop_event.is_set():
             try:
