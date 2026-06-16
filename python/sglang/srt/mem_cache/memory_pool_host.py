@@ -239,6 +239,37 @@ ALLOC_MEMORY_FUNCS = defaultdict(
 
 
 class HostKVCache(abc.ABC):
+    """Host 端 KV cache 内存池基类 —— 三层缓存架构的 L2 层 (CPU pinned memory)。
+
+    ╔══════════════════════════════════════════════════════════════════════╗
+    ║  三层缓存架构中的位置                                                    ║
+    ╠══════════════════════════════════════════════════════════════════════╣
+    ║                                                                      ║
+    ║  L1: GPU (mem_pool_device)   ← 推理时直接访问                           ║
+    ║      ↕ DMA (write_stream / load_stream)                              ║
+    ║  L2: Host (本类)             ← CPU pinned memory, DMA 中转站           ║
+    ║      ↕ IO (backup_thread / prefetch_thread)                          ║
+    ║  L3: Storage (storage_backend) ← 磁盘/远程, 容量大延迟高                 ║
+    ║                                                                      ║
+    ╚══════════════════════════════════════════════════════════════════════╝
+
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │  核心职责                                                             │
+    │                                                                     │
+    │  1) 内存管理: alloc/free slot 分配释放 (free_slots 栈式管理)             │
+    │  2) DMA 传输: backup_from_device_all_layer (GPU→Host 全层一次)         │
+    │               load_to_device_per_layer    (Host→GPU 逐层)            │
+    │  3) L3 IO:    get_data_page / set_from_flat_data_page (页级读写)      │
+    │  4) 索引管理: page 对齐, layout 感知 (layer_first/page_first)          │
+    └─────────────────────────────────────────────────────────────────────┘
+
+    子类 (按模型架构区分):
+      - MHATokenToKVPoolHost:  标准 Multi-Head Attention (MHA)
+      - MLATokenToKVPoolHost:  Multi-head Latent Attention (MLA, DeepSeek)
+      - MambaPoolHost:         Mamba/SsM 状态空间模型
+      - DeepSeekV4PagedHostPool: DeepSeek V4 分页式
+      - DSAIndexerPoolHost:    DSA 索引器
+    """
 
     def __init__(
         self,
@@ -251,22 +282,49 @@ class HostKVCache(abc.ABC):
         device: str,
         allocator_type: str = "default",
     ):
+        """
+        Args:
+            device_pool:          对应的 GPU KV pool, 用于获取 dtype/size/层数等信息
+            host_to_device_ratio: Host/GPU 容量比例 (当 host_size=0 时使用)
+            host_size:            Host 内存大小 (GB), 0 表示按比例计算
+            page_size:            每个 page 的 token 数, alloc/free 的最小粒度
+            layout:               Host KV buffer 内存布局:
+                                    "layer_first"  → [layer, token, head, dim]
+                                    "page_first"   → [page, layer, head, dim]
+                                    "page_first_direct" → page_first + direct IO
+                                    "page_head"    → [layer, page, head, dim]
+            pin_memory:           是否使用 pinned memory (CUDA DMA 需要)
+            device:               tensor 设备 ("cpu" / "npu")
+            allocator_type:       内存分配器类型
+        """
+        # 对应的 GPU 端 KV pool, 子类通过它获取模型结构参数
         self.device_pool = device_pool
+        # page 粒度: 每次 alloc/free 的 token 数必须是 page_size 的倍数
         self.page_size = page_size
+        # 内存布局, 影响 DMA kernel 选择和索引方式 (详见 cache_controller.move_indices 注释)
         self.layout = layout
+        # 是否使用 pinned memory (cuda pinned memory, DMA 传输必需)
         self.pin_memory = pin_memory
+        # tensor 设备 ("cpu" 为主, NPU 场景可能不同)
         self.device = device
+        # 内存分配器
         self.allocator = get_allocator_from_storage(allocator_type)
 
+        # KV 数据类型 (与 GPU pool 一致)
         self.dtype = device_pool.store_dtype
+        # 每个 token 占用的字节数, 由子类 get_size_per_token() 计算
         self.size_per_token = self.get_size_per_token()
+        # Host pool 的 token slot 总数
+        #   host_size > 0: 直接按 GB 换算
+        #   host_size = 0: 按 device_pool.size × host_to_device_ratio
         if host_size > 0:
             self.size = int(host_size * 1e9 // self.size_per_token)
         else:
             self.size = int(device_pool.size * host_to_device_ratio)
-        # Align up the host memory pool size to the page size
+        # 向上对齐到 page_size 的整数倍
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
+        # 模型层范围 (支持 PP 场景下只存部分层)
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
 
@@ -290,26 +348,34 @@ class HostKVCache(abc.ABC):
                 f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
             )
 
+        # 实际 KV 数据缓冲区, 由子类 init_kv_buffer() 创建 (k_buffer + v_buffer)
         self.kv_buffer = self.init_kv_buffer()
 
-        # A lock for synchronized operations on memory allocation and state transitions.
+        # 线程安全锁, 保护 alloc/free/clear 等内存操作
+        #   使用 RLock (可重入锁), 允许同一线程多次 acquire
+        #   由 @synchronized 装饰器自动 acquire/release
         self.lock = threading.RLock()
         self.clear()
 
     @abc.abstractmethod
     def get_size_per_token(self):
+        """计算每个 token 的 KV 数据占用的字节数, 用于容量换算。"""
         raise NotImplementedError()
 
     @abc.abstractmethod
     def init_kv_buffer(self):
+        """创建实际的 KV 数据缓冲区 (k_buffer + v_buffer), 由子类根据 layout 实现。"""
         raise NotImplementedError()
 
     @abc.abstractmethod
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ) -> None:
-        """
-        Load KV data from the host memory pool to the device memory pool for a specific layer.
+        """Host→GPU 逐层 DMA 拷贝 (由 start_loading 逐层调用)。
+
+        与 backup_from_device_all_layer 的区别:
+          - backup: 全层一次性拷贝 (write 不需要逐层同步)
+          - load:   逐层拷贝 (compute stream 需要逐层等待, 见 LayerDoneCounter)
         """
         raise NotImplementedError()
 
@@ -317,30 +383,37 @@ class HostKVCache(abc.ABC):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ) -> None:
-        """
-        Backup KV data from the device memory pool to the host memory pool for all layers.
+        """GPU→Host 全层一次性 DMA 拷贝 (由 start_writing 调用)。
+
+        根据 io_backend 和 layout 选择不同的 kernel 实现:
+          - kernel + layer_first → transfer_kv_all_layer (全层一次DMA)
+          - kernel + page_first  → jit_transfer_hicache_all_layer_staged_lf_pf (staging buffer)
+          - direct + layer_first → PyTorch 原生索引 + sort
+          - direct + page_first_direct → PyTorch 原生索引
         """
         raise NotImplementedError()
 
     @abc.abstractmethod
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
-        """
-        Get a flat data page from the host memory pool.
+        """从 Host pool 读取一个 page 的 KV 数据 (用于 L3 写入时的数据源)。
+
+        L3 写入链路: get_data_page(index) → storage_backend.batch_set(hash, data)
         """
         raise NotImplementedError()
 
     @abc.abstractmethod
     def get_dummy_flat_data_page(self) -> torch.Tensor:
-        """
-        Get a dummy flat data page from the host memory pool.
-        This is used for prefetching or initializing empty pages.
+        """获取一个空白的 flat data page (用于 L3 预读时的目标缓冲区)。
+
+        L3 预读链路: storage_backend.batch_get(hash, dummy) → set_from_flat_data_page()
         """
         raise NotImplementedError()
 
     @abc.abstractmethod
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
-        """
-        Set a flat data page to the host memory pool.
+        """将一个 page 的 KV 数据写入 Host pool (用于 L3 预读时的数据写入)。
+
+        L3 预读链路: storage_backend.batch_get() → set_from_flat_data_page(index, data)
         """
         raise NotImplementedError()
 
@@ -359,17 +432,25 @@ class HostKVCache(abc.ABC):
 
     @synchronized
     def clear(self):
-        # Initialize memory states and tracking structures.
+        """重置内存状态, 将所有 slot 标记为空闲。"""
+        # mem_state[i] = 0 表示 slot i 空闲, = 1 表示已占用
         self.mem_state = torch.zeros(
             (self.size,), dtype=torch.uint8, device=self.device
         )
+        # free_slots: 栈式空闲 slot 索引, alloc 从头部取, free 追加到尾部
         self.free_slots = torch.arange(self.size, dtype=torch.int64)
 
     def available_size(self):
+        """当前可分配的 token slot 数量。"""
         return len(self.free_slots)
 
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
+        """分配 need_size 个连续 token slot, 返回索引 tensor; 不够则返回 None。
+
+        注意: 实际上是"从 free_slots 栈头取 need_size 个", 不保证物理连续。
+        need_size 必须是 page_size 的倍数。
+        """
         assert (
             need_size % self.page_size == 0
         ), "The requested size should be a multiple of the page size."
@@ -383,6 +464,10 @@ class HostKVCache(abc.ABC):
 
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
+        """释放之前 alloc 的 slot 索引, 追加回 free_slots 尾部。
+
+        indices 会先 .cpu() 确保在 CPU 上再 cat (因为 free_slots 在 CPU)。
+        """
         self.free_slots = torch.cat([self.free_slots, indices.cpu()])
         return len(indices)
 
