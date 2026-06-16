@@ -61,22 +61,22 @@ logger = logging.getLogger(__name__)
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerBatchResultProcessor:
     is_generation: bool
-    disaggregation_mode: "DisaggregationMode"
+    disaggregation_mode: DisaggregationMode
     enable_overlap: bool
     enable_overlap_mlx: bool
-    server_args: "ServerArgs"
-    model_config: "ModelConfig"
-    token_to_kv_pool_allocator: "BaseTokenToKVPoolAllocator"
-    tree_cache: "BasePrefixCache"
-    hisparse_coordinator: Optional["HiSparseCoordinator"]
-    req_to_token_pool: "ReqToTokenPool"
-    decode_offload_manager: Optional["DecodeKVCacheOffloadManager"]
-    metrics_collector: "SchedulerMetricsCollector"
-    metrics_reporter: "SchedulerMetricsReporter"
-    draft_worker: "BaseTpWorker"
-    model_worker: "BaseTpWorker"
-    logprob_result_processor: "SchedulerLogprobResultProcessor"
-    output_streamer: "SchedulerOutputStreamer"
+    server_args: ServerArgs
+    model_config: ModelConfig
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
+    tree_cache: BasePrefixCache
+    hisparse_coordinator: Optional[HiSparseCoordinator]
+    req_to_token_pool: ReqToTokenPool
+    decode_offload_manager: Optional[DecodeKVCacheOffloadManager]
+    metrics_collector: SchedulerMetricsCollector
+    metrics_reporter: SchedulerMetricsReporter
+    draft_worker: BaseTpWorker
+    model_worker: BaseTpWorker
+    logprob_result_processor: SchedulerLogprobResultProcessor
+    output_streamer: SchedulerOutputStreamer
     abort_request: Callable
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
@@ -206,7 +206,7 @@ class SchedulerBatchResultProcessor:
 
             # Move next_token_ids and logprobs to cpu
             next_token_ids = next_token_ids.tolist()
-            self._move_logprobs_to_cpu(batch=batch, logits_output=logits_output)
+            self.move_logprobs_to_cpu(batch=batch, logits_output=logits_output)
 
             self._validate_pp_skip_output_comm(batch, result)
 
@@ -381,7 +381,7 @@ class SchedulerBatchResultProcessor:
                 embeddings = [tensor.tolist() for tensor in embeddings]
         return embeddings
 
-    def _move_logprobs_to_cpu(
+    def move_logprobs_to_cpu(
         self,
         *,
         batch: ScheduleBatch,
@@ -549,12 +549,12 @@ class SchedulerBatchResultProcessor:
             logprob_pt += num_input_logprobs
         return logprob_pt
 
-    def _resolve_spec_overlap_tokens(
+    def _resolve_spec_v2_tokens(
         self,
         result: GenerationBatchResult,
         batch: ScheduleBatch,
     ) -> List[List[int]]:
-        """Resolve the padding next token ids for speculative decoding with overlap."""
+        """Resolve the padded next token ids for spec-v2 (overlap and non-overlap)."""
         assert result.next_token_ids.is_cpu
         assert result.accept_lens.is_cpu
 
@@ -566,7 +566,9 @@ class SchedulerBatchResultProcessor:
         # Feed the adaptive controller now that accept_lens is on CPU,
         # instead of doing a synchronous GPU→CPU copy in the worker hot path.
         # BaseSpecWorker provides a no-op default for non-adaptive workers.
-        self.model_worker.on_verify_complete_cpu(result.num_correct_drafts_per_req_cpu)
+        self.model_worker.on_verify_complete_cpu(
+            result.num_correct_drafts_per_req_cpu, batch_size=len(batch.reqs)
+        )
 
         predict_tokens = []
         # In adaptive spec-v2, the worker state may already have switched when this
@@ -584,12 +586,17 @@ class SchedulerBatchResultProcessor:
                 continue
 
             if req.finished():
-                # -1 because prepare_for_decode pre-claimed the bonus slot.
-                req.kv_committed_len -= 1
+                if not batch.spec_algorithm.is_dflash():
+                    # EAGLE prepare_for_decode pre-claimed the bonus slot.
+                    req.kv_committed_len -= 1
                 continue
 
-            # -1 because prepare_for_decode pre-claimed the bonus slot.
-            req.kv_committed_len += accept_lens[i] - 1
+            if batch.spec_algorithm.is_dflash():
+                # DFLASH materialized accepted draft tokens plus the bonus token.
+                req.kv_committed_len += accept_lens[i]
+            else:
+                # EAGLE prepare_for_decode pre-claimed the bonus slot.
+                req.kv_committed_len += accept_lens[i] - 1
             req.spec_verify_ct += 1
 
             num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
@@ -673,10 +680,6 @@ class SchedulerBatchResultProcessor:
         # 减少 kernel launch 开销
         self.token_to_kv_pool_allocator.free_group_begin()
 
-        # Spec V1 在 verify 阶段已经处理了 output_ids、finish_state、grammar、reasoning；
-        # 非 spec 和 V2 则在下面统一处理。
-        is_spec_v1 = not batch.spec_algorithm.is_none() and not batch.is_spec_v2
-
         for i, req in enumerate(batch.reqs):
             req: Req
 
@@ -686,24 +689,7 @@ class SchedulerBatchResultProcessor:
             ):
                 continue
 
-            # ---- Spec V1 分支：verify 阶段已完成主要处理，这里只补收尾 ----
-            if is_spec_v1:
-                self._mamba_prefix_cache_update(req, batch, result, i)
-                req.time_stats.set_last_decode_finish_time()
-                # 请求完成时的资源回收（multi-modal feature 释放、expert/indexer 信息收集）
-                self._handle_finished_req(req, i, logits_output)
-                # 收集 hidden states（如开启）
-                if req.return_hidden_states and logits_output.hidden_states is not None:
-                    req.hidden_states.append(
-                        logits_output.hidden_states[i].cpu().clone().tolist()
-                    )
-                # 同步 grammar 结束状态
-                if req.grammar is not None:
-                    req.grammar.finished = req.finished()
-                continue
-
-            # ---- 非 Spec / Spec V2 分支：完整的 decode 后处理 ----
-            # 1. 将新生成的 token(s) 追加到 output_ids
+            # Non-spec and V2: full post-processing
             next_token_id = next_token_ids[i]
             new_accepted_len = 1
             if batch.spec_algorithm.is_none():
@@ -717,15 +703,12 @@ class SchedulerBatchResultProcessor:
             # 2. 更新推理（reasoning）token 计数（如 DeepSeek-R1 思考模式）
             self._maybe_update_reasoning_tokens(req, next_token_id)
 
-            # 3. 更新 Mamba 模型的 track 状态
-            self._mamba_prefix_cache_update(req, batch, result, i)
             req.time_stats.set_last_decode_finish_time()
 
             # 4. 检查结束条件（max_new_tokens / stop token / stop string / grammar）
             req.update_finish_state(new_accepted_len)
 
-            # 5. 处理已完成请求的资源回收
-            self._handle_finished_req(req, i, logits_output)
+            self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
 
             # 6. 可选数据收集：logprobs、hidden states、grammar
             if req.return_logprob:
@@ -771,31 +754,27 @@ class SchedulerBatchResultProcessor:
         next_token_ids: Union[torch.Tensor, List[int]],
     ) -> Tuple[Union[List[int], List[List[int]]], Optional[List[float]]]:
         next_token_logprobs = None
-        if batch.spec_algorithm.is_none() or batch.is_spec_v2:
-            if batch.is_spec_v2:
-                next_token_ids = self._resolve_spec_overlap_tokens(result, batch)
-            elif isinstance(next_token_ids, list):
-                pass  # MLX path: already a list[int], skip torch round-trip
-            else:
-                next_token_ids = next_token_ids.tolist()
+        if not batch.spec_algorithm.is_none():
+            next_token_ids = self._resolve_spec_v2_tokens(result, batch)
+        elif isinstance(next_token_ids, list):
+            pass  # MLX path: already a list[int], skip torch round-trip
+        else:
+            next_token_ids = next_token_ids.tolist()
 
-            if batch.return_logprob:
-                next_token_logprobs = logits_output.next_token_logprobs.tolist()
-                if logits_output.next_token_top_logprobs_val:
-                    logits_output.next_token_top_logprobs_val = [
-                        v.tolist() for v in logits_output.next_token_top_logprobs_val
-                    ]
-                    logits_output.next_token_top_logprobs_idx = [
-                        x.tolist() for x in logits_output.next_token_top_logprobs_idx
-                    ]
+        if batch.return_logprob:
+            next_token_logprobs = logits_output.next_token_logprobs.tolist()
+            if logits_output.next_token_top_logprobs_val:
+                logits_output.next_token_top_logprobs_val = [
+                    v.tolist() for v in logits_output.next_token_top_logprobs_val
+                ]
+                logits_output.next_token_top_logprobs_idx = [
+                    x.tolist() for x in logits_output.next_token_top_logprobs_idx
+                ]
 
-                if logits_output.next_token_token_ids_logprobs_val:
-                    logits_output.next_token_token_ids_logprobs_val = [
-                        v.tolist()
-                        for v in logits_output.next_token_token_ids_logprobs_val
-                    ]
-        # else: Spec V1 — output_ids, update_finish_state, grammar, and reasoning tokens
-        # are already handled in the verify phase (eagle_info.py / ngram_info.py).
+            if logits_output.next_token_token_ids_logprobs_val:
+                logits_output.next_token_token_ids_logprobs_val = [
+                    v.tolist() for v in logits_output.next_token_token_ids_logprobs_val
+                ]
         return next_token_ids, next_token_logprobs
 
     def _apply_decode_logprobs(
@@ -808,9 +787,8 @@ class SchedulerBatchResultProcessor:
         next_token_logprobs: list,
         logits_output: LogitsProcessorOutput,
     ) -> None:
-        # Spec v1 handles logprobs inside its own worker.
-        # Normalize: non-spec has 1 token, spec v2 has multiple.
-        if batch.is_spec_v2:
+        # Normalize: non-spec has 1 token, spec decoding has multiple.
+        if not batch.spec_algorithm.is_none():
             accepted_logprobs = next_token_logprobs[i]
             accepted_ids = next_token_id
             max_accept = len(accepted_logprobs)
@@ -851,7 +829,7 @@ class SchedulerBatchResultProcessor:
             if batch.spec_algorithm.is_none():
                 # Normal decode: single token
                 req.grammar.accept_token(next_token_id)
-            elif batch.is_spec_v2:
+            else:
                 # Speculative decode: next_token_id is a list of accepted tokens
                 for token_id in next_token_id:
                     req.grammar.accept_token(token_id)
@@ -864,23 +842,18 @@ class SchedulerBatchResultProcessor:
             self.abort_request(AbortReq(rid=req.rid))
         req.grammar.finished = req.finished()
 
-    def _handle_finished_req(
+    def _handle_finish_state_updated_req(
         self,
         req: Req,
+        batch: ScheduleBatch,
+        result: GenerationBatchResult,
         i: int,
         logits_output: LogitsProcessorOutput,
     ):
-        """请求完成时的统一后处理入口。
+        # Called here (after update_finish_state) so req.finished() is valid
+        # for mamba_lazy_post_decode_at_boundary inside.
+        self._mamba_prefix_cache_update(req, batch, result, i)
 
-        根据是否启用 disaggregation decode offload 走两条路径：
-        1. offload 模式：将 KV 异步搬迁到 CPU，搬迁完成后回调 release_kv_cache
-        2. 普通模式：直接释放 KV cache，清理 multi-modal 特征、收集 MoE/indexer 信息
-
-        不论请求是否 finished 都调用：
-        - 未 finished 但开启了 offload：也会触发 offload（为后续 decode 腾空间）
-        - 已 finished：释放多模态输入特征（节省内存），收集 expert/indexer 信息
-        """
-        # 未完成但开启了 offload：将 KV 从 GPU 异步搬运到 CPU
         if (
             self.server_args.disaggregation_decode_enable_offload_kvcache
             and not req.finished()
@@ -909,8 +882,12 @@ class SchedulerBatchResultProcessor:
                 )
                 if callable(prepare_release):
                     prepare_release(req)
-                # 将 KV 写入 radix tree 供后续复用，然后释放内存池 slot
-                release_kv_cache(req, self.tree_cache)
+                is_insert = (
+                    req.mamba_lazy_is_insert
+                    if get_global_server_args().enable_mamba_extra_buffer_lazy()
+                    else True
+                )
+                release_kv_cache(req, self.tree_cache, is_insert=is_insert)
 
             req.time_stats.set_completion_time()
 
@@ -932,33 +909,80 @@ class SchedulerBatchResultProcessor:
         result: GenerationBatchResult,
         i: int,
     ) -> None:
-        seq_len = len(req.origin_input_ids) + len(req.output_ids) - 1
-        if req.mamba_ping_pong_track_buffer is not None:
-            mamba_track_interval = get_global_server_args().mamba_track_interval
-            if batch.spec_algorithm.is_none() and seq_len % mamba_track_interval == 0:
-                # for non-spec decode, we update mamba_last_track_seqlen at the end of each track interval
-                req.mamba_next_track_idx = (
-                    batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                        req.mamba_next_track_idx
-                    )
+        """Update mamba track state at ping-pong boundaries.
+
+        Non-lazy: swap the ping-pong index so the next forward writes to
+        the alternate slot.
+        Lazy: keep the same index (prealloc handles the swap) and run
+        post-decode cleanup to free the temporary second slot.
+        """
+        if req.mamba_ping_pong_track_buffer is None:
+            return
+
+        lazy = get_global_server_args().enable_mamba_extra_buffer_lazy()
+        at_boundary, track_seqlen = self._mamba_check_track_boundary(
+            req, batch, result, i
+        )
+
+        if not at_boundary:
+            return
+
+        req.mamba_last_track_seqlen = track_seqlen
+        if lazy:
+            self.mamba_lazy_post_decode_at_boundary(req, batch)
+        else:
+            req.mamba_next_track_idx = (
+                batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                    req.mamba_next_track_idx
                 )
-                req.mamba_last_track_seqlen = seq_len
-            elif (
-                not batch.spec_algorithm.is_none()
-                and result.num_correct_drafts_per_req_cpu is not None
-            ):
-                # for spec decode, update mamba_last_track_seqlen if this iteration crosses a track interval
-                actual_seq_len = req.seqlen - 1
-                if (
-                    actual_seq_len // mamba_track_interval
-                    != (actual_seq_len - result.num_correct_drafts_per_req_cpu[i] - 1)
-                    // mamba_track_interval
-                ):
-                    req.mamba_next_track_idx = (
-                        batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                            req.mamba_next_track_idx
-                        )
-                    )
-                    req.mamba_last_track_seqlen = (
-                        actual_seq_len // mamba_track_interval * mamba_track_interval
-                    )
+            )
+
+    def _mamba_check_track_boundary(self, req, batch, result, i):
+        """Check if this decode step crosses a mamba track interval boundary.
+
+        Returns (at_boundary, track_seqlen).  The boundary condition
+        matches what the forward's tracking mask used:
+        ``prepare_for_decode`` increments both ``seq_lens_cpu`` and
+        ``kv_committed_len`` by 1, then checks
+        ``seq_lens_cpu % interval == 0``.  Using ``kv_committed_len``
+        here reproduces that check exactly, and the value is always a
+        multiple of ``interval`` (hence page-aligned).
+
+        For spec decode, the boundary is detected by comparing the
+        accepted seq_len range against interval boundaries.
+        """
+        interval = get_global_server_args().mamba_track_interval
+
+        if batch.spec_algorithm.is_none():
+            if req.kv_committed_len % interval == 0:
+                return True, req.kv_committed_len
+        elif result.num_correct_drafts_per_req_cpu is not None:
+            cur = req.seqlen - 1
+            prev = cur - result.num_correct_drafts_per_req_cpu[i] - 1
+            if cur // interval != prev // interval:
+                return True, cur // interval * interval
+
+        return False, 0
+
+    def mamba_lazy_post_decode_at_boundary(self, req: Req, batch: ScheduleBatch):
+        """Post-decode cleanup at a lazy-mode track boundary.
+
+        Finished reqs: if prealloc failed (other slot is -1), the forward
+        overwrote the only slot with corrupted state, so mark
+        is_insert=False to skip the cache insert.  If the other slot is
+        occupied (stale prealloc from an overlap extra forward), free it
+        so the prealloc assert in the next prepare_for_decode holds.
+
+        Running reqs: free the old ping-pong slot so we go back to
+        holding only 1 slot until the next boundary.
+        """
+        other_idx = 1 - req.mamba_next_track_idx
+        other_val = req.mamba_ping_pong_track_buffer[other_idx].item()
+        if other_val != -1:
+            pool = batch.req_to_token_pool
+            pool.mamba_allocator.free(
+                req.mamba_ping_pong_track_buffer[other_idx].unsqueeze(0)
+            )
+            pool.set_mamba_ping_pong_slot(req, other_idx, -1)
+        elif req.finished():
+            req.mamba_lazy_is_insert = False

@@ -28,6 +28,7 @@ import torch
 from numpy import float64
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -43,7 +44,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.events import KVCacheEventMixin
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.utils import split_node_hash_value
 
 if TYPE_CHECKING:
@@ -101,7 +101,7 @@ class TreeNode:
     def backuped(self):
         return self.host_value is not None
 
-    def __lt__(self, other: "TreeNode"):
+    def __lt__(self, other: TreeNode):
         return self.last_access_time < other.last_access_time
 
 
@@ -341,7 +341,7 @@ class LRUList:
         return evictable_size
 
     # Note: this is expensive, only use for debug or idle check
-    def sanity_check(self, tree_cache: "SWARadixCache"):
+    def sanity_check(self, tree_cache: SWARadixCache):
         """
         Check if the lru list is valid by rebuilding the lru list from the tree, heapifying it, and
         checking if the lru list is valid.
@@ -604,7 +604,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.disable:
             # 直接取 req_to_token_pool 中该请求的全部 KV slot 索引
             kv_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : len(req.fill_ids)
+                req.req_pool_idx, : req.fill_len
             ]
 
             # 存入 prefix_indices，下一 chunk 直接用，不查 radix tree
@@ -612,12 +612,7 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
             req.prefix_indices = kv_indices
             return
 
-        # ═══════════════════════════════════════════════════════════════
-        # disable=False（radix cache 启用）的路径
-        # 目标: 把当前计算的 KV 插入 radix tree，让后续请求可以匹配；同时更新请求的锁。
-        # ═══════════════════════════════════════════════════════════════
-
-        token_ids = req.fill_ids
+        token_ids = req.get_fill_ids()
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]

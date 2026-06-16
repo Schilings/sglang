@@ -70,6 +70,7 @@ from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
+    EvictParams,
     MatchPrefixParams,
     zero_match_result,
 )
@@ -77,6 +78,8 @@ from sglang.srt.mem_cache.common import (
     alloc_for_decode,
     alloc_for_extend,
     evict_from_tree_cache,
+    free_swa_out_of_window_slots,
+    get_alloc_reserve_per_decode,
     release_kv_cache,
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -409,7 +412,7 @@ class MultimodalProcessorOutput:
     token_type_ids: Optional[torch.Tensor] = None
 
     @staticmethod
-    def from_dict(d: dict) -> "MultimodalProcessorOutput":
+    def from_dict(d: dict) -> MultimodalProcessorOutput:
         return MultimodalProcessorOutput(
             mm_items=d["mm_items"],
             input_ids=d.get("input_ids"),
@@ -492,7 +495,7 @@ class MultimodalInputs:
             item.feature = None
 
     @staticmethod
-    def from_processor_output(obj: "MultimodalProcessorOutput"):
+    def from_processor_output(obj: MultimodalProcessorOutput):
         mm_items = obj.mm_items
         assert isinstance(mm_items, list)
         mm_items = [item for item in mm_items if item.is_valid()]
@@ -572,6 +575,25 @@ class MultimodalInputs:
 
     def contains_mm_input(self) -> bool:
         return any(True for item in self.mm_items if item.is_valid())
+
+    def compute_mm_token_counts(self) -> Tuple[int, int, int]:
+        """Count prompt tokens consumed by each modality (image, audio, video).
+
+        A modality's token count is the total span covered by its items'
+        offsets. Returns a (image_tokens, audio_tokens, video_tokens) tuple.
+        """
+        image_tokens = audio_tokens = video_tokens = 0
+        for item in self.mm_items:
+            if not item.offsets:
+                continue
+            num_tokens = sum(end - start + 1 for start, end in item.offsets)
+            if item.is_image():
+                image_tokens += num_tokens
+            elif item.is_audio():
+                audio_tokens += num_tokens
+            elif item.is_video():
+                video_tokens += num_tokens
+        return image_tokens, audio_tokens, video_tokens
 
     def merge(self, other: MultimodalInputs):
         """
@@ -683,16 +705,22 @@ class Req(ReqDllmMixin):
     ):
         # Input and output info
         self.rid = rid
-        self.origin_input_ids = array("q", origin_input_ids)
+        self.origin_input_ids = origin_input_ids
         self.origin_input_ids_unpadded = (
-            array("q", origin_input_ids_unpadded)
+            origin_input_ids_unpadded
             if origin_input_ids_unpadded
             else self.origin_input_ids
         )  # Before image padding
-        # Each decode stage's output ids
+        # Each decode stage's output ids. Append-only by contract:
+        # _refresh_fill_ids infers how many output tokens are already in
+        # full_untruncated_fill_ids from lengths alone, so in-place rewrites
+        # that preserve length would silently corrupt fill_ids.
         self.output_ids = array("q")
-        # fill_ids = origin_input_ids + output_ids. Updated if chunked.
-        self.fill_ids = array("q")
+        # Full untruncated sequence: origin + output (+ DLLM mask block).
+        # Kept in sync by _refresh_fill_ids; admission only updates fill_len,
+        # never mutates this array's length.
+        self.full_untruncated_fill_ids = array("q")
+        self.fill_len: int = 0
 
         self.session = session
         self.input_embeds = input_embeds
@@ -775,6 +803,9 @@ class Req(ReqDllmMixin):
         self.mamba_cow_src_index: Optional[torch.Tensor] = None
         # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
         self.mamba_needs_clear: bool = False
+        # Lazy extra buffer: skip radix cache insert when prealloc failed at
+        # boundary — the forward overwrites the only slot, corrupting the state.
+        self.mamba_lazy_is_insert: bool = True
 
         # Check finish
         self.tokenizer = None
@@ -807,6 +838,11 @@ class Req(ReqDllmMixin):
 
         # For multimodal inputs
         self.multimodal_inputs: Optional[MultimodalInputs] = None
+        # Pre-computed multimodal prompt token counts; populated on the prefill
+        # node and transferred to decode via the metadata buffer in disagg (PD) mode.
+        self.mm_image_tokens: int = 0
+        self.mm_audio_tokens: int = 0
+        self.mm_video_tokens: int = 0
 
         # Prefix info
         # The indices to kv cache for the shared prefix.
@@ -819,7 +855,15 @@ class Req(ReqDllmMixin):
         self.last_node: Any = None
         self.last_host_node: Any = None
         self.best_match_node: Any = None
+        # Per-component host hit lengths split off from host_hit_length:
         self.host_hit_length = 0
+        self.swa_host_hit_length = 0
+        self.mamba_host_hit_length = 0
+        # Total cached prefix length (on-device prefix_indices + host_hit_length),
+        # capped at the max allowed prefix. Set during prefix matching at schedule
+        # time and used to estimate uncached tokens / sort by longest prefix for
+        # load reporting.
+        self.num_matched_prefix_tokens = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
         # The node to lock until for swa radix tree lock ref
@@ -954,8 +998,8 @@ class Req(ReqDllmMixin):
         # the start index of the sent kv cache
         # We want to send it chunk by chunk for chunked prefill.
         # After every chunk forward, we do the following:
-        # kv_send(req.input_ids[req.start_send_idx:len(req.fill_ids)])
-        # start_send_idx = len(req.fill_ids)
+        # kv_send(req.input_ids[req.start_send_idx:req.fill_len])
+        # start_send_idx = req.fill_len
         self.start_send_idx: int = 0
 
         # For overlap schedule, we delay the kv transfer until `process_batch_result_disagg_prefill` rather than `process_prefill_chunk` in non-overlap
@@ -999,6 +1043,14 @@ class Req(ReqDllmMixin):
         if self.finished_len is not None:
             return self.output_ids[: self.finished_len]
         return self.output_ids
+
+    def needs_host_load_back(self) -> bool:
+        """Whether any cache layer has a host hit that needs L2 H2D load_back."""
+        return (
+            self.host_hit_length > 0
+            or self.swa_host_hit_length > 0
+            or self.mamba_host_hit_length > 0
+        )
 
     def _cache_commit_len(self) -> int:
         """计算实际需要提交（commit）的 KV cache 长度。
@@ -1059,6 +1111,30 @@ class Req(ReqDllmMixin):
         # Whether request reached finished condition
         return self.finished_reason is not None
 
+    def get_fill_ids(self) -> array:
+        return self.full_untruncated_fill_ids[: self.fill_len]
+
+    def _refresh_fill_ids(self) -> None:
+        """Keep full_untruncated_fill_ids == origin_input_ids + output_ids by
+        appending only the new output tokens.
+
+        Falls back to a full rebuild when the in-place append is invalid:
+        - aliasing: scheduler_pp_mixin assigns full_untruncated_fill_ids =
+          origin_input_ids directly, so extending in place would write output
+          tokens into the origin;
+        - lengths disagree: fresh req (array still empty), retraction
+          (output_ids reset to empty), or set_finish_with_abort (origin
+          replaced by a 1-token stub).
+        """
+        n_have_output = len(self.full_untruncated_fill_ids) - len(self.origin_input_ids)
+        if (
+            self.full_untruncated_fill_ids is not self.origin_input_ids
+            and 0 <= n_have_output <= len(self.output_ids)
+        ):
+            self.full_untruncated_fill_ids.extend(self.output_ids[n_have_output:])
+        else:
+            self.full_untruncated_fill_ids = self.origin_input_ids + self.output_ids
+
     def init_next_round_input(
         self,
         tree_cache: Optional[BasePrefixCache] = None,
@@ -1075,9 +1151,9 @@ class Req(ReqDllmMixin):
             self._init_fill_ids_for_dllm()
             self.determine_dllm_phase()
         else:
-            self.fill_ids = self.origin_input_ids + self.output_ids
+            self._refresh_fill_ids()
 
-        input_len = len(self.fill_ids)
+        input_len = len(self.full_untruncated_fill_ids)
 
         # Streaming sessions reuse committed KV from the session slot, so
         # custom logprob_start_len is not supported — override to -1.
@@ -1095,14 +1171,16 @@ class Req(ReqDllmMixin):
             )
             self.logprob_start_len = -1
 
-        # 1. prompt输入，最多匹配的prefix长度为len(prompt)-1
-        # 2. 如果需要计算logprobs，则最多匹配的prefix长度为logprob_start_len，因为后面开始需要参与计算得到logprobs
-        token_ids_to_match = self.fill_ids[: self._compute_max_prefix_len(input_len)]
+        # Pass the full array with a raw-token cap (limit) instead of slicing,
+        # avoiding an O(context) copy per prefill-batch build.
+        token_ids_to_match = self.full_untruncated_fill_ids
+        key_limit: Optional[int] = self._compute_max_prefix_len(input_len)
 
         # Disable prefix caching when embed overrides are present: same token IDs
         # with different override vectors must not share cached KV values.
         if self.positional_embed_overrides is not None:
             token_ids_to_match = array("q")
+            key_limit = None
 
         if tree_cache is not None:
             if cow_mamba is None:
@@ -1111,7 +1189,9 @@ class Req(ReqDllmMixin):
             match_result = tree_cache.match_prefix(
                 MatchPrefixParams(
                     key=RadixKey(
-                        token_ids=token_ids_to_match, extra_key=self.extra_key
+                        token_ids=token_ids_to_match,
+                        extra_key=self.extra_key,
+                        limit=key_limit,
                     ),
                     req=self,
                     cow_mamba=cow_mamba,
@@ -1125,6 +1205,8 @@ class Req(ReqDllmMixin):
                 self.last_host_node,
                 self.best_match_node,
                 self.host_hit_length,
+                self.swa_host_hit_length,
+                self.mamba_host_hit_length,
                 self.mamba_branching_seqlen,
             ) = (
                 match_result.device_indices,
@@ -1132,6 +1214,8 @@ class Req(ReqDllmMixin):
                 match_result.last_host_node,
                 match_result.best_match_node,
                 match_result.host_hit_length,
+                match_result.swa_host_hit_length,
+                match_result.mamba_host_hit_length,
                 match_result.mamba_branching_seqlen,
             )
             if match_result.cache_protected_len is not None:
@@ -1157,8 +1241,7 @@ class Req(ReqDllmMixin):
                 )
             )
 
-        # extend_input_len表示除了prefix的部分，即除了prefix的token
-        self.set_extend_input_len(len(self.fill_ids) - len(self.prefix_indices))
+        self.set_extend_input_len(input_len - len(self.prefix_indices))
 
     def _compute_max_prefix_len(self, input_len: int) -> int:
         # NOTE: the matched length is at most 1 less than the input length to enable logprob computation
@@ -1190,7 +1273,18 @@ class Req(ReqDllmMixin):
 
         return self.surr_and_decode_ids, self.read_offset - self.surr_offset
 
-    def tail_str(self) -> str:
+    def _stop_match_tail_len(self, new_accepted_len: int) -> int:
+        max_len_tail_str = max(
+            self.sampling_params.stop_str_max_len + 1,
+            self.sampling_params.stop_regex_max_len + 1,
+        )
+        # Cover all newly accepted tokens so an early stop string is not missed
+        # when speculative decoding accepts multiple tokens per step.
+        return min(
+            max_len_tail_str + max(new_accepted_len - 1, 0), len(self.output_ids)
+        )
+
+    def tail_str(self, new_accepted_len: int = 1) -> str:
         # Check stop strings and stop regex patterns together
         if (
             len(self.sampling_params.stop_strs) == 0
@@ -1198,12 +1292,7 @@ class Req(ReqDllmMixin):
         ):
             return ""
 
-        max_len_tail_str = max(
-            self.sampling_params.stop_str_max_len + 1,
-            self.sampling_params.stop_regex_max_len + 1,
-        )
-
-        tail_len = min(max_len_tail_str, len(self.output_ids))
+        tail_len = self._stop_match_tail_len(new_accepted_len)
         return self.tokenizer.decode(self.output_ids[-tail_len:])
 
     def check_match_stop_str_prefix(self) -> bool:
@@ -1259,18 +1348,51 @@ class Req(ReqDllmMixin):
 
         return False
 
-    def _check_str_based_finish(self):
+    def _locate_str_stop_finished_len(
+        self,
+        new_accepted_len: int,
+        *,
+        stop_str: Optional[str] = None,
+        stop_regex: Optional[str] = None,
+    ) -> int:
+        """Map a matched stop string/regex to output_ids length (stop included)."""
+
+        def matched(text: str) -> bool:
+            if stop_str is not None:
+                return stop_str in text
+            return re.search(stop_regex, text) is not None
+
+        tail_len = self._stop_match_tail_len(new_accepted_len)
+        start = len(self.output_ids) - tail_len
+        token_window = self.output_ids[start:]
+
+        # Old prefixes were checked in the previous step.
+        for token_count in range(
+            max(1, len(token_window) - new_accepted_len + 1), len(token_window)
+        ):
+            if matched(self.tokenizer.decode(token_window[:token_count])):
+                return start + token_count
+
+        # The full tail window is already known to match by the caller.
+        return len(self.output_ids)
+
+    def _check_str_based_finish(self, new_accepted_len: int = 1):
         if (
             len(self.sampling_params.stop_strs) > 0
             or len(self.sampling_params.stop_regex_strs) > 0
         ):
-            tail_str = self.tail_str()
+            tail_str = self.tail_str(new_accepted_len)
 
             # Check stop strings
             if len(self.sampling_params.stop_strs) > 0:
                 for stop_str in self.sampling_params.stop_strs:
-                    if stop_str in tail_str or stop_str in self.decoded_text:
+                    stop_str_in_tail = stop_str in tail_str
+                    if stop_str_in_tail or stop_str in self.decoded_text:
                         self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
+                        if stop_str_in_tail:
+                            self.finished_len = self._locate_str_stop_finished_len(
+                                new_accepted_len, stop_str=stop_str
+                            )
                         return True
 
             # Check stop regex
@@ -1280,13 +1402,16 @@ class Req(ReqDllmMixin):
                         self.finished_reason = FINISHED_MATCHED_REGEX(
                             matched=stop_regex_str
                         )
+                        self.finished_len = self._locate_str_stop_finished_len(
+                            new_accepted_len, stop_regex=stop_regex_str
+                        )
                         return True
 
         return False
 
     def _check_vocab_boundary_finish(self, new_accepted_tokens: List[int] = None):
         for i, token_id in enumerate(new_accepted_tokens):
-            if token_id > self.vocab_size or token_id < 0:
+            if token_id >= self.vocab_size or token_id < 0:
                 offset = len(self.output_ids) - len(new_accepted_tokens) + i
                 if self.sampling_params.stop_token_ids:
                     self.output_ids[offset] = next(
@@ -1351,8 +1476,7 @@ class Req(ReqDllmMixin):
         if self._check_vocab_boundary_finish(new_accepted_tokens):
             return
 
-        # 生成文本中包含 stop string
-        if self._check_str_based_finish():
+        if self._check_str_based_finish(new_accepted_len):
             return
 
     def reset_for_retract(self):
@@ -1365,6 +1489,7 @@ class Req(ReqDllmMixin):
         self.indexer_topk = None
         self.last_node = None
         self.cache_protected_len = 0
+        self.num_matched_prefix_tokens = 0
         self.swa_uuid_for_lock = None
         self.swa_prefix_lock_released = False
         self.extend_input_len = 0
@@ -1390,6 +1515,7 @@ class Req(ReqDllmMixin):
         self.swa_evicted_seqlen = 0
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
+        self.fill_len = 0
 
         # When using input_embeds, we cannot easily mix the original input embeddings
         # with the newly generated output token IDs during re-prefill of retracted request.
@@ -1448,7 +1574,7 @@ class Req(ReqDllmMixin):
         # - extend_input_len: Number of tokens that need to be processed in this extend batch
         self.extend_input_len = extend_input_len
         if self.logprob_start_len == -1:
-            logprob_start_len = len(self.fill_ids)
+            logprob_start_len = len(self.full_untruncated_fill_ids)
         else:
             # logprob_start_len should be at least the length of the prefix indices
             logprob_start_len = max(self.logprob_start_len, len(self.prefix_indices))
@@ -1532,15 +1658,68 @@ def set_mamba_track_indices_from_reqs(batch):
     )
 
 
+def release_req(
+    *,
+    req: Req,
+    remaing_req_count: int,
+    server_args: ServerArgs,
+    req_to_token_pool: ReqToTokenPool,
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+    tree_cache: BasePrefixCache,
+    hisparse_coordinator: Optional[HiSparseCoordinator],
+) -> None:
+    if hisparse_coordinator is not None and not req.finished():
+        hisparse_coordinator.retract_req(req)
+
+    if server_args.disaggregation_mode == "decode":
+        req.offload_kv_cache(req_to_token_pool, token_to_kv_pool_allocator)
+    # TODO (csy): for preempted requests, we may want to insert into the tree
+    release_kv_cache(req, tree_cache, is_insert=False)
+    # NOTE(lsyin): we should use the newly evictable memory instantly.
+    num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
+    evict_from_tree_cache(tree_cache, num_tokens)
+
+    req.reset_for_retract()
+
+
+def retract_all(
+    *,
+    reqs: List[Req],
+    server_args: ServerArgs,
+    req_to_token_pool: ReqToTokenPool,
+    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
+    tree_cache: BasePrefixCache,
+    hisparse_coordinator: Optional[HiSparseCoordinator],
+) -> List[Req]:
+    retracted_reqs = reqs
+    for idx in range(len(reqs)):
+        release_req(
+            req=reqs[idx],
+            remaing_req_count=len(reqs) - idx,
+            server_args=server_args,
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            tree_cache=tree_cache,
+            hisparse_coordinator=hisparse_coordinator,
+        )
+    return retracted_reqs
+
+
 def _compute_chunked_req_next_prompt_token(
     chunked_req: Optional[Req],
+    vocab_size: int,
 ) -> Optional[int]:
+    """Return the next real prompt token after the fill boundary, skipping
+    multimodal placeholder (hash) tokens that lie outside the model vocab."""
     if chunked_req is None:
         return None
-    fill_len = len(chunked_req.fill_ids)
-    if fill_len >= len(chunked_req.origin_input_ids):
+    fill_len = chunked_req.fill_len
+    origin_ids = chunked_req.origin_input_ids
+    if fill_len >= len(origin_ids):
         return None
-    return int(chunked_req.origin_input_ids[fill_len])
+    if origin_ids[fill_len] < vocab_size:
+        return int(origin_ids[fill_len])
+    return None
 
 
 @dataclasses.dataclass
@@ -1664,6 +1843,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     is_extend_in_batch: bool = False
     all_extend_in_batch: bool = False  # plumbing for downstream forks (PR #19639)
     can_run_dp_cuda_graph: bool = False
+    can_run_dp_breakable_cuda_graph: bool = False
     tbo_split_seq_index: Optional[int] = None
 
     # For processing logprobs
@@ -1759,7 +1939,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
             chunked_req_next_prompt_token=_compute_chunked_req_next_prompt_token(
-                chunked_req
+                chunked_req,
+                model_config.vocab_size,
             ),
             dllm_config=dllm_config,
         )
@@ -1922,12 +2103,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # ── 2. 收集各请求的元数据 ──
         reqs = self.reqs
-        # 每个请求本次要计算的 token ids（去掉已匹配的 prefix 部分）
-        input_ids = [r.fill_ids[len(r.prefix_indices) :] for r in reqs]
+        input_ids = [r.get_fill_ids()[len(r.prefix_indices) :] for r in reqs]
         extend_num_tokens = sum(len(ids) for ids in input_ids)
-        # 各请求维度参数: [seq_len, prompt总长, prefix长度, 本次extend长度]
-        seq_lens = [len(r.fill_ids) for r in reqs]
-        orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
+        seq_lens = [r.fill_len for r in reqs]
+        orig_seq_lens = [max(r.fill_len, len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
         extend_lens = [r.extend_input_len for r in reqs]
 
@@ -1979,7 +2158,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             # 5a. 提取 input_embeds（如果有）
             if req.input_embeds is not None:
-                # PrefillAdder 截断 fill_ids 但不管 input_embeds，手动切片对齐
+                # Slice to match extend_input_len — PrefillAdder truncates
+                # fill_len/extend_input_len on chunk overflow but not input_embeds.
                 input_embeds.extend(
                     req.input_embeds[pre_len : pre_len + req.extend_input_len]
                 )
@@ -2036,13 +2216,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             # 5e. 收集 input logprob 所需的 token ids
             if self.return_logprob:
-                # 需要"下一个 token" 来计算当前 token 的 logprob:
-                #   fill_ids = [1, 2], origin_input_ids = [1, 2, 3, 4]
-                #   → extend_input_logprob_token_id = [2, 3]（shift 1）
-                # 超出 origin_input_ids 的用 0 补齐
+                # Find input logprob token ids.
+                # First, find a global index within origin_input_ids and slide it by 1
+                # to compute input logprobs. It is because you need the next token
+                # to compute input logprobs. E.g., (chunk size 2)
+                #
+                # input_logprobs = [1, 2, 3, 4]
+                # get_fill_ids() = [1, 2]
+                # extend_input_logprob_token_id = [2, 3]
+                #
+                # Note that it can also overflow. In this case, we pad it with 0.
+                # input_logprobs = [1, 2, 3, 4]
+                # get_fill_ids() = [3, 4]
+                # extend_input_logprob_token_id = [4, 0]
                 global_start_idx, global_end_idx = (
                     len(req.prefix_indices),
-                    len(req.fill_ids),
+                    req.fill_len,
                 )
                 if req.logprob_start_len == -1:
                     logprob_start_len = len(req.origin_input_ids)
@@ -2152,7 +2341,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def _mamba_radix_cache_v2_req_prepare_for_extend(
         self,
         req: Req,
-    ) -> "_MambaRadixCacheV2TrackEntry":
+    ) -> _MambaRadixCacheV2TrackEntry:
         mamba_cache_chunk_size = get_global_server_args().mamba_cache_chunk_size
 
         def _force_track_h(i: int) -> int:
@@ -2201,11 +2390,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
                 mamba_track_seqlen = _force_track_h(mamba_track_seqlen_aligned)
 
-            req.mamba_next_track_idx = (
-                self.req_to_token_pool.get_mamba_ping_pong_other_idx(
-                    req.mamba_next_track_idx
+            # In lazy mode, skip the swap — the second ping-pong slot is not
+            # allocated yet; it will be allocated on demand at the track boundary
+            # in mamba_lazy_prealloc_at_boundary during prepare_for_decode.
+            if not get_global_server_args().enable_mamba_extra_buffer_lazy():
+                req.mamba_next_track_idx = (
+                    self.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                        req.mamba_next_track_idx
+                    )
                 )
-            )
             if req.mamba_branching_seqlen is not None:
                 # track branching point in this forward if the branching point
                 # is within the current extend batch.
@@ -2257,12 +2450,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # For split prefill, we need to set the forward mode to SPLIT_PREFILL
         self.forward_mode = ForwardMode.SPLIT_PREFILL
 
-    def mix_with_running(self, running_batch: "ScheduleBatch"):
+    def mix_with_running(self, running_batch: ScheduleBatch):
         self.forward_mode = ForwardMode.MIXED
         running_bs = running_batch.batch_size()
 
         for req in running_batch.reqs:
-            req.fill_ids = req.origin_input_ids + req.output_ids
+            req._refresh_fill_ids()
+            req.fill_len = len(req.full_untruncated_fill_ids)
             req.set_extend_input_len(1)
 
         # Decode tokens of the running portion live in future_map.output_tokens_buf.
@@ -2303,34 +2497,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             new_pages = sum(1 for r in requests if r.kv_committed_len % page_size == 0)
             return new_pages * page_size
 
-        if self.is_spec_v2:
-            return self._new_tokens_required_next_decode_spec_v2(requests, page_size)
-
-        server_args = get_global_server_args()
-        len_per_topk = server_args.speculative_num_steps or 1
-        spec_topk = server_args.speculative_eagle_topk or 1
-        spec_tokens = server_args.speculative_num_draft_tokens
-
-        if page_size > 1 and spec_topk > 1:
-            # last partial page and ceil alignment
-            len_per_topk = ceil_align(len_per_topk + page_size, page_size)
-            spec_tokens = ceil_align(spec_tokens, page_size)
-        elif page_size > 1:
-            # only page alignment
-            len_per_topk = ceil_align(len_per_topk, page_size)
-            spec_tokens = ceil_align(spec_tokens, page_size)
-
-        num_tokens = max(len_per_topk * spec_topk, spec_tokens) * len(requests)
-        return num_tokens
+        return self._new_tokens_required_next_decode_spec_v2(requests, page_size)
 
     def _new_tokens_required_next_decode_spec_v2(self, requests, page_size):
         """Tight estimate matching eagle_info_v2.prepare_for_decode allocation."""
-        from sglang.srt.managers.utils import get_alloc_len_per_decode
-
-        alloc_len = get_alloc_len_per_decode()
+        reserve = get_alloc_reserve_per_decode()
         total = 0
         for r in requests:
-            x = max(0, r.kv_committed_len + 2 * alloc_len - r.kv_allocated_len)
+            x = max(0, r.kv_committed_len + reserve - r.kv_allocated_len)
             cur = r.kv_allocated_len
             nxt = cur + x
             total += ceil_align(nxt, page_size) - ceil_align(cur, page_size)
@@ -2342,11 +2516,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return self.token_to_kv_pool_allocator.available_size() >= num_tokens
 
     def retract_all(self, server_args: ServerArgs):
-        retracted_reqs = self.reqs
-        for idx in range(len(self.reqs)):
-            self.release_req(idx, len(self.reqs) - idx, server_args)
-
-        self.filter_batch(retracted_reqs)
+        retracted_reqs = retract_all(
+            reqs=self.reqs,
+            server_args=server_args,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
+            hisparse_coordinator=self.hisparse_coordinator,
+        )
+        self.reqs = []
         return retracted_reqs
 
     def retract_decode(
@@ -2424,24 +2602,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         return retracted_reqs, new_estimate_ratio, reqs_to_abort
 
     def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
-        req = self.reqs[idx]
-
-        if self.hisparse_coordinator is not None and not req.finished():
-            self.hisparse_coordinator.retract_req(req)
-
-        if server_args.disaggregation_mode == "decode":
-            req.offload_kv_cache(
-                self.req_to_token_pool, self.token_to_kv_pool_allocator
-            )
-        # TODO (csy): for preempted requests, we may want to insert into the tree
-        # is_insert=False，表示释放资源，且不插入到前缀数上，即不留着给其他请求匹配prefix
-        release_kv_cache(req, self.tree_cache, is_insert=False)
-        # NOTE(lsyin): we should use the newly evictable memory instantly.
-        num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
-        evict_from_tree_cache(self.tree_cache, num_tokens)
-
-        # 回退该请求，is_retracted = True
-        req.reset_for_retract()
+        release_req(
+            req=self.reqs[idx],
+            remaing_req_count=remaing_req_count,
+            server_args=server_args,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
+            hisparse_coordinator=self.hisparse_coordinator,
+        )
 
     def prepare_encoder_info_decode(self):
         # Reset the encoder cached status
@@ -2464,12 +2633,37 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.model_config.vocab_size,
         )
 
-    @property
-    def is_spec_v2(self):
-        # FIXME: finally deprecate is_spec_v2
-        ret = self.enable_overlap and not self.spec_algorithm.is_none()
-        assert not ret or self.spec_algorithm.supports_spec_v2()
-        return ret
+    def mamba_lazy_prealloc_at_boundary(self, mamba_track_interval: int):
+        """Allocate a temporary second ping-pong slot for reqs at a track boundary.
+
+        In lazy mode each request normally holds only 1 ping-pong slot.
+        When seq_len hits a track interval boundary, we allocate the
+        second slot so the forward pass can write the new tracked state
+        there. The old slot is freed after the forward in
+        mamba_lazy_post_decode_at_boundary.
+        """
+        pool = self.req_to_token_pool
+        for i, req in enumerate(self.reqs):
+            buf = req.mamba_ping_pong_track_buffer
+            assert buf is not None
+            # Skip reqs not at a track boundary
+            if self.seq_lens_cpu[i].item() % mamba_track_interval != 0:
+                continue
+            other_idx = 1 - req.mamba_next_track_idx
+            if buf[other_idx].item() != -1:
+                # With overlap the previous forward's post-processing
+                # (which frees this slot) hasn't run yet. Skip.
+                continue
+            if envs.SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL.get():
+                new_slot = None
+            else:
+                new_slot = pool.mamba_allocator.alloc(1)
+                if new_slot is None:
+                    self.tree_cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+                    new_slot = pool.mamba_allocator.alloc(1)
+            if new_slot is not None:
+                pool.set_mamba_ping_pong_slot(req, other_idx, new_slot[0])
+                req.mamba_next_track_idx = other_idx
 
     def prepare_for_decode(self):
         """为 decode 阶段的 forward pass 准备 batch。
@@ -2496,16 +2690,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
             self.attn_cp_metadata = None
 
-        # ---- Step 2: Speculative Decode 处理 ----
-        if self.is_spec_v2:
-            # Spec V2（Eagle）：draft_input 中包含 draft model 需要的信息，
-            # 在此处做 decode 前的预处理
+        if not self.spec_algorithm.is_none():
+            # Spec decoding: the draft input owns decode preparation
+            # (allocation, pre-claim, seq-lens bookkeeping).
             draft_input: EagleDraftInput = self.spec_info
             draft_input.prepare_for_decode(self)
-
-        if not self.spec_algorithm.is_none():
-            # Spec V1 / 非 Eagle V2：batch 的最终准备在
-            # forward_batch_speculative_generation 中 draft model 跑完后进行
             return
 
         # ---- Step 3: 更新 frequency/presence penalty ----
@@ -2570,16 +2759,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
         if get_global_server_args().enable_mamba_extra_buffer():
+            mamba_track_interval = get_global_server_args().mamba_track_interval
+
             if len(self.reqs) == 0:
                 self.mamba_track_indices = torch.empty(
                     (0,), dtype=torch.int64, device=self.device
                 )
             else:
+                if get_global_server_args().enable_mamba_extra_buffer_lazy():
+                    self.mamba_lazy_prealloc_at_boundary(mamba_track_interval)
                 set_mamba_track_indices_from_reqs(self)
 
             # 异步 H2D：将 track_mask 从 CPU 传到 GPU
             self.mamba_track_mask = (
-                (self.seq_lens_cpu % get_global_server_args().mamba_track_interval == 0)
+                (self.seq_lens_cpu % mamba_track_interval == 0)
                 .pin_memory()
                 .to(device=self.device, non_blocking=True)
             )
@@ -2588,8 +2781,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self,
         chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
         keep_indices: Optional[List[int]] = None,
-        # FIXME(lsyin): deprecate this API after spec v1 is deprecated
-        v1_spec_info_filtered: Optional[bool] = False,
     ):
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
@@ -2656,18 +2847,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.has_grammar = any(req.grammar for req in self.reqs)
 
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
-        # NOTE: spec_info filtered before batch filtering only happens in:
-        # - Spec v1's verify phase
-        # - Only for decode batch (running_batch)
-        has_been_filtered = v1_spec_info_filtered and not self.is_spec_v2
-
         if self.spec_info:
             self.spec_info.filter_batch(
                 new_indices=keep_indices_device,
-                has_been_filtered=has_been_filtered,
+                has_been_filtered=False,
             )
 
-    def merge_batch(self, other: "ScheduleBatch"):
+    def merge_batch(self, other: ScheduleBatch):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
         # orchestrator.merge() depends on Batch.reqs during preparation of each penalizers, so it
         # needs to be called with pre-merged Batch.reqs.
@@ -2739,9 +2925,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_logprob=self.return_logprob,
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,
+            spec_info=self.spec_info,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
+            can_run_dp_breakable_cuda_graph=self.can_run_dp_breakable_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,
             all_extend_in_batch=self.all_extend_in_batch,
             #Batch：表示Bacth内是否存在一个请求的is_prefill_only为True
@@ -2851,39 +3039,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 mapping[free_slots] = 0  → 清除映射
         """
         assert self.tree_cache.supports_swa(), "prefix cache must support swa"
-        sliding_window_size = self.tree_cache.sliding_window_size
-
-        # radix cache 保护的 token 不能被回收，skip 掉
-        assert (
-            req.cache_protected_len % self.tree_cache.page_size == 0
-        ), "cache_protected_len must be page aligned"
-        req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, req.cache_protected_len)
-
-        # 计算回收边界: pre_len 往前推 (window_size + page_size)
-        # 多减 page_size 作为安全边际: 至少保留一页给 radix tree 存非 tombstone 节点
-        # 否则叶子节点变 tombstone → SWA 内存泄漏
-        if envs.SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN.get():
-            evict_threshold = pre_len - sliding_window_size                    # 不留边际
-        else:
-            evict_threshold = pre_len - sliding_window_size - self.tree_cache.page_size  # 留一页
-        new_swa_evicted_seqlen = max(
-            req.swa_evicted_seqlen,   # 已回收的位置
-            evict_threshold,          # 新计算的回收边界
+        free_swa_out_of_window_slots(
+            req,
+            pre_len,
+            sliding_window_size=self.tree_cache.sliding_window_size,
+            page_size=self.tree_cache.page_size,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
         )
-
-        # 对齐到 page 边界，保证每次回收整页
-        if self.tree_cache.page_size > 1:
-            new_swa_evicted_seqlen = (
-                new_swa_evicted_seqlen // self.tree_cache.page_size
-            ) * self.tree_cache.page_size
-
-        # 增量回收: 只回收 [上次截止点, 新边界) 之间的 slot
-        if new_swa_evicted_seqlen > req.swa_evicted_seqlen:
-            free_slots = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, req.swa_evicted_seqlen : new_swa_evicted_seqlen
-            ]                                                         # 从 req_to_token 取 full slot 索引
-            self.token_to_kv_pool_allocator.free_swa(free_slots)     # → mapping 查表 → 回收 swa → 置 0
-            req.swa_evicted_seqlen = new_swa_evicted_seqlen           # 更新截止点
 
     def __str__(self):
         return (

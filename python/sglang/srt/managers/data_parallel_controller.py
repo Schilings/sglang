@@ -167,7 +167,7 @@ class DataParallelController:
         self.load_snapshot_reader = create_load_snapshot_reader(
             server_args,
             port_args,
-            caller="dp_controller",
+            caller="DataParallelController",
         )
         self._last_refresh_time = 0.0
 
@@ -683,7 +683,11 @@ def run_data_parallel_controller_process(
 
     configure_logger(server_args)
     if server_args.enable_trace:
-        process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
+        process_tracing_init(
+            server_args.otlp_traces_endpoint,
+            "sglang",
+            trace_modules=server_args.trace_modules,
+        )
         thread_label = "DP Controller"
         if server_args.disaggregation_mode == "prefill":
             thread_label = "Prefill DP Controller"

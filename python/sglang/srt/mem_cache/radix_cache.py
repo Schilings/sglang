@@ -56,13 +56,14 @@ if TYPE_CHECKING:
 class RadixKey:
     """is_bigram=True: token_ids holds raw tokens (N+1 for N bigrams); slices share one boundary token."""
 
-    __slots__ = ("token_ids", "extra_key", "is_bigram")
+    __slots__ = ("token_ids", "extra_key", "is_bigram", "limit")
 
     def __init__(
         self,
         token_ids: array[int],
         extra_key: Optional[str] = None,
         is_bigram: bool = False,
+        limit: Optional[int] = None,
     ):
         # token ids sequence (raw ints in both modes)
         # 例如: ["A", "B", "C"]
@@ -72,23 +73,42 @@ class RadixKey:
         self.extra_key = extra_key
         # bigram view over token_ids: length = max(0, len(token_ids) - 1)
         self.is_bigram = is_bigram
+        # Optional cap on raw tokens: behave as if token_ids were sliced to
+        # token_ids[:limit], without the O(n) copy. None = use all tokens.
+        self.limit = limit
+
+    def _raw_len(self) -> int:
+        n = len(self.token_ids)
+        if self.limit is not None and self.limit < n:
+            return self.limit
+        return n
+
+    def raw_token_ids(self) -> array:
+        """token_ids honoring `limit` (copies only when capped)."""
+        n = self._raw_len()
+        t = self.token_ids
+        return t if n == len(t) else t[:n]
 
     def __len__(self) -> int:
+        n = self._raw_len()
         if self.is_bigram:
-            n = len(self.token_ids)
             return n - 1 if n > 0 else 0
-        return len(self.token_ids)
+        return n
 
     # TODO(Jialin): vectorize with numpy without PyLong boxing
     def __iter__(self) -> Iterator:
+        t = self.token_ids
+        n = self._raw_len()
         if self.is_bigram:
-            t = self.token_ids
-            for i in range(len(t) - 1):
+            for i in range(n - 1 if n > 0 else 0):
                 yield (t[i], t[i + 1])
+        elif n == len(t):
+            yield from t
         else:
-            yield from self.token_ids
+            for i in range(n):
+                yield t[i]
 
-    def __getitem__(self, idx: Union[int, slice]) -> "RadixKey":
+    def __getitem__(self, idx: Union[int, slice]) -> RadixKey:
         # Normalize int -> 1-element slice so the rest handles one shape.
         if isinstance(idx, int):
             if idx < 0:
@@ -111,7 +131,7 @@ class RadixKey:
         preview = self.token_ids[:10]
         return f"RadixKey(extra_key={self.extra_key!r}, token_ids={preview}{'...' if len(self.token_ids) > 10 else ''}, is_bigram={self.is_bigram})"
 
-    def page_aligned(self, page_size: int) -> "RadixKey":
+    def page_aligned(self, page_size: int) -> RadixKey:
         if page_size == 1:
             return self
         aligned_len = len(self) // page_size * page_size
@@ -121,7 +141,7 @@ class RadixKey:
         self,
         is_eagle: bool,
         value: Optional[torch.Tensor] = None,
-    ) -> Tuple["RadixKey", Optional[torch.Tensor]]:
+    ) -> Tuple[RadixKey, Optional[torch.Tensor]]:
         # O(1): flip the bigram flag instead of materializing a tuple list.
         # value is paired with raw tokens and gets truncated to the bigram count.
         if is_eagle and not self.is_bigram:
@@ -130,45 +150,48 @@ class RadixKey:
                 value = value[: len(self)]
         return self, value
 
-    def _check_compatible(self, other: "RadixKey") -> None:
+    def _check_compatible(self, other: RadixKey) -> None:
         if self.extra_key != other.extra_key:
             raise ValueError(
                 f"RadixKey operations require matching extra_key, but got "
                 f"{self.extra_key=} != {other.extra_key=}"
             )
 
-
-    # TODO(Jialin): replace zip with numpy to skip per-element PyLong boxing
-    def match(self, other: "RadixKey", page_size: int = 1) -> int:
+    def match(self, other: RadixKey, page_size: int = 1) -> int:
         """Logical-unit prefix length shared with ``other``. Result is rounded down to ``page_size``."""
         self._check_compatible(other)
         t0, t1 = self.token_ids, other.token_ids
+        assert type(t0) is type(t1), (type(t0), type(t1))
+        n = min(len(t0), len(t1))
+
+        # Exponential search for the first diverging token: gallop in doubling
+        # windows (one C-level slice compare each), then binary-search the window
+        # holding the divergence -- no per-token Python loop on long shared prefixes.
+        matched_tokens = n
+        lo = 0
+        step = 1
+        while lo < n:
+            hi = lo + step if lo + step < n else n
+            if t0[lo:hi] != t1[lo:hi]:
+                while hi - lo > 1:
+                    mid = (lo + hi) // 2
+                    if t0[lo:mid] == t1[lo:mid]:
+                        lo = mid
+                    else:
+                        hi = mid
+                matched_tokens = lo
+                break
+            lo = hi
+            step *= 2
 
         if self.is_bigram:
-            # Walk raw tokens; L matching tokens imply L-1 matching bigrams.
-            i = 0
-            for a, b in zip(t0, t1):
-                if a != b:
-                    break
-                i += 1
-            matched = max(0, min(i - 1, len(self), len(other)))
+            matched = max(0, min(matched_tokens - 1, len(self), len(other)))
             return (matched // page_size) * page_size if page_size > 1 else matched
 
+        matched_tokens = min(matched_tokens, len(self), len(other))
         if page_size == 1:
-            i = 0
-            for a, b in zip(t0, t1):
-                if a != b:
-                    break
-                i += 1
-            return i
-
-        min_len = min(len(self), len(other))
-        i = 0
-        while i < min_len:
-            if t0[i : i + page_size] != t1[i : i + page_size]:
-                break
-            i += page_size
-        return i
+            return matched_tokens
+        return (matched_tokens // page_size) * page_size
 
     def child_key(self, page_size: int = 1):
         """Hashable dict-key for the first ``page_size`` logical units, namespaced by ``extra_key``."""
@@ -227,6 +250,7 @@ class TreeNode:
         self.host_ref_counter = 0
         # store the host indices of KV cache
         self.host_value: Optional[torch.Tensor] = None
+        self.write_through_pending_id: Optional[int] = None
         # store hash values of each pages
         # 每一个Page的hash值
         self.hash_value: Optional[List[str]] = None
@@ -269,7 +293,7 @@ class TreeNode:
 
         return node.get_prefix_hash_values(node.parent) + node.hash_value
 
-    def __lt__(self, other: "TreeNode"):
+    def __lt__(self, other: TreeNode):
         return self.last_access_time < other.last_access_time
 
 
@@ -535,12 +559,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.disable:
             return
 
-        # 计算完的token ids需要存储在前缀树中
-        # 对于chunked req，其fill_ids会在调度时
-        # 被截断：req.fill_ids = req.fill_ids[: len(req.prefix_indices) + trunc_len]
-        # 因此对于chunked req，req.fill_ids只是完成prefill计算的前半部分token
-        # 截断后的fill_ids长度为prefix_len + trunc_len
-        token_ids = req.fill_ids
+        token_ids = req.get_fill_ids()
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(token_ids)
         ]
