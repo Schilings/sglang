@@ -674,18 +674,26 @@ void transfer_kv_all_layer_mla_lf_pf(
       num_warps_per_block);
 }
 
+// 直接按页拷贝：本质上就是 Tensor.slice::copy_，没有自定义 CUDA kernel。
+// 底层走 PyTorch 的 cudaMemcpyAsync（non_blocking=true），异步 DMA 不阻塞 host。
+// src_buffer / dst_buffer 的 dim-0 是 page 维度，slice 取出 [index, index+page_size) 区间后拷贝。
 inline void transfer_page_direct(
     const at::Tensor src_buffer,
     at::Tensor dst_buffer,
     int64_t src_page_index,
     int64_t dst_page_index,
     int64_t page_size) {
+  // 对 dim-0 切片，然后异步拷贝
   dst_buffer.slice(0, dst_page_index, dst_page_index + page_size)
       .copy_(
           src_buffer.slice(0, src_page_index, src_page_index + page_size),
           /* non_blocking= */ true);
 }
 
+// 逐页 DMA 拷贝 KV cache，按 layer 维度逐个拷贝。
+// 优化：合并连续的 token chunk（src_diff==1 && dst_diff==1），减少 copy 调用次数。
+//      例：src_indices=[0,1,2, 5,6] → 先拷贝 [0,1,2] 连续3个 token，再拷贝 [5,6] 连续2个。
+// 没有自定义 kernel，底层走 transfer_page_direct → Tensor.slice::copy_(non_blocking=true)。
 void transfer_kv_direct(
     const std::vector<at::Tensor>& src_layers,
     std::vector<at::Tensor> dst_layers,
@@ -698,6 +706,7 @@ void transfer_kv_direct(
   TORCH_CHECK(page_size > 0, "Page size must be positive");
   TORCH_CHECK(src_indices.numel() % page_size == 0, "Source indices size must be divisible by page size");
 
+  // 索引张量拉到 CPU：在 host 端判连续段更快（不用触发 device sync）
   auto src_indices_cpu = src_indices.cpu();
   auto dst_indices_cpu = dst_indices.cpu();
 
@@ -709,26 +718,29 @@ void transfer_kv_direct(
   int64_t start_index = 0;
   int64_t end_index = 0;
 
+  // 扫描所有 token，合并连续的 chunk
   for (int64_t i = 0; i < num_indices; ++i) {
     if (i < num_indices - 1) {
       auto src_diff = src_indices_ptr[i + 1] - src_indices_ptr[i];
       auto dst_diff = dst_indices_ptr[i + 1] - dst_indices_ptr[i];
 
+      // 源和目标都连续（diff==1），继续延伸当前 chunk
       if (src_diff == 1 && dst_diff == 1) {
         continue;
       }
-      end_index = i + 1;
-    } else {  // last batch
+      end_index = i + 1;  // 断点：结束当前 chunk
+    } else {  // 最后一个 chunk
       end_index = num_indices;
     }
     auto src_index = src_indices_ptr[start_index];
     auto dst_index = dst_indices_ptr[start_index];
     auto num_tokens = end_index - start_index;
 
+    // 按 layer 逐个拷贝这个 chunk
     for (int64_t j = 0; j < num_layers; ++j) {
       transfer_page_direct(src_layers[j], dst_layers[j], src_index, dst_index, num_tokens);
     }
-    start_index = end_index;
+    start_index = end_index;  // 移到下一个 chunk 起点
   }
 }
 

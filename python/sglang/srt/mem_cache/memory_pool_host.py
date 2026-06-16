@@ -521,6 +521,20 @@ class MHATokenToKVPoolHost(HostKVCache):
             dtype=torch.uint64,
             device=self.device_pool.device,
         )
+        """
+        📌核心问题
+        page_first 布局下，GPU 端 KV cache 按 (page, token, head, dim) 组织。
+        回写到主机时，如果逐页 cudaMemcpy，会产生大量小粒度拷贝，PCIe 带宽利用率极低。
+        
+        📌解决方案
+        先在 GPU 上申请一个 staging 缓冲区：
+        GPU 内部 gather（高带宽）
+          多个 page 数据 → staging buffer（GPU 上）
+          
+          一次大块 cudaMemcpy（充分利用 PCIe 带宽）
+          staging buffer（GPU）→ 主机 mmap 内存池
+        每次最多攒 64 个 page（_WRITE_BACK_STAGING_PAGE_CHUNK），循环分批写回。
+        """
         self._init_write_back_staging_buffers()
 
     def get_size_per_token(self):
@@ -571,6 +585,28 @@ class MHATokenToKVPoolHost(HostKVCache):
         return buffer
 
     def _init_write_back_staging_buffers(self):
+        """初始化 GPU 端的 staging 缓冲区，用于加速 page_first 布局的 KV cache 回写。
+
+        📌背景：
+            HiCache 的 KV cache 在 page_first 布局下，GPU 端数据按 (page, token, head, dim)
+            组织，主机端也一样。直接从 GPU page-by-page 拷贝到主机端会有大量小粒度
+            cudaMemcpy，效率很低。
+
+        📌解决方案：
+            先在 GPU 端申请一个 staging 缓冲区，将多个 page 的数据先 gather 到这个
+            缓冲区中（GPU 内部操作，带宽很高），再通过一次大块 cudaMemcpy 写到主机端。
+
+            staging 缓冲区大小 = min(total_pages, 64) * page_size 个 token，
+            即每次最多攒 64 个 page 的数据一次性写回。这个 64 由_WRITE_BACK_STAGING_PAGE_CHUNK 常量控制。
+
+        📌使用场景：
+            - jit_transfer_hicache_all_layer_staged_lf_pf (JIT 路径，使用 staging)
+            - transfer_kv_all_layer_lf_pf (非 JIT 回退路径，直接逐页拷贝，不用 staging)
+
+        📌限制：
+            - 仅 page_first 布局生效（其他布局不需要 staging）
+            - NPU / XPU / MPS 不支持，直接跳过
+        """
         self.staging_page_capacity = 0
         self.staging_token_capacity = 0
         self.staging_k_buffer = None
@@ -578,8 +614,12 @@ class MHATokenToKVPoolHost(HostKVCache):
         if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
             return
 
+        # staging 缓冲区容纳最多 64 个 page（或全部 page，取较小值）
         self.staging_page_capacity = min(self.page_num, _WRITE_BACK_STAGING_PAGE_CHUNK)
         self.staging_token_capacity = self.staging_page_capacity * self.page_size
+
+        # shape: (staging_tokens, layer_num, head_num, head_dim)
+        # 分配在 GPU 上（device_pool.device），用于 gather 多页 KV 数据
         self.staging_k_buffer = torch.empty(
             (
                 self.staging_token_capacity,
@@ -632,12 +672,15 @@ class MHATokenToKVPoolHost(HostKVCache):
                     )
             elif self.layout == "page_first":
                 if self.can_use_jit:
-                    # Transpose [page, layer, ...] -> [layer, page, ...] then
-                    # index by layer_id to get a per-layer view with strided layout.
-                    # The kernel handles different src/dst strides automatically.
+                    # JIT kernel 逐层加载：Host(page_first) → GPU(layer_first)。
+                    # host 端 k_buffer = (page, layer, token, head, dim)，
+                    # 通过 transpose → k_data_refs[layer_id] 得到该层的 strided view。
+                    # JIT kernel 内部自动处理 src/dst 不同的 stride。
                     jit_transfer_hicache_one_layer(
+                        # dst: GPU 端 per-layer tensor（layer_first 布局）
                         k_cache_dst=device_pool.k_buffer[layer_id],
                         v_cache_dst=device_pool.v_buffer[layer_id],
+                        # src: Host 端 per-layer strided view（从 page_first 转置得到）
                         k_cache_src=self.k_data_refs[layer_id],
                         v_cache_src=self.v_data_refs[layer_id],
                         indices_dst=device_indices,
@@ -747,13 +790,23 @@ class MHATokenToKVPoolHost(HostKVCache):
                     )
             elif self.layout == "page_first":
                 if self.can_use_jit:
+                    # kernel 后端 + page_first 布局：GPU→staging→主机，最优路径。
+                    # 两阶段流水线：
+                    #   1) GPU kernel 从 per-layer tensor 中 gather 多页 KV 到 staging buffer
+                    #   2) staging buffer → host k_buffer/v_buffer (一次大块 cudaMemcpy)
+                    # 每次处理最多 staging_page_capacity 个 page（默认64），循环分批。
+                    # 底层是 TVM JIT 编译的 CUDA kernel (kvcacheio/staged_write_back.cuh)，
+                    # 运行时按 element_size 特化编译，比 transfer_kv_direct 快很多。
                     jit_transfer_hicache_all_layer_staged_lf_pf(
+                        # 源端：GPU 端 per-layer tensor 的指针张量（用于 kernel 内索引）
                         k_ptr_src=device_pool.k_data_ptrs,
                         v_ptr_src=device_pool.v_data_ptrs,
                         src_indices=device_indices,
                         dst_indices=host_indices,
+                        # GPU 端 staging 缓冲区，kernel 先 gather 到这里
                         staging_k=self.staging_k_buffer,
                         staging_v=self.staging_v_buffer,
+                        # 目标端：主机端原始大 tensor (page_first 布局)
                         dst_k=self.k_buffer,
                         dst_v=self.v_buffer,
                         page_size=self.page_size,
@@ -788,16 +841,30 @@ class MHATokenToKVPoolHost(HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "direct":
             if self.layout == "layer_first":
+                # direct 后端 + layer_first 布局：GPU→主机逐层 DMA 拷贝。
+                # device_pool.k_buffer / v_buffer 是 per-layer 引用列表，
+                # 传到 C++ 侧后逐个 layer 做 Tensor.slice::copy_(non_blocking=true)。
+                # 会自动合并连续 token chunk 以减少 copy 调用次数。
                 transfer_kv_direct(
                     src_layers=device_pool.k_buffer + device_pool.v_buffer,
+                    # dst: k_data_refs = [k_buffer[i] for i in range(layer_num)]
+                    # 即 per-layer 视图列表，GPU/Host 都是 layer_first，无需布局转换
                     dst_layers=self.k_data_refs + self.v_data_refs,
                     src_indices=device_indices,
                     dst_indices=host_indices,
                     page_size=self.page_size,
                 )
             elif self.layout == "page_first_direct":
+                # direct 后端 + page_first 布局：GPU(layer_first) → 主机(page_first) 布局转换 + DMA。
+                # device_pool 是 per-layer tensor 列表（layer_first），主机端是单个大 tensor
+                # (page, token, layer, head, dim)（page_first），需要同时做布局转换和拷贝。
+                # CUDA 12.8+ 用 cudaMemcpyBatchAsync 一次批量提交所有 page，
+                # 低版本回退为逐页 Tensor.slice::copy_。
                 transfer_kv_all_layer_direct_lf_pf(
                     src_ptrs=device_pool.k_buffer + device_pool.v_buffer,
+                    # dst: [k_buffer, v_buffer] 是原始大 tensor，非 per-layer 视图
+                    # 因为 Host 是 page_first 布局 (page, layer, token, head, dim)，
+                    # C++ 侧需要 select(0, page_index) 定位每个 page，传入完整 tensor
                     dst_ptrs=[self.k_buffer, self.v_buffer],
                     src_indices=device_indices,
                     dst_indices=host_indices,
@@ -823,11 +890,42 @@ class MHATokenToKVPoolHost(HostKVCache):
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
+        """从 Host KV cache 中读取一个 page 的数据（用于 L3 写入等场景）。
+
+        不同 layout 下 kv_buffer 的形状和索引方式：
+
+        默认 layout 为 page_first（server_args.hicache_mem_layout），
+        direct IO 后端会自动切换到 page_first_direct。
+
+        layer_first:
+          kv_buffer = (2, layer, token, head, dim)
+          slice: [:, :, index:index+page_size, :, :]
+          → 取出 dim-2 (token 维度) 的连续 page_size 个 token
+
+        page_first:
+          kv_buffer = (2, token, layer, head, dim)
+          slice: [:, index:index+page_size, :, :, :]
+          → 取出 dim-1 (token 维度) 的连续 page_size 个 token
+
+        page_first_direct / page_head:
+          kv_buffer = (2, page, layer, page_size, head, dim) 或 (2, page, head, page_size, layer, dim)
+          real_index = index // page_size               ← index 是 token 偏移，需要转成 page 编号
+          slice: [:, real_index:real_index+1, :, :, :, :]
+          → 取出整个 page，维持 6D 形状
+
+        Args:
+            index: token 偏移量（layer_first/page_first）或 page 内 token 偏移（page_first_direct/page_head）
+            flat:  True 则 flatten 成一维返回（默认），False 保持原始形状
+        """
         if self.layout == "layer_first":
+            # shape: (2, layer, token, head, dim) → 切 token 维度
             data_page = self.kv_buffer[:, :, index : index + self.page_size, :, :]
         elif self.layout == "page_first":
+            # shape: (2, token, layer, head, dim) → 切 token 维度
             data_page = self.kv_buffer[:, index : index + self.page_size, :, :, :]
         elif self.layout in ["page_first_direct", "page_head"]:
+            # shape: (2, page, ...) → 按 page 编号取整页
+            # index 是 token 级偏移，除以 page_size 得到 page 编号
             real_index = index // self.page_size
             data_page = self.kv_buffer[:, real_index : real_index + 1, :, :, :, :]
         else:
@@ -845,6 +943,18 @@ class MHATokenToKVPoolHost(HostKVCache):
         ).flatten()
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+        """L3 → Host：将扁平化的 data_page 写入 kv_buffer 指定位置。
+
+        与 get_data_page 互为逆操作：
+          get_data_page:  Host → flatten → 写入 L3 存储
+          set_from_flat_data_page: L3 读取 → reshape → 写入 Host
+
+        根据 layout 不同，data_page 的 reshape 形状也不同：
+        - layer_first:         (2, layer, page_size, head, dim)
+        - page_first:          (2, page_size, layer, head, dim)
+        - page_first_direct:   (2, 1, layer, page_size, head, dim)
+        - page_head:           (2, 1, head, page_size, layer, dim)
+        """
         if self.layout == "layer_first":
             self.kv_buffer[:, :, index : index + self.page_size, :, :] = (
                 data_page.reshape(
@@ -881,8 +991,13 @@ class MHATokenToKVPoolHost(HostKVCache):
     def get_split_heads_page_buffer_meta(
         self, indices: torch.Tensor, split_factor: int
     ):
-        """
-        get meta data for zero copy of heterogeneous ranks' KVCache
+        """获取异构 rank split-heads 场景下的 zero-copy 元数据。
+
+        用于 disaggregation 场景：不同 TP rank 持有不同的 head 组，
+        需要按 head 拆分 KV cache 传输。返回每个 split 的 (data_ptr, size)，
+        供存储后端（mooncake/EIC 等）做零拷贝 DMA。
+
+        仅在 page_head 布局下使用。
         """
         assert self.layout == "page_head"
         assert len(indices) % self.page_size == 0
@@ -927,8 +1042,15 @@ class MHATokenToKVPoolHost(HostKVCache):
         return ptr_list, element_size_list
 
     def get_page_buffer_meta(self, indices):
-        """
-        meta data for zero copy
+        """获取 KV cache page 的 zero-copy 元数据。
+
+        返回每个 page 的 (data_ptr, size) 列表，供存储后端（mooncake/EIC/NIXL）
+        做零拷贝 RDMA/DirectIO。存储后端直接用这些指针读写 kv_buffer，
+        无需经过 CPU 拷贝。
+
+        layout 影响指针计算方式：
+        - layer_first: K/V 按 layer 交错 → 逐层计算偏移
+        - page_first 系列: token/page 连续 → 直接按 page 起始地址算
         """
         assert len(indices) % self.page_size == 0
         ptr_list = []
@@ -989,16 +1111,13 @@ class MHATokenToKVPoolHost(HostKVCache):
         return ptr_list, element_size_list
 
     def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
-        """Return True if per-page strides are multiples of *page_size_bytes*.
+        """检查每 page 的 stride 是否页对齐（用于 O_DIRECT / NIXL zero-copy）。
 
-        When O_DIRECT is used with any file-based NIXL backend, every data pointer
-        passed to the kernel must be page-aligned.  In zero-copy mode the
-        pointer for KV page ``p`` is:
-
+        O_DIRECT 要求所有数据指针按 OS 页大小对齐。在 zero-copy 模式下，
+        第 p 个 page 的指针为:
             base_ptr + p * page_size * layer_num * head_num * head_dim * itemsize
 
-        For this to be page-aligned (given a page-aligned ``base_ptr``) the per-page
-        stride must itself be a multiple of the OS page size.
+        只有 stride 本身是页大小的倍数时，每个 page 的起始地址才对齐。
         """
         if self.layout not in ("page_first", "page_first_direct", "page_head"):
             return False
@@ -1405,14 +1524,28 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         return buffer
 
     def _init_write_back_staging_buffers(self):
+        """初始化 GPU 端 staging 缓冲区（MLA/GQA 变体，单 buffer 版本）。
+
+        与 K/V 分离版本的区别：
+        本类是 MLA (Multi-head Latent Attention) 或 GQA 场景，KV 合并存储在单个
+        k_buffer 中，维度为 (page, token, layer, 1, kv_cache_dim)，head_num 固定为 1。
+        因此 staging 也只需要一个 buffer 而非 K/V 分开的两个。
+
+        原理同 K/V 分离版本：先在 GPU 端 gather 多个 page 到 staging buffer，
+        再一次性大块拷贝到主机端，避免 page-by-page 小粒度 cudaMemcpy。
+        """
         self.staging_page_capacity = 0
         self.staging_token_capacity = 0
         self.staging_buffer = None
         if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
             return
 
+        # staging 缓冲区容纳最多 64 个 page
         self.staging_page_capacity = min(self.page_num, _WRITE_BACK_STAGING_PAGE_CHUNK)
         self.staging_token_capacity = self.staging_page_capacity * self.page_size
+
+        # shape: (staging_tokens, layer_num, 1, kv_cache_dim)
+        # head_num=1 因为 MLA 将多头 KV 压缩为单个 latent 向量
         self.staging_buffer = torch.empty(
             (
                 self.staging_token_capacity,
