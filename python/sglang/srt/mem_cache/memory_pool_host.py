@@ -104,10 +104,64 @@ class HostTensorAllocator:
 
 
 class HiSparseHostPoolMixin:
+    """HiSparse Host 端按页分配 Mixin —— 为 Host KV pool（L2 层）提供页粒度的稀疏分配能力。
+
+    ╔══════════════════════════════════════════════════════════════════════╗
+    ║  在 HiSparse 三层缓存架构中的位置                                       ║
+    ╠══════════════════════════════════════════════════════════════════════╣
+    ║                                                                      ║
+    ║  L1: GPU device buffer  ← 最近 token 的压缩 KV，推理时直接访问          ║
+    ║      ↕ DMA (backup_from_device / load_to_device)                    ║
+    ║  L2: Host (本 Mixin)    ← CPU pinned memory, 较旧 token 的压缩 KV    ║
+    ║      ↕ IO (backup_thread / prefetch_thread)                         ║
+    ║  L3: Storage            ← 磁盘/远程, 最旧的 KV                        ║
+    ║                                                                      ║
+    ╚══════════════════════════════════════════════════════════════════════╝
+
+    【为什么 MHA 不需要这个 Mixin？】
+      MLA 模型（如 DeepSeek-V2/V3）通过低秩压缩将多头 KV 压成单个 latent 向量，
+      单 token 的 KV 很小，Host 端可以存大量 token，按页稀疏分配收益大。
+      MHA 每个 token 的 KV 很大（head_num × head_dim），Host 端存不了多少，
+      按页稀疏分配收益不大，因此 MHA 的 Host pool 不继承此 Mixin。
+
+    【继承关系】
+      MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache)   ← DeepSeek-V2/V3
+      DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache) ← DeepSeek-V4
+
+    【调用场景】（hisparse_coordinator.py）
+      1. prefill 后 backup：将 prefill 产生的 KV 从 GPU 写入 Host，
+         调用 alloc_paged_token_slots 分配 Host 页（第 221 行）
+      2. decode 时 backup：每个 decode step 产生的压缩 KV 也需要写入 Host，
+         同样调用 alloc_paged_token_slots（第 568 行）
+
+    【核心数据结构】
+      req_to_host_pool:         [max_reqs, max_context_len] 的 int64 tensor
+                                每行对应一个请求，记录每个 token 位置的 Host slot 索引
+                                类比 GPU 端的 req_to_token_pool，但指向 Host pool 的物理页
+      req_to_host_pool_allocated_len: [max_reqs] 的 int64 tensor
+                                每个请求已分配到哪个位置（page-aligned），初始为 0
+                                新页只能追加在 allocated_len 之后，保证递增分配
+
+    【分配策略】
+      按需分配：只在 start_pos + num_tokens 超出已分配长度时才分配新页
+      向上取整：end_pos 按 page_size 向上取整到 page_end，保证分配完整的页
+      递增追加：新页追加到 req_to_host_pool[req_pool_idx, allocated_len:page_end]，
+               allocated_len 只增不减
+    """
+
     def _round_up_to_page_size(self, size: int) -> int:
+        """将 token 数向上取整到 page_size 的倍数。
+
+        例：page_size=16, size=25 → 返回 32
+        """
         return (size + self.page_size - 1) // self.page_size * self.page_size
 
     def alloc_page(self, num_pages: int) -> Optional[torch.Tensor]:
+        """从 Host pool 分配 num_pages 个页，返回页的起始 slot 索引 tensor。
+
+        底层调用 self.alloc(num_pages * self.page_size)，
+        将页数转换为 token 数后从 Host pool 的 free_slots 中分配。
+        """
         return self.alloc(num_pages * self.page_size)
 
     def alloc_paged_token_slots(
@@ -118,17 +172,49 @@ class HiSparseHostPoolMixin:
         start_pos: int,
         num_tokens: int,
     ) -> torch.Tensor:
-        """Allocate request host slots by page and return token-granular slots."""
+        """为请求分配 Host 端的 KV slot，按页粒度按需追加。
+
+        ╔══════════════════════════════════════════════════════════════════════╗
+        ║  分配示意图 (page_size=16)                                            ║
+        ╠══════════════════════════════════════════════════════════════════════╣
+        ║                                                                      ║
+        ║  调用前：allocated_len = 32 (已分配 2 页)                              ║
+        ║  请求：start_pos=25, num_tokens=20 → end_pos=45                      ║
+        ║                                                                      ║
+        ║  req_to_host_pool[req_idx]:                                          ║
+        ║  ├─ [0, 16)   page_0 ← 已分配                                      ║
+        ║  ├─ [16, 32)  page_1 ← 已分配                                      ║
+        ║  ├─ [32, 48)  page_2 ← 新分配 ← page_end = round_up(45) = 48       ║
+        ║  └─ [48, ...)  未分配                                               ║
+        ║                                                                      ║
+        ║  num_new_pages = (48 - 32) / 16 = 1                                 ║
+        ║  返回：req_to_host_pool[req_idx, 25:45] ← token 粒度，不是页粒度      ║
+        ╚══════════════════════════════════════════════════════════════════════╝
+
+        Args:
+            req_to_host_pool:         [max_reqs, max_context_len] 每个 token 的 Host slot 索引
+            req_to_host_pool_allocated_len: [max_reqs] 每个请求已分配的长度（page-aligned）
+            req_pool_idx:             请求在 req_to_host_pool 中的行索引
+            start_pos:                本次需要的起始 token 位置
+            num_tokens:               本次需要的 token 数量
+
+        Returns:
+            token 粒度的 Host slot 索引 tensor [start_pos, start_pos + num_tokens)
+        """
         device = req_to_host_pool.device
         if num_tokens <= 0:
             return torch.empty((0,), dtype=torch.int64, device=device)
 
+        # 当前已分配到哪（page-aligned），新页只能追加在这之后
         allocated_len = int(req_to_host_pool_allocated_len[req_pool_idx])
         end_pos = start_pos + num_tokens
+        # 向上取整到 page 边界：例如 end_pos=45, page_size=16 → page_end=48
         page_end = self._round_up_to_page_size(end_pos)
+        # start_pos 必须 ≤ allocated_len，否则中间有空隙（逻辑错误）
         assert start_pos <= allocated_len
 
         if page_end > allocated_len:
+            # 需要分配新页
             num_new_pages = (page_end - allocated_len) // self.page_size
             host_locs = self.alloc_page(num_new_pages)
             if host_locs is None:
@@ -144,11 +230,16 @@ class HiSparseHostPoolMixin:
                     f"HiSparse host mem pool alloc failed for {num_new_pages} pages"
                 )
 
+            # 将新页的 slot 索引写入 req_to_host_pool 对应行
+            # allocated_len 到 page_end 是新分配的区域
             req_to_host_pool[req_pool_idx, allocated_len:page_end] = host_locs.to(
                 device=device, non_blocking=True
             )
+            # 更新已分配长度
             req_to_host_pool_allocated_len[req_pool_idx] = page_end
 
+        # 返回 token 粒度（不是页粒度）的 slot 索引
+        # 调用方拿到这些索引后可以直接做 DMA 传输
         return req_to_host_pool[req_pool_idx, start_pos:end_pos]
 
     def allocated_host_indices(
@@ -157,12 +248,21 @@ class HiSparseHostPoolMixin:
         req_pool_idx: int,
         allocated_len: int,
     ) -> torch.Tensor:
+        """获取请求在 Host pool 中已分配的所有有效 slot 索引。
+
+        取 req_to_host_pool 中 [0, page_aligned_len) 范围内的索引，
+        过滤掉无效值（< 0），返回一维 tensor。
+
+        用于 backup/evict 时遍历请求在 Host 端占用的所有物理 slot。
+        """
         allocated_len = int(allocated_len)
+        # 取 page-aligned 的长度，不超过 req_to_host_pool 的列宽
         host_len = min(
             self._round_up_to_page_size(allocated_len),
             req_to_host_pool.shape[1],
         )
         host_indices = req_to_host_pool[req_pool_idx, :host_len]
+        # 过滤掉未初始化或已释放的 slot（值 < 0）
         return host_indices[host_indices >= 0]
 
 
@@ -496,7 +596,12 @@ class MHATokenToKVPoolHost(HostKVCache):
             device,
             allocator_type,
         )
+        # 每个 token 每层的 KV 元素数 = head_num × head_dim（K 和 V 共享维度）
         self.element_dim = self.device_pool.head_num * self.device_pool.head_dim
+        # 判断能否使用 JIT 编译的高性能 HiCache DMA kernel
+        # 两个条件：(1) 必须是 NVIDIA CUDA 环境（_is_cuda）
+        #          (2) element_dim × dtype字节数 必须是 128 的倍数（TMA 对齐要求）
+        # 主流模型（head_dim=128, fp16/bf16）几乎都满足，通常为 True
         self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
             element_size=self.element_dim * self.dtype.itemsize
         )
@@ -544,10 +649,15 @@ class MHATokenToKVPoolHost(HostKVCache):
         return self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize * 2
 
     def get_ksize_per_token(self):
+        # [vs MHA] MHA 返回 size_per_token // 2 (K 占一半); MLA 返回全部 (K=V 合并, 无分离)
         return self.get_size_per_token() // 2
 
     def init_kv_buffer(self):
+        # [vs MHA] MHA dims 以 2 开头 (K+V 分离) 且有 head_num 维;
+        #          MLA 无 2 前缀 (K=V 合并), head_num 固定为 1, 用 kv_cache_dim 替代 head_num*head_dim
         if self.layout == "layer_first":
+            # MHA: (2, layer_num, size, head_num, head_dim)
+            # MLA: (   layer_num, size, 1,          kv_cache_dim)
             dims = (2, self.layer_num, self.size, self.head_num, self.head_dim)
         elif self.layout == "page_first":
             dims = (2, self.size, self.layer_num, self.head_num, self.head_dim)
@@ -1385,6 +1495,48 @@ def get_mha_host_pool_cls(device_pool: MHATokenToKVPool) -> type:
     return MHATokenToKVPoolHost
 
 
+# ============================================================================
+# MLATokenToKVPoolHost — MLA (Multi-head Latent Attention) 的 Host KV 缓存池
+# ============================================================================
+#
+# 与 MHATokenToKVPoolHost 的核心区别:
+#
+#   1. KV 合并存储: MLA 通过低秩压缩将多头 KV 压缩为单个 latent 向量,
+#      因此 K 和 V 共用一个 kv_buffer (而非 MHA 的 k_buffer + v_buffer 分离)。
+#      维度: kv_cache_dim = kv_lora_rank + qk_rope_head_dim (而非 MHA 的 head_num × head_dim)
+#
+#   2. head_num=1: MLA buffer 的 head 维度始终为 1, 因为多头信息已被压缩到 latent 中。
+#
+#   3. 指针引用: data_refs / data_ptrs 只有一组 (MHA 有 k_data_refs/v_data_refs 两组)
+#
+#   4. 继承 HiSparseHostPoolMixin: 增加了按页分配能力 (alloc_page, alloc_paged_token_slots),
+#      MHA 不继承此 Mixin。因为 MLA 模型 (如 DeepSeek-V2/V3) token 量大,
+#      Host 端内存按需稀疏分配更有意义。
+#
+#   5. 额外布局 page_first_kv_split: Ascend NPU 专用, 将 K/V 拆分为独立 buffer。
+#      MHA 没有此布局 (MHA 本身 K/V 就是分开的)。
+#
+#   6. 额外参数 override_kv_cache_dim: 允许覆盖 kv_cache_dim 的计算, MHA 无此参数。
+#
+#   7. page_first 转置条件: 仅 can_use_jit 时做 transpose;
+#      MHA 无条件做 transpose (因为 MHA 非 JIT 路径也需要 per-layer view)。
+#
+#   8. Staging buffer: 只有一个 staging_buffer; MHA 有 staging_k_buffer + staging_v_buffer。
+#
+#   9. get_ksize_per_token: 返回全部 size_per_token (因为 K=V 合并);
+#      MHA 返回 size_per_token // 2。
+#
+# 对应表:
+#   MHA 属性              → MLA 属性
+#   k_buffer + v_buffer   → kv_buffer
+#   k_data_refs           → data_refs
+#   v_data_refs           → (无)
+#   k_data_ptrs           → data_ptrs
+#   v_data_ptrs           → (无)
+#   element_dim            → kv_cache_dim
+#   staging_k/v_buffer    → staging_buffer
+#   head_num × head_dim   → kv_lora_rank + qk_rope_head_dim
+# ============================================================================
 class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     device_pool: MLATokenToKVPool
 
@@ -1398,7 +1550,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
-        override_kv_cache_dim: Optional[int] = None,
+        override_kv_cache_dim: Optional[int] = None,  # [MLA独有] 允许覆盖 kv_cache_dim 计算
     ):
         self.override_kv_cache_dim = override_kv_cache_dim
         super().__init__(
@@ -1411,9 +1563,13 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             device,
             allocator_type,
         )
+        # [vs MHA] MHA 用 element_dim = head_num * head_dim; MLA 用 kv_cache_dim
         self.can_use_jit = _is_cuda and can_use_hicache_jit_kernel(
             element_size=self.kv_cache_dim * self.dtype.itemsize
         )
+
+        # [vs MHA] MHA 无条件做 page_first transpose; MLA 仅 can_use_jit 时做
+        # 原因: MLA 非 JIT 路径不需要 per-layer view, MHA 非 JIT 路径仍需 k_data_refs/v_data_refs
 
         if self.layout == "page_first" and self.can_use_jit:
             # Transpose [page, layer, ...] -> [layer, page, ...] to get per-layer views
@@ -1422,6 +1578,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             self.data_refs = [transposed[i] for i in range(self.layer_num)]
         else:
             self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
+        # [vs MHA] MHA: k_data_refs + v_data_refs (两组); MLA: data_refs (一组, 因为 K=V 合并)
         self.data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.data_refs],
             dtype=torch.uint64,
@@ -1438,6 +1595,10 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         return data_ptrs, data_lens, item_lens
 
     def get_size_per_token(self):
+        # [vs MHA] MHA: head_dim * head_num * layer_num * dtype * 2 (×2 因为 K+V 分离)
+        #          MLA: kv_cache_dim * layer_num * dtype (无 ×2, 因为 K=V 合并存储)
+        # kv_cache_dim = kv_lora_rank + qk_rope_head_dim (低秩压缩 + RoPE 维度)
+        # [vs MHA] MHA 返回 size_per_token // 2 (K 占一半); MLA 返回全部 (K=V 合并, 无分离)
         self.kv_lora_rank = self.device_pool.kv_lora_rank
         self.qk_rope_head_dim = self.device_pool.qk_rope_head_dim
         self.layer_num = self.device_pool.layer_num
@@ -1447,10 +1608,15 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         return self.kv_cache_dim * self.dtype.itemsize * self.layer_num
 
     def get_ksize_per_token(self):
+        # [vs MHA] MHA 返回 size_per_token // 2 (K 占一半); MLA 返回全部 (K=V 合并, 无分离)
         return self.get_size_per_token()
 
     def init_kv_buffer(self):
+        # [vs MHA] MHA dims 以 2 开头 (K+V 分离) 且有 head_num 维;
+        #          MLA 无 2 前缀 (K=V 合并), head_num 固定为 1, 用 kv_cache_dim 替代 head_num*head_dim
         if self.layout == "layer_first":
+            # MHA: (2, layer_num, size, head_num, head_dim)
+            # MLA: (   layer_num, size, 1,          kv_cache_dim)
             dims = (
                 self.layer_num,
                 self.size,
@@ -1458,22 +1624,20 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 self.kv_cache_dim,
             )
         elif self.layout == "page_first":
+            # MHA: (2, size, layer_num, head_num, head_dim)
+            # MLA: (   size, layer_num, 1,          kv_cache_dim)
             dims = (
                 self.size,
                 self.layer_num,
                 1,
                 self.kv_cache_dim,
             )
-        elif self.layout == "page_first_direct":
-            dims = (
-                self.page_num,
-                self.layer_num,
-                self.page_size,
-                1,
-                self.kv_cache_dim,
-            )
         # Ascend-specific: Aligns with NPUMLATokenToKVPool layout
         # Separately allocate k_buffer and v_buffer for easier data transfer.
+        # [MLA独有] page_first_kv_split: Ascend NPU 专用布局
+        # 将 kv_lora_rank 和 qk_rope_head_dim 拆分为独立的 k_buffer + v_buffer,
+        # 以便 Ascend 硬件传输。MHA 不需要此布局 (MHA 本身 K/V 就是分开的)。
+        # 额外还有 index_k_buffer (当 index_head_dim 存在时)。
         elif self.layout == "page_first_kv_split":
             base_dims = (
                 self.page_num,
@@ -1560,9 +1724,13 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def load_to_device_per_layer(
         self, device_pool, host_indices, device_indices, layer_id, io_backend
     ):
+        # [vs MHA] 所有传输函数从 *_one_layer 变为 *_one_layer_mla,
+        #          参数从 k_cache + v_cache 变为单个 cache (K=V 合并)
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
+                    # MHA: jit_transfer_hicache_one_layer(k_cache_dst, v_cache_dst, ...)
+                    # MLA: jit_transfer_hicache_one_layer_mla(cache_dst, cache_src, ...)
                     jit_transfer_hicache_one_layer_mla(
                         cache_dst=device_pool.kv_buffer[layer_id],
                         cache_src=self.kv_buffer[layer_id],
@@ -1601,6 +1769,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "direct":
             if self.layout == "layer_first":
+                # MHA: src/dst 各两个 [k_buffer[l], v_buffer[l]]
+                # MLA: src/dst 各一个 [kv_buffer[l]]
                 transfer_kv_direct(
                     src_layers=[self.kv_buffer[layer_id]],
                     dst_layers=[device_pool.kv_buffer[layer_id]],
@@ -1609,6 +1779,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     page_size=self.page_size,
                 )
             elif self.layout == "page_first_direct":
+                # MHA: src_ptrs=[k_buffer, v_buffer]; MLA: src_ptrs=[kv_buffer]
                 transfer_kv_per_layer_direct_pf_lf(
                     src_ptrs=[self.kv_buffer],
                     dst_ptrs=[device_pool.kv_buffer[layer_id]],
@@ -1620,6 +1791,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
+            # [MLA独有] page_first_kv_split 布局: Ascend NPU 专用
+            # 在此布局下, kv_lora_rank 和 qk_rope_head_dim 被拆分为独立的 k_buffer + v_buffer,
+            # 且额外有 index_k_buffer (如 index_head_dim 存在)。MHA 无此布局 (MHA 本身 K/V 就是分开的)。
             if self.layout == "page_first_kv_split":
                 # Ascend-specific: transfer KV data for all layers when layer_id == 0
                 if layer_id == 0:
@@ -1643,9 +1817,13 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        # [vs MHA] 所有传输函数从 *_all_layer 变为 *_all_layer_mla,
+        #          参数从 k_ptr + v_ptr 变为单个 ptr (K=V 合并)
         if io_backend == "kernel":
             if self.layout == "layer_first":
                 if self.can_use_jit:
+                    # MHA: jit_transfer_hicache_all_layer(k_ptr_dst, v_ptr_dst, ...)
+                    # MLA: jit_transfer_hicache_all_layer_mla(ptr_dst, ptr_src, ...)
                     jit_transfer_hicache_all_layer_mla(
                         ptr_dst=self.data_ptrs,
                         indices_dst=host_indices,
@@ -1666,12 +1844,15 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     )
             elif self.layout == "page_first":
                 if self.can_use_jit:
+                    # MHA: jit_transfer_hicache_all_layer_staged_lf_pf(k_ptr_src, v_ptr_src, staging_k, staging_v, dst_k, dst_v, ...)
+                    # MLA: jit_transfer_hicache_all_layer_mla_staged_lf_pf(ptr_src, staging, dst, ...)
+                    # MLA 只有一个 staging_buffer 和一个 dst (kv_buffer), 而非 K/V 各一个
                     jit_transfer_hicache_all_layer_mla_staged_lf_pf(
                         ptr_src=device_pool.data_ptrs,
                         src_indices=device_indices,
                         dst_indices=host_indices,
-                        staging=self.staging_buffer,
-                        dst=self.kv_buffer,
+                        staging=self.staging_buffer,  # [vs MHA] MHA: staging_k + staging_v; MLA: 单个 staging_buffer
+                        dst=self.kv_buffer,            # [vs MHA] MHA: dst_k + dst_v; MLA: 单个 kv_buffer
                         page_size=self.page_size,
                     )
                 else:
@@ -1688,6 +1869,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "direct":
             if self.layout == "layer_first":
+                # MHA: src/dst 各两个 (k_buffer + v_buffer)
+                # MLA: src/dst 各一个 (kv_buffer / data_refs)
                 transfer_kv_direct(
                     src_layers=device_pool.kv_buffer,
                     dst_layers=self.data_refs,
@@ -1696,6 +1879,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     page_size=self.page_size,
                 )
             elif self.layout == "page_first_direct":
+                # MHA: src_ptrs=[k_buffer, v_buffer], dst_ptrs=[k_buffer, v_buffer]
+                # MLA: src_ptrs=kv_buffer, dst_ptrs=[kv_buffer]
                 transfer_kv_all_layer_direct_lf_pf(
                     src_ptrs=device_pool.kv_buffer,
                     dst_ptrs=[self.kv_buffer],
@@ -1706,6 +1891,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
+            # [MLA独有] page_first_kv_split 布局: Ascend NPU 专用
+            # 在此布局下, kv_lora_rank 和 qk_rope_head_dim 被拆分为独立的 k_buffer + v_buffer,
+            # 且额外有 index_k_buffer (如 index_head_dim 存在)。MHA 无此布局 (MHA 本身 K/V 就是分开的)。
             if self.layout == "page_first_kv_split":
                 transfer_kv_dim_exchange(
                     device_indices=device_indices,
@@ -1725,6 +1913,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
+        # [vs MHA] MHA 从 k_buffer/v_buffer 各取一页 (返回 K 和 V 两部分);
+        #          MLA 从 kv_buffer 取一页 (K=V 合并, 只有一部分)
+        # MHA reshape 包含 head_num × head_dim; MLA reshape 包含 kv_cache_dim
         if self.layout == "layer_first":
             data_page = self.kv_buffer[:, index : index + self.page_size, :, :]
         elif self.layout == "page_first":
@@ -1739,6 +1930,8 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         return data_page
 
     def get_dummy_flat_data_page(self) -> torch.Tensor:
+        # [vs MHA] MHA: (layer_num, page_size, head_num, head_dim) × 2 (K+V)
+        #          MLA: (layer_num, page_size, 1, kv_cache_dim) × 1 (K=V 合并)
         return torch.zeros(
             (
                 self.layer_num,
@@ -3309,6 +3502,7 @@ class DSAIndexerPoolHost(HostKVCache):
         )
 
     def get_ksize_per_token(self):
+        # [vs MHA] MHA 返回 size_per_token // 2 (K 占一半); MLA 返回全部 (K=V 合并, 无分离)
         return self.get_size_per_token()
 
     def init_kv_buffer(self):

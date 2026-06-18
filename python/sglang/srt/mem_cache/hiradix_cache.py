@@ -70,6 +70,119 @@ logger = logging.getLogger(__name__)
 
 
 class HiRadixCache(RadixCache):
+    """分层 Radix Cache —— 在 RadixCache 基础上增加 GPU↔Host↔Storage 三级 KV 存储。
+
+    ╔══════════════════════════════════════════════════════════════════════════════════╗
+    ║  与 RadixCache 的核心区别：节点三态 vs 两态                                           ║
+    ╠══════════════════════════════════════════════════════════════════════════════════╣
+    ║                                                                                  ║
+    ║  RadixCache 节点只有两种状态：                                                      ║
+    ║    ┌──────────┐   evict   ┌──────────┐                                           ║
+    ║    │ 在 GPU   │ ────────→ │ 删除     │  value=None 就意味着节点没了                  ║
+    ║    │ value≠∅  │           │ 节点移除  │                                           ║
+    ║    └──────────┘           └──────────┘                                           ║
+    ║                                                                                  ║
+    ║  HiRadixCache 节点有三种状态：                                                      ║
+    ║    ┌──────────┐  write_backup  ┌──────────┐  write_backup_storage  ┌──────────┐  ║
+    ║    │ 在 GPU   │ ────────────→  │ 在 Host   │ ────────────────────→  │ 在Storage │ ║
+    ║    │ value≠∅  │  evict(GPU)    │ value=None│   backup              │           │ ║
+    ║    │ host=∅   │                │ host≠∅    │                       │           │ ║
+    ║    │ evicted=F│                │ evicted=T │                       │           │ ║
+    ║    │ backuped=F│               │ backuped=T│                       │           │ ║
+    ║    └──────────┘                └──────────┘                        └──────────┘  ║
+    ║         ↑  load_back               ↑  prefetch                                   ║
+    ║         └──────────────────────────┘──────────────────────────────────────────┘  ║
+    ║                                                                                  ║
+    ║  关键：evict 不是真删除，而是"降级"（GPU→Host），节点仍在树中。                           ║
+    ║  被驱逐的 KV 可以通过 load_back 从 Host 恢复，无需重新计算。                             ║
+    ╚══════════════════════════════════════════════════════════════════════════════════╝
+
+    ╔══════════════════════════════════════════════════════════════════════════════════╗
+    ║  逐方法对比 HiRadixCache vs RadixCache                                             ║
+    ╠══════════════════════════════════════════════════════════════════════════════════╣
+    ║                                                                                  ║
+    ║  match_prefix:  RadixCache 匹配到就返回 device_indices                             ║
+    ║                 HiRadixCache 额外返回 host_hit_length / last_host_node             ║
+    ║                 为后续 load_back / prefetch 提供起点                                ║
+    ║                                                                                  ║
+    ║  insert:        RadixCache 遇匹配节点 inc_hit_count                                ║
+    ║                 HiRadixCache 遇 evicted 节点要重新赋 value（KV 回到 GPU）             ║
+    ║                                                                                  ║
+    ║  evict:         RadixCache 直接 free + _delete_leaf（真删除）                       ║
+    ║                 HiRadixCache 分两条路：                                           ║
+    ║                   write_back 模式：先 write_backup → 再 _evict_backuped（降级）     ║
+    ║                   非 write_back：_evict_regular（真删除，同 RadixCache）            ║
+    ║                                                                                  ║
+    ║  新增方法（RadixCache 完全没有）：                                                   ║
+    ║    write_backup           GPU→Host DMA，node.host_value = host_indices           ║
+    ║    load_back              Host→GPU DMA，恢复 node.value，清除 evicted 状态          ║
+    ║    evict_host             驱逐 Host 端 KV（Host 内存不够时）                         ║
+    ║    prefetch_from_storage  Storage→Host 预取                                      ║
+    ║    write_backup_storage   Host→Storage 持久化                                    ║
+    ║    writing_check          等待异步 write DMA 完成                                 ║
+    ║    loading_check          等待异步 load DMA 完成                                  ║
+    ╚══════════════════════════════════════════════════════════════════════════════════╝
+
+    ╔══════════════════════════════════════════════════════════════════════════════════╗
+    ║  写策略（write_policy）：write_through vs write_back                               ║
+    ╠══════════════════════════════════════════════════════════════════════════════════╣
+    ║                                                                                  ║
+    ║  write_through（默认）—— 命中即备份，主动同步                                       ║
+    ║  ═══════════════════════════════════════════════════                              ║
+    ║  节点命中时：                                                                      ║
+    ║    _inc_hit_count(node)                                                          ║
+    ║      ├── hit_count >= write_through_threshold(=1) 且 node 未 backuped             ║
+    ║      │     └── write_backup(node)  ← 主动异步写回 Host                             ║
+    ║      │            ├── node.host_value = Host端slot索引                             ║
+    ║      │            ├── node.backuped → True（@property: host_value is not None）    ║
+    ║      │            └── inc_lock_ref(node) 防止 DMA 飞行中被 evict                    ║
+    ║      │   DMA 完成后：writing_check → _finish_write_through_ack → dec_lock_ref      ║
+    ║      │                                                                             ║
+    ║  GPU evict 时（节点已 backuped）：                                                 ║
+    ║    node.backuped=True                                                             ║
+    ║      → _evict_backuped(node)  只释放 GPU slot，节点降级                             ║
+    ║        node.value = None      → evicted 自动=True                                 ║
+    ║        节点仍在树中，host_value 保留，可 load_back 恢复                              ║
+    ║                                                                                  ║
+    ║  write_back —— 驱逐时才写，被动备份                                                 ║
+    ║  ═══════════════════════════════════                                              ║
+    ║  节点命中时：                                                                      ║
+    ║    _inc_hit_count(node)                                                           ║
+    ║      └── write_policy=="write_back" → return（跳过，不计数不备份）                   ║
+    ║                                                                                  ║
+    ║  GPU evict 时（节点没 backuped）：                                                 ║
+    ║    node.backuped=False                                                            ║
+    ║      → write_policy=="write_back"                                                 ║
+    ║        ├── write_backup(x, write_back=True)  ← 紧急阻塞写回 Host                    ║
+    ║        ├── writing_check(write_back=True)     ← 阻塞等全部 DMA 完成                 ║
+    ║        └── _evict_backuped(x)                  ← 然后释放 GPU slot                  ║
+    ║                                                                                  ║
+    ║  对比总结：                                                                        ║
+    ║  ┌──────────────┬─────────────────────┬─────────────────────┐                    ║
+    ║  │              │ write_through       │ write_back          │                    ║
+    ║  ├──────────────┼─────────────────────┼─────────────────────┤                    ║
+    ║  │ 备份时机      │ 命中时主动写         │ 驱逐时被动写          │                    ║
+    ║  │ hit_count    │ 正常递增触发阈值      │ 直接跳过              │                    ║
+    ║  │ evict 行为    │ _evict_backuped     │ write_backup →      │                    ║
+    ║  │              │ （无需等 DMA）        │ _evict_backuped      │                    ║
+    ║  │              │                     │ （必须等 DMA 完成）    │                    ║
+    ║  │ 优势          │ 热门节点 Host 有副本  │ 冷门节点不浪费        │                    ║
+    ║  │              │ evict 延迟低          │ Host IO 带宽          │                    ║
+    ║  └──────────────┴─────────────────────┴─────────────────────┘                    ║
+    ╚══════════════════════════════════════════════════════════════════════════════════╝
+
+    ╔══════════════════════════════════════════════════════════════════════════════════╗
+    ║  TreeNode 新增字段（RadixCache 的 TreeNode 没有）                                    ║
+    ╠══════════════════════════════════════════════════════════════════════════════════╣
+    ║  host_value               Host 端 slot 索引，write_backup 后非空                    ║
+    ║  host_ref_counter         防止 Host KV 被驱逐（类似 lock_ref 但针对 Host）            ║
+    ║  write_through_pending_id 跟踪异步写回（write_through 模式 DMA 未完成时）              ║
+    ║  hash_value               每页的 SHA256，Storage 层去重/查找用                       ║
+    ║  evicted 属性             value is None（RadixCache 中 value=None=删除，           ║
+    ║                           HiRadixCache 中 value=None=在 Host，节点还在树中）        ║
+    ║  backuped 属性            host_value is not None                                 ║
+    ╚══════════════════════════════════════════════════════════════════════════════════╝
+    """
 
     def __init__(self, params: CacheInitParams, server_args: ServerArgs):
         self._enable_metrics_flag = params.enable_metrics
@@ -757,19 +870,50 @@ class HiRadixCache(RadixCache):
             return False
 
     def write_backup(self, node: TreeNode, write_back=False) -> int:
-        # Backup invariant (for write-through mode): backed-up nodes must form a
-        # contiguous prefix from root — no gaps.  Skip if parent isn't backed
-        # up yet;
+        """将节点的 KV 从 GPU 写入 Host（GPU→Host DMA）。
+
+        ╔════════════════════════════════════════════════════════════════════════════╗
+        ║  write_backup 的两种触发场景                                                 ║
+        ╠════════════════════════════════════════════════════════════════════════════╣
+        ║                                                                              ║
+        ║  1. write_through 模式（write_back=False）：                                  ║
+        ║     节点命中次数达标时自动触发，将 KV 主动写入 Host                             ║
+        ║     调用链：_inc_hit_count → write_backup(node) → inc_lock_ref(node)             ║
+        ║            [DMA 飞行中] → writing_check → _finish_write_through_ack              ║
+        ║            → dec_lock_ref + write_backup_storage（写三层存储）                    ║
+        ║     前置约束：parent 必须 backuped（保证从 root 到当前节点连续备份，无空隙）      ║
+        ║                                                                              ║
+        ║  2. write_back 模式（write_back=True）：                                     ║
+        ║     evict 时调用，先把 KV 备份到 Host，再释放 GPU                             ║
+        ║     调用链：evict → write_backup(write_back=True) → _evict_backuped          ║
+        ║     无 parent 约束（evict 是被动触发的，不保证连续性）                          ║
+        ║     写完不 inc_lock_ref（马上就要 _evict_backuped）                           ║
+        ╚════════════════════════════════════════════════════════════════════════════╝
+
+        写入成功后：
+          node.host_value = host_indices  ← 记录 Host 端 slot 索引
+          node.backuped → True
+          后续可通过 load_back 从 Host 恢复到 GPU
+
+        Host 内存不足时：
+          先调 evict_host 释放其他节点的 Host KV，再重试一次
+        """
+        # write_through 模式下的 backup 连续约束：
+        #   从 root 到任意 backuped 节点必须是连续的备份链（不允许中间断层）。
+        #   如果父节点还没 backup，先跳过本次写回，等父节点先被 backup。
         if not write_back and (
             node.parent != self.root_node and not node.parent.backuped
         ):
             return 0
 
+        # 发起 GPU→Host DMA 写入，返回 Host 端分配的 slot 索引
         host_indices = self.cache_controller.write(
             device_indices=node.value,
             node_id=node.id,
             **self._get_extra_pools(),
         )
+
+        # Host 内存不足 → 先驱逐其他 Host 节点腾空间，再重试一次
         if host_indices is None:
             self.evict_host(len(node.value))
             host_indices = self.cache_controller.write(
@@ -777,13 +921,25 @@ class HiRadixCache(RadixCache):
                 node_id=node.id,
                 **self._get_extra_pools(),
             )
+
         if host_indices is not None:
+            # 记录 Host 端 slot 索引，标记 backuped 状态
             node.host_value = host_indices.clone()
             assert len(node.host_value) > 0
+
+            # 加入 ongoing_write_through 跟踪字典 —
+            #   记录当前节点的 DMA 正在飞行中（pending），后继：
+            #   • 防止同一节点重复写 Host（node.write_through_pending_id 不为空时跳过）
+            #   • 树分裂时通过 _replace_pending_write_through_node 替换为拆分后的节点
+            #   • DMA 完成后 writing_check → _finish_write_through_ack → dec_lock_ref 收尾
             self._track_write_through_node(node, len(node.key))
+
+            # write_through 模式：加 lock_ref 防止 DMA 完成前节点被 evict
+            # write_back 模式：不加锁（紧随其后就是 _evict_backuped，节点即将被驱逐）
             if not write_back:
                 self.inc_lock_ref(node)
         else:
+            # Host 驱逐后仍然分配失败（极端 OOM），本次写回放弃
             return 0
 
         return len(host_indices)
@@ -894,70 +1050,166 @@ class HiRadixCache(RadixCache):
         return top, key, hash_value, host_value
 
     def _inc_hit_count(self, node: TreeNode, chunked=False):
-        # skip the hit count update for chunked requests
+        """重写父类 RadixCache._inc_hit_count，增加 HiCache 的 write-through 自动触发逻辑。
+
+        父类仅递增 hit_count（chunked 时跳过防止虚增）；
+        本方法额外：
+        1. write_back 模式下也跳过 —— 此时节点在 evict 时才写 Host，无需靠 hit_count 触发。
+        2. 非 backuped 节点命中数达到 write_through_threshold 时，自动触发 write_backup 将 KV 写回 Host。
+           这是 write_through 策略的核心：热门节点自动落 Host，后续可直接从 Host 加载无需重算。
+        """
+        # write_back 模式下不跟踪 hit_count（写 Host 由 evict 驱动）；
+        # chunked 请求也跳过，防止同一请求多 chunk 反复命中自己创建的节点导致虚增
         if self.cache_controller.write_policy == "write_back" or chunked:
             return
+
+        # 父类的 hit_count 只是驱逐策略的优先级参考（热门节点推迟驱逐）；
+        # 子类把它升级为 write-through 自动触发器——当一个节点足够热门（命中次数达标），
+        # 就自动把它异步写回 Host，后续请求可直接从 Host 加载而无需重算。
         node.hit_count += 1
 
+        # hit_count（历史命中次数） —— 热度统计
+        # 含义：节点自创建以来，一共被多少个请求匹配到过
+        # 只增不减：每次匹配 _inc_hit_count +1，永不减少
+        # 软性排序：不阻止驱逐，只在驱逐策略中影响优先级
+
+        # lock_ref（引用计数） —— 即时安全锁
+        # 含义：当前有多少个活跃请求正在使用这个节点
+        # 有增有减：请求开始时沿路径 inc_lock_ref，完成时 dec_lock_ref
+        # 硬性保护：lock_ref > 0 时节点绝对不能被驱逐
+        # 沿祖先路径生效：对一个节点加锁，它的所有祖先也会被加锁
+
+        # 节点尚未在 Host 有备份，且命中数达到阈值 → 触发异步写回 Host
         if not node.backuped:
             if node.hit_count >= self.write_through_threshold:
-                # write to host if the node is not backuped
                 self.write_backup(node)
 
     def writing_check(self, write_back=False):
+        """轮询并收割已完成的 GPU→Host DMA 写入。
+
+        两种写入策略（write_policy）对比：
+        ┌──────────────┬────────────────────────────────┬──────────────────────────────────┐
+        │              │  write_through                 │  write_back                      │
+        ├──────────────┼────────────────────────────────┼──────────────────────────────────┤
+        │ 触发时机       │ _inc_hit_count 命中达标时        │ evict(GPU) 驱逐时                 │
+        │              │   write_through_threshold=1    │                                  │
+        │ 写后行为       │ KV 同时存在于 GPU+Host           │ 写完即 _evict_backuped 释放 GPU   │
+        │              │   后续 evict 直接降级，无需再写    │   节点降级为 evicted 状态          │
+        │ writing_check│ 非阻塞（write_back=False）       │ 阻塞（write_back=True）           │
+        │              │   本轮收割已完成的，不等 pending   │   必须等全部 pending 完成           │
+        └──────────────┴────────────────────────────────┴──────────────────────────────────┘
+
+        Args:
+            write_back: True=阻塞等待全部 DMA 完成（evict 场景），False=非阻塞收割（write_through 场景）
+        """
         if write_back:
-            # blocking till all write back complete
+            # evict 场景：必须等待所有 pending DMA 完成才能安全释放 GPU slot。
+            # 阻塞循环直到 ongoing_write_through 清空。
             while len(self.ongoing_write_through) > 0:
+                # 遍历 ack_write_queue，同步等待每个 finish_event
                 for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
-                    finish_event.synchronize()
+                    finish_event.synchronize()          # 阻塞等待 GPU→Host DMA 完成
                     for ack_id in ack_list:
                         self._finish_write_through_ack(ack_id, release_lock=False)
                 self.cache_controller.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
             return
 
-        # NOTE: all ranks has the same ongoing_write_through, can skip sync if empty
+        # write_through / 非 evict 场景：非阻塞收割。
+        # 所有 rank 的 ongoing_write_through 一致，空时跳过 all_reduce 同步。
         if len(self.ongoing_write_through) == 0:
             return
 
+        # ── 分布式同步收割：多 GPU pipeline parallelism 场景 ──
+        # 每个 rank 独立发起 GPU→Host DMA，完成时间可能不同。
+        # 不能某个 rank 擅自收割（release lock_ref），否则其他 rank 的 DMA 还在飞。
+        # 因此需要 pp_rank=0 先统计 → all_reduce(MIN) 取各 rank 都完成的数量 → FIFO 收割。
+        #
+        # 示例：rank0 看到 5 个完成，rank1 只看到 3 个 → all_reduce(MIN)=3，安全收割前 3 个。
+        # 场景：write_through 模式下，DMA 异步飞行中，周期调用 writing_check 清理已完成的。
+        #
+        # pp_rank=0 统计已完成的 DMA 数量（按顺序检查，遇到未完成的就停止）
         finish_count = 0
         if self.pp_rank == 0:
             for _, finish_event, ack_list in self.cache_controller.ack_write_queue:
-                if not finish_event.query():
-                    break
+                if not finish_event.query():            # query() 非阻塞，true=已完成
+                    break                               # 按序检查，遇到未完成就停止
                 finish_count += 1
+
+        # all_reduce(MIN)：跨所有 TP+PP rank 取最小完成数，保证一致性。
+        # 通信分两步：
+        #   1. pp_rank=0 的 TP 组内 all_reduce(MIN) → PP0 上所有注意力 rank 达成一致
+        #   2. _pp_sync 广播 PP0 结果到 PP1, PP2, ... → 所有 PP rank 拿到相同值
+        # 效果：finish_count = min(所有 TP 和 PP rank 中各自统计的完成数)
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
         self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
         finish_count = finish_count_tensor.item()
 
         if finish_count > 0:
             logger.debug(f"Process {finish_count} write back operations")
+
+        # 按 FIFO 顺序收割已完成的 DMA —
+        #   synchronize() 确认 GPU→Host DMA 真正完成（防假完成）
+        #   → _finish_write_through_ack 清理 ongoing_write_through + 发 Store 事件
+        #   → dec_lock_ref 释放 write_backup 时加的锁（release_lock=True）
+        #
+        # ack_write_queue vs ongoing_write_through 的关系：
+        #   ack_write_queue 每条记录 = 一次 flush_write DMA 操作
+        #   ongoing_write_through 每条记录 = 一个树节点
+        #   一次 DMA 可能合并写多个节点（merge），所以 ack_list 有多个 ack_id，
+        #   每个 ack_id 对应 ongoing_write_through 中的一条。常见情况是 1:1。
         while finish_count > 0:
             _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
-            finish_event.synchronize()
+            finish_event.synchronize()                  # 阻塞确认 DMA 物理完成
             for ack_id in ack_list:
+                # _finish_write_through_ack 收尾四件事：
+                #   1. ongoing_write_through.pop(ack_id)    ← 清除 pending 记录
+                #   2. node.write_through_pending_id = None ← DMA 确认，Host 已有副本
+                #   3. _record_store_event(CPU)             ← 通知下游索引器
+                #   4. if enable_storage: write_backup_storage ← 写第三层存储
+                #
+                # release_lock=True 的原因：
+                #   write_through 模式下 write_backup 执行了 inc_lock_ref(node)
+                #   防止 DMA 飞行期间节点被 evict，这里 DMA 确认完成后释放锁。
+                #   对比 write_back 模式（line ~1113）release_lock=False：
+                #   write_back 的 write_backup 没有 inc_lock_ref（紧随其后就 evict），无需释放。
                 self._finish_write_through_ack(ack_id, release_lock=True)
             finish_count -= 1
 
     def loading_check(self):
+        """轮询并收割已完成的 Host→GPU DMA 加载（load_back 的异步收尾）。
+
+        writing_check 的对称方法，处理反向数据传输（Host→GPU）。
+        同样是多 GPU 分布式场景：各 rank DMA 完成时间不同，
+        pp_rank=0 统计 → all_reduce(MIN) → FIFO 收割。
+
+        writing_check 收尾时：_finish_write_through_ack → dec_lock_ref + Storage 持久化
+        loading_check 收尾时：ongoing_load_back.pop → dec_lock_ref 即可
+        （load_back 不涉及 Host→Storage 持久化）
+        """
+        # pp_rank=0 统计已完成的 load DMA 数量（按序检查，遇到未完成就停止）
         finish_count = 0
         if self.pp_rank == 0:
             for _, finish_event, ack_list in self.cache_controller.ack_load_queue:
-                if not finish_event.query():
-                    break
+                if not finish_event.query():            # query() 非阻塞，true=已完成
+                    break                               # 按序检查，遇到未完成就停止
                 finish_count += 1
+
+        # all_reduce(MIN)：取所有 rank 中完成的 min 值，保证跨 rank 一致
         finish_count_tensor = torch.tensor(finish_count, dtype=torch.int, device="cpu")
         self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
         finish_count = finish_count_tensor.item()
 
         if finish_count > 0:
             logger.debug(f"Process {finish_count} load operations")
+
+        # 按 FIFO 顺序收割：同步等待 → 清除 pending 状态 → 释放 lock_ref
         while finish_count > 0:
             _, finish_event, ack_list = self.cache_controller.ack_load_queue.pop(0)
-            finish_event.synchronize()
+            finish_event.synchronize()                  # 确认 Host→GPU DMA 完成
             for ack_id in ack_list:
-                end_node = self.ongoing_load_back.pop(ack_id)
-                self.dec_lock_ref(end_node)
+                end_node = self.ongoing_load_back.pop(ack_id)  # 移除 pending 记录
+                self.dec_lock_ref(end_node)                      # 释放 load_back 时加的锁
             finish_count -= 1
 
     def is_load_back_event_done(self, consumer_index: int) -> bool:
@@ -1031,6 +1283,31 @@ class HiRadixCache(RadixCache):
             self.evictable_host_leaves.add(node)
 
     def evict(self, params: EvictParams) -> EvictResult:
+        """驱逐 GPU 端 KV 以释放显存。
+
+        ╔════════════════════════════════════════════════════════════════════════════╗
+        ║  evict 的两条路径                                                             ║
+        ╠════════════════════════════════════════════════════════════════════════════╣
+        ║                                                                              ║
+        ║  RadixCache.evict：                                                          ║
+        ║    直接 free(node.value) + _delete_leaf  → 节点从树中删除（真删除）            ║
+        ║                                                                              ║
+        ║  HiRadixCache.evict：                                                        ║
+        ║    ┌──────────────────────────────────────────────────────────────────┐       ║
+        ║    │ node.backuped?                                                  │       ║
+        ║    │   ├── Yes → _evict_backuped: 只释放 GPU slot                    │       ║
+        ║    │   │         node.value = None, evicted=True                     │       ║
+        ║    │   │         节点仍在树中，host_value 保留，可 load_back 恢复       │       ║
+        ║    │   │                                                              │       ║
+        ║    │   └── No  → write_back 模式？                                    │       ║
+        ║    │         ├── Yes → write_backup(node) 先备份到 Host              │       ║
+        ║    │         │         写完后 _evict_backuped（降级）                  │       ║
+        ║    │         │                                                        │       ║
+        ║    │         └── No  → _evict_regular: 真删除（同 RadixCache）         │       ║
+        ║    │                   free + _delete_leaf，节点从树中移除              │       ║
+        ║    └──────────────────────────────────────────────────────────────────┘       ║
+        ╚════════════════════════════════════════════════════════════════════════════╝
+        """
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
         leaves = list(self.evictable_leaves)
@@ -1079,9 +1356,20 @@ class HiRadixCache(RadixCache):
         return EvictResult(num_tokens_evicted=num_evicted)
 
     def _evict_backuped(self, node: TreeNode):
-        # GPU -> CPU demotion: block moves from device to host.
-        # Emit remove(GPU) so downstream indexers stop scoring it as device-local.
-        # The matching store(CPU) was emitted when write_backup() copied to host.
+        """驱逐已备份到 Host 的节点：只释放 GPU slot，节点降级为 evicted 状态。
+
+        ╔══════════════════════════════════════════════════════════════╗
+        ║  驱逐前后节点状态变化                                          ║
+        ╠══════════════════════════════════════════════════════════════╣
+        ║  驱逐前：value=[gpu_slots], host_value=[host_slots]           ║
+        ║  驱逐后：value=None,        host_value=[host_slots]  不变     ║
+        ║          evicted=False → evicted=True                        ║
+        ║          backuped=True  → backuped=True   不变               ║
+        ║                                                                ║
+        ║  对比 _evict_regular（真删除）：                                ║
+        ║    free + _delete_leaf，节点从树中移除，host_value 也没了      ║
+        ╚══════════════════════════════════════════════════════════════╝
+        """
         self._record_remove_event(node, medium=StorageMedium.GPU)
         num_evicted = self.cache_controller.evict_device(node.value)
         assert num_evicted > 0
@@ -1094,6 +1382,11 @@ class HiRadixCache(RadixCache):
         return num_evicted
 
     def _evict_regular(self, node: TreeNode):
+        """真删除：节点既不在 Host 有备份，直接从树中移除。
+
+        只有在非 write_back 模式下，且节点没有 backuped 时才会走这条路。
+        效果等同于 RadixCache 的 evict：free GPU slot + _delete_leaf。
+        """
         # evict a node not initiated write to host -- emit BlockRemoved
         assert len(node.children) == 0, f"non-leaf, {node.id=}"
 
@@ -1104,6 +1397,21 @@ class HiRadixCache(RadixCache):
         return num_evicted
 
     def evict_host(self, num_tokens: int):
+        """驱逐 Host 端的 KV 缓存（Host→无），当 Host 内存不足时触发。
+
+        ╔════════════════════════════════════════════════════════════════════════════╗
+        ║  evict_host 只驱逐"GPU 已驱逐 + Host 还有副本"的节点                          ║
+        ╠════════════════════════════════════════════════════════════════════════════╣
+        ║                                                                              ║
+        ║  三级驱逐链：                                                                ║
+        ║    evict(GPU)   → 节点在 Host，evicted=True，可 load_back 恢复              ║
+        ║    evict_host   → 节点从树中删除（真删除），Host KV 也丢了                    ║
+        ║                                                                              ║
+        ║  前提：只有 evicted=True 的节点才能被 evict_host                               ║
+        ║        （如果 GPU 还有 value，说明还在用，不能删 Host 副本）                   ║
+        ║        host_ref_counter > 0 的也不能删（有 prefetch 在用）                    ║
+        ╚════════════════════════════════════════════════════════════════════════════╝
+        """
         leaves = list(self.evictable_host_leaves)
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
@@ -1141,6 +1449,35 @@ class HiRadixCache(RadixCache):
     def load_back(
         self, node: TreeNode, mem_quota: Optional[int] = None
     ) -> Optional[torch.Tensor]:
+        """将节点的 KV 从 Host 加载回 GPU（Host→GPU DMA），恢复 evicted 状态。
+
+        ╔════════════════════════════════════════════════════════════════════════════╗
+        ║  load_back 工作原理                                                          ║
+        ╠════════════════════════════════════════════════════════════════════════════╣
+        ║                                                                              ║
+        ║  场景：match_prefix 匹配到一个 evicted 节点，需要把 KV 从 Host 搬回 GPU        ║
+        ║                                                                              ║
+        ║  树结构示例：A(root) → B → C → D                                             ║
+        ║    B: value=[10,11], host_value=None, evicted=False                          ║
+        ║    C: value=None,    host_value=[20,21], evicted=True                        ║
+        ║    D: value=None,    host_value=[30,31], evicted=True                        ║
+        ║                                                                              ║
+        ║  load_back(D) 时：                                                            ║
+        ║    1. 从 D 往上走，收集所有连续 evicted 节点 → nodes_to_load = [C, D]         ║
+        ║    2. 找到最近的非 evicted 祖先 → ancestor_node = B                           ║
+        ║    3. inc_lock_ref(B)：防止 B 在 DMA 期间被 evict                             ║
+        ║    4. cat C.host_value + D.host_value → 一笔 DMA 传完                         ║
+        ║    5. cache_controller.load(host_indices) → device_indices                   ║
+        ║    6. C.value = device_indices[0:2], D.value = device_indices[2:4]            ║
+        ║    7. C.evicted=False, D.evicted=False                                       ║
+        ║    8. inc_lock_ref(D)：防止刚加载回来就被 evict                               ║
+        ╚════════════════════════════════════════════════════════════════════════════╝
+
+        GPU 内存不足时：
+          先调 evict 释放其他节点的 GPU KV，再重试一次
+        过短或超 mem_quota 时：
+          跳过加载（不值得花 DMA 开销）
+        """
 
         start_time = time.perf_counter()
         last_hit_node = node
@@ -1436,36 +1773,71 @@ class HiRadixCache(RadixCache):
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
     def match_prefix(self, params: MatchPrefixParams):
+        """在 radix tree 中查找与 key 匹配的最长前缀。
+
+        ╔════════════════════════════════════════════════════════════════════════════╗
+        ║  与 RadixCache.match_prefix 的区别                                            ║
+        ╠════════════════════════════════════════════════════════════════════════════╣
+        ║                                                                              ║
+        ║  RadixCache 返回：                                                            ║
+        ║    device_indices, last_device_node                                           ║
+        ║    （匹配到多长就返回多长，简单直接）                                            ║
+        ║                                                                              ║
+        ║  HiRadixCache 返回：                                                          ║
+        ║    device_indices   ← 匹配链上非 evicted 节点的 value 拼接                    ║
+        ║    last_device_node ← 最深的非 evicted 节点                                   ║
+        ║    last_host_node   ← 最深的 backuped 节点（为 load_back/prefetch 提供起点）   ║
+        ║    host_hit_length  ← 被驱逐到 Host 的 token 数                               ║
+        ║                                                                              ║
+        ║  示例树：A(root) → B → C → D                                                  ║
+        ║    B: evicted=False, backuped=False                                           ║
+        ║    C: evicted=True,  backuped=True                                            ║
+        ║    D: evicted=True,  backuped=True                                            ║
+        ║                                                                              ║
+        ║  匹配到 D 时：                                                                ║
+        ║    device_indices = B.value  （C、D 被 evicted，value=None，不包含）           ║
+        ║    last_device_node = B      （最深的非 evicted）                              ║
+        ║    last_host_node = D        （最深的 backuped，load_back 从这里开始）          ║
+        ║    host_hit_length = len(C) + len(D) （C、D 在 Host 上）                      ║
+        ║                                                                              ║
+        ║  后续调度器根据 host_hit_length 决定是否 load_back                             ║
+        ╚════════════════════════════════════════════════════════════════════════════╝
+        """
         if self.disable:
             return self._empty_match_result
 
         key = params.key
-        key, _ = key.maybe_to_bigram_view(self.is_eagle)
-        key = key.page_aligned(self.page_size)
+        key, _ = key.maybe_to_bigram_view(self.is_eagle)  # Eagle 模式下转 bigram 视图
+        key = key.page_aligned(self.page_size)              # 对齐到 page 边界（截断尾部不足一页的部分）
         if len(key) == 0:
             return self._empty_match_result
 
+        # 沿 radix tree 匹配前缀，收集匹配节点的 value（GPU slot 索引）
         value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
-            value = torch.cat(value)
+            value = torch.cat(value)                        # 拼接各匹配节点的 device_indices
         else:
             value = self._empty_match_result.device_indices
 
+        # 从 last_node 向上回溯，累计被 evicted（KV 在 Host 不在 GPU）的 token 数
         host_hit_length = 0
-        last_host_node = last_node
+        last_host_node = last_node                          # 先记住最深的匹配节点
         while last_node.evicted:
-            host_hit_length += len(last_node.host_value)
-            last_node = last_node.parent
+            host_hit_length += len(last_node.host_value)    # 累加 Host 端的 slot 数
+            last_node = last_node.parent                    # 继续往上找，直到遇到非 evicted 节点
+        # last_node 现在是最深的仍在 GPU 上的匹配节点（last_device_node）
+
+        # 从最深匹配节点向上找最近的 backuped 祖先，作为 load_back 的起点
         while not last_host_node.backuped:
-            last_host_node = last_host_node.parent
+            last_host_node = last_host_node.parent          # 找到最近的有 Host 副本的祖先
 
         return MatchResult(
             device_indices=value,
-            last_device_node=last_node,
-            last_host_node=last_host_node,
-            # TODO(ispobock): use best_match_node as start node for load_back
+            last_device_node=last_node,                     # 最深仍在 GPU 上的匹配节点
+            last_host_node=last_host_node,                  # 最近有 Host 副本的祖先，load_back 起点
+            # TODO(ispoblock): use best_match_node as start node for load_back
             best_match_node=last_host_node,
-            host_hit_length=host_hit_length,
+            host_hit_length=host_hit_length,                # Host 端命中的 token 数（需 load_back 的量）
         )
 
     def prefetch_from_storage(
@@ -1572,32 +1944,42 @@ class HiRadixCache(RadixCache):
 
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
         node.last_access_time = time.monotonic()
-        child_key = key.child_key(self.page_size)
-        value = []
+        child_key = key.child_key(self.page_size)  # 取 key 的第一页作为子节点查找键
+        value = []                                  # 收集匹配节点的 GPU slot 索引
 
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = time.monotonic()
-            prefix_len = child.key.match(key, page_size=self.page_size)
+            prefix_len = child.key.match(key, page_size=self.page_size)  # 计算当前 child 与 key 的公共前缀长度
+
             if prefix_len < len(child.key):
+                # 部分匹配：child 的 key 比 key 的前缀长，需要分裂 child
                 new_node = self._split_node(child.key, child, prefix_len)
                 if not new_node.evicted:
-                    value.append(new_node.value)
+                    value.append(new_node.value)     # 分裂后的新节点持有公共前缀部分
                 node = new_node
-                break
+                break                                # 前缀匹配到此结束
             else:
+                # 完全匹配：child 的 key 是 key 的前缀，继续往下走
                 if not child.evicted:
-                    value.append(child.value)
+                    value.append(child.value)         # 只收集 KV 在 GPU 上的节点
                 node = child
-                key = key[prefix_len:]
+                key = key[prefix_len:]                # 剥离已匹配部分，继续匹配剩余 key
 
                 if len(key):
-                    child_key = key.child_key(self.page_size)
+                    child_key = key.child_key(self.page_size)  # 剩余 key 的第一页作为下一步查找键
 
         return value, node
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int):
-        # child node split into new_node -> child
+        """重写父类 RadixCache._split_node，增加 HiCache 三层存储（GPU/Host）的分裂逻辑。
+
+        父类仅处理 GPU value 的拆分；本方法额外处理：
+        1. evicted 状态：子节点 KV 被驱逐到 Host 时，共享前缀 new_node 的 GPU value 置 None。
+        2. backuped 状态：分裂 host_value，保持 Host 层 KV 与树结构一致。
+        3. write-through pending 队列：替换待写队列中的 old child 为拆分后的两个节点。
+        """
+        # 创建共享前缀节点（new_node），作为原 child 的父节点
         new_node = TreeNode(priority=child.priority)
         new_node.children = {key[split_len:].child_key(self.page_size): child}
         new_node.parent = child.parent
@@ -1605,29 +1987,59 @@ class HiRadixCache(RadixCache):
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
 
-        # split value and host value if exists
+        # GPU 层 value 分裂 -
+        #   child.evicted → GPU 上没有 KV，共享前缀节点 value 为 None
+        #   child 未 evicted → 正常拆分 value
         if child.evicted:
             new_node.value = None
         else:
             new_node.value = child.value[:split_len].clone()
             child.value = child.value[split_len:].clone()
+
+        # Host 层 host_value 分裂 -
+        #   child 在 Host 有备份时，同步拆分 host_value
         if child.backuped:
             new_node.host_value = child.host_value[:split_len].clone()
             child.host_value = child.host_value[split_len:].clone()
 
+        # hash_value 拆分（用于 KV cache 事件路由/去重）
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
         )
+
+        # 重定向父子关系：new_node 插入 child 与 grandparent 之间
         child.parent = new_node
         child.key = child.key[split_len:]
         new_node.parent.children[key.child_key(self.page_size)] = new_node
 
+        # 更新 write-through 待写队列：旧的 child 被替换为 [new_node, child]
         if child.backuped:
             self._replace_pending_write_through_node(child, [new_node, child])
 
         return new_node
 
     def insert(self, params: InsertParams) -> InsertResult:
+        """将 KV 缓存写入 radix tree。
+
+        ╔════════════════════════════════════════════════════════════════════════════╗
+        ║  与 RadixCache.insert 的区别：evicted 节点的复活                              ║
+        ╠════════════════════════════════════════════════════════════════════════════╣
+        ║                                                                              ║
+        ║  RadixCache：节点匹配到就 inc_hit_count，不修改 value                          ║
+        ║                                                                              ║
+        ║  HiRadixCache：遇到 evicted 节点时，需要"复活"：                               ║
+        ║    node.value = value[:prefix_len].clone()   ← KV 重新回到 GPU               ║
+        ║    evictable_size_ += len(node.value)         ← GPU 可驱逐量增加              ║
+        ║    node.evicted → False                       ← 节点恢复为 GPU 状态           ║
+        ║                                                                              ║
+        ║  为什么需要复活？                                                              ║
+        ║    场景：请求 R1 的 KV 被驱逐到 Host（evicted=True），                         ║
+        ║    新请求 R2 与 R1 共享前缀，insert 时匹配到 evicted 节点，                     ║
+        ║    R2 的 value 已经在 GPU 上了（调度时分配了新 slot），                         ║
+        ║    所以直接用 R2 的 value 恢复 node.value，无需 load_back。                    ║
+        ║    这比 load_back（Host→GPU DMA）更快，因为 R2 的 KV 已经在 GPU 了。           ║
+        ╚════════════════════════════════════════════════════════════════════════════╝
+        """
         key = params.key
         value = params.value
         chunked = params.chunked
@@ -1636,43 +2048,51 @@ class HiRadixCache(RadixCache):
         if priority is None:
             priority = 0
 
-        key, value = key.maybe_to_bigram_view(self.is_eagle, value)
-        key = key.page_aligned(self.page_size)
+        key, value = key.maybe_to_bigram_view(self.is_eagle, value)  # Eagle 模式下转 bigram 视图
+        key = key.page_aligned(self.page_size)                        # 对齐到 page 边界
         if value is not None:
-            value = value[: len(key)]
+            value = value[: len(key)]                                 # 截断 value 与 key 等长
 
         if len(key) == 0:
             return InsertResult(prefix_len=0)
 
         node = self.root_node
-        child_key = key.child_key(self.page_size)
+        child_key = key.child_key(self.page_size)                     # 取 key 的第一页作为子节点查找键
         total_prefix_length = 0
 
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = time.monotonic()
-            node.priority = max(node.priority, priority)
+            node.priority = max(node.priority, priority)              # 继承最高优先级
             prefix_len = node.key.match(key, page_size=self.page_size)
 
             if prefix_len == len(node.key):
+                # 完全匹配：node.key 是 key 的前缀
                 if node.evicted:
-                    # change the reference if the node is evicted
-                    # this often happens in the case of KV cache recomputation
+                    # node 的 KV 之前被驱逐到 Host，现在新请求重新计算了 KV（已在 GPU），
+                    # 直接用新 value 恢复 node.value，无需 load_back DMA。
+                    # 注意：evicted 是 @property，等价于 self.value is None，
+                    # 所以 node.value = ... 赋值后 node.evicted 自动变为 False，无需显式设置。
                     node.value = value[:prefix_len].clone()
-                    self.evictable_size_ += len(node.value)
+                    self.evictable_size_ += len(node.value)           # 恢复后重新计入可驱逐大小
+                    # 节点 KV 从 Host 恢复到 GPU，更新其 GPU 可驱逐叶子状态
                     self._update_leaf_status(node)
+                    # 同步更新 Host 层可驱逐叶子状态（节点回到 GPU 后不再是 Host 候选叶子）
                     self._update_host_leaf_status(node)
-                    # update parent status as a new leaf is added into device
+                    # 父节点原本可能被子节点全部 evicted → 被标记为叶子；
+                    # 现在子节点恢复回 GPU，父节点不再是叶子，需要重新计算其状态
                     self._update_leaf_status(node.parent)
                 else:
+                    # node 的 KV 还在 GPU，只需增加引用计数
                     self._inc_hit_count(node, chunked)
                     total_prefix_length += prefix_len
             else:
-                # partial match, split the node
+                # 部分匹配：node.key 比 key 的公共前缀长，需要分裂
                 new_node = self._split_node(node.key, node, prefix_len)
                 # shared-prefix node should also reflect max priority
                 new_node.priority = max(new_node.priority, priority)
                 if new_node.evicted:
+                    # 分裂后的新节点也是 evicted 状态，用新 value 恢复
                     new_node.value = value[:prefix_len].clone()
                     self.evictable_size_ += len(new_node.value)
                     self._update_leaf_status(new_node)
@@ -1682,14 +2102,15 @@ class HiRadixCache(RadixCache):
                 else:
                     self._inc_hit_count(new_node, chunked)
                     total_prefix_length += prefix_len
-                node = new_node
+                node = new_node                                        # 继续从分裂后的新节点往下
 
-            key = key[prefix_len:]
+            key = key[prefix_len:]                                     # 剥离已匹配部分
             value = value[prefix_len:]
 
             if len(key):
                 child_key = key.child_key(self.page_size)
 
+        # 循环结束后 key 仍有剩余 → 树中没有匹配，创建新叶子节点
         if len(key):
             new_node = TreeNode(priority=priority)
             new_node.parent = node
@@ -1697,8 +2118,8 @@ class HiRadixCache(RadixCache):
             new_node.value = value.clone()
             node.children[child_key] = new_node
             self.evictable_size_ += len(value)
-            self._update_leaf_status(node)
-            self._update_leaf_status(new_node)
+            self._update_leaf_status(node)                             # 父节点不再是叶子
+            self._update_leaf_status(new_node)                         # 新节点是叶子
 
             # Compute hash_value if storage or kv events are enabled
             if self.enable_storage or self.enable_kv_cache_events:
@@ -1707,6 +2128,8 @@ class HiRadixCache(RadixCache):
             # Emit BlockStored so the router indexes this block.
             self._record_store_event(new_node)
 
+            # write_through 模式下，新节点也算"命中"（会触发 write_backup）
+            # write_back 模式下不 inc_hit_count，等 evict 时才写 Host
             if self.cache_controller.write_policy != "write_back":
                 self._inc_hit_count(new_node, chunked)
         return InsertResult(prefix_len=total_prefix_length)
