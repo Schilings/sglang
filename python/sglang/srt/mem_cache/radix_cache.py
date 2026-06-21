@@ -653,6 +653,16 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def evict(self, params: EvictParams) -> EvictResult:
         """
+        📌 完整调用链（从 scheduler 到 evict）：
+        scheduler.run_batch()
+          → prepare_for_decode / prepare_for_extend       (schedule_batch.py)
+            → alloc_for_decode / alloc_for_extend         (common.py)
+              → alloc_token_slots / alloc_paged_token_slots_extend  (common.py:272)
+                → evict_from_tree_cache(tree_cache, N)    (common.py:302)
+                  → tree_cache.evict(EvictParams(num_tokens=N))   ← 你在这
+        scheduler 在每次 alloc KV slot 之前检查显存。若不够，
+        先 evict 腾空间，再 alloc。这是 write_back / CPU offload 的核心触发点。
+        
         ⚠️ScheduleBatch::update_running_batch
             -> ScheduleBatch::check_decode_mem
                 -> evict_from_tree_cache

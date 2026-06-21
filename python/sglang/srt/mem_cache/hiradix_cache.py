@@ -1443,7 +1443,7 @@ class HiRadixCache(RadixCache):
         📌 阶段 1: 循环驱逐
            ├── lock_ref>0 → 跳过
            ├── 未 backuped + write_back → write_backup(DMA)，记录到 write_back_nodes
-           ├── 未 backuped + write_through → _evict_regular(真删除)
+           ├── 未 backuped + write_through(hit数可能没达到阈值，所以没backup) → _evict_regular(真删除)
            └── 已 backuped → _evict_backuped(降级到 Host)
         📌 阶段 2: write_back 两阶段收尾
            └── writing_check(等 DMA 完成) → _evict_backuped(释放 GPU)
@@ -1503,8 +1503,9 @@ class HiRadixCache(RadixCache):
                     if written > 0:
                         write_back_nodes.append(x)
                 else:
-                    # write_through 模式下未 backuped → 不该出现（write_through 会主动备份）
-                    # 若出现说明 write_backup 失败后节点仍未 backuped → 真删除
+                    # write_through 模式：insert 时已尝试 write_backup（threshold=1，即首次 hit 就触发），
+                    # 正常情况此时节点已 backuped。但若 Host 内存不足 write_backup 失败，
+                    # 节点仍是未 backuped 状态 → 只能真删除（无 Host 副本可用）
                     num_evicted += self._evict_regular(x)
             else:
                 # 已在 Host 有副本 → 直接释放 GPU slot（降级，节点仍在树中）
