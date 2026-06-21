@@ -1076,14 +1076,36 @@ class HiRadixCache(RadixCache):
         self.ongoing_write_through[ack_id] = (lock_node, backup_len, updated_nodes)
 
     def _finish_write_through_ack(self, ack_id: int, *, release_lock: bool) -> None:
+        """GPU→Host DMA 完成后的收尾回调，做四件事。
+
+        这是 write_through 流程的终点回调，由 scheduler writing_check() 轮询调用。
+        writing_check 先通过 all_reduce(MIN) 确保所有 PP rank 的 DMA 都完成，
+        再 FIFO 遍历 ack_write_queue 逐个调用本函数。
+
+        📌 四步收尾：
+        1. ongoing_write_through.pop(ack_id)   — 清除异步追踪记录
+        2. node.write_through_pending_id = None — DMA 确认，Host 已有副本
+        3. _record_store_event(CPU)            — 通知下游索引器（如 disaggregation router）
+        📌 4. if enable_storage: write_backup_storage(lock_node, backup_len)
+             — 将刚写入 Host 的 KV 进一步备份到 L3 持久化存储！
+             — 这是 L2→L3 的数据流入口：Host 写完后立即触发 storage 后备
+
+        Args:
+            ack_id:       DMA 操作的唯一 ID（等于 node.id）
+            release_lock: 是否释放 write_backup 时加的锁
+                          write_through: True（write_backup 加了 inc_lock_ref，现在释放）
+                          write_back:    False（write_backup 没加锁，evict 紧随其后）
+        """
         lock_node, backup_len, publish_nodes = self.ongoing_write_through.pop(ack_id)
         for node in publish_nodes:
             if node.write_through_pending_id == ack_id:
-                node.write_through_pending_id = None
-            # DMA confirmed -- block is now on host.
+                node.write_through_pending_id = None  # 清除 pending 标记
+            # DMA 确认完成 → 节点 KV 数据现在在 CPU Host 上可用
             self._record_store_event(node, medium=StorageMedium.CPU)
+        # 异步写入 L3 持久化存储（mooncake/EIC 等后端）
         if self.enable_storage:
             self.write_backup_storage(lock_node, backup_len)
+        # write_through 模式下释放 DMA 飞行期间的保护锁
         if release_lock:
             self.dec_lock_ref(lock_node)
 
@@ -1333,36 +1355,55 @@ class HiRadixCache(RadixCache):
         return self.evictable_size_
 
     def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
+        """引用计数 +1（沿路径到 root），同时更新 GPU 和 Host 两套可驱逐叶节点集合。
+
+        与 RadixCache.inc_lock_ref 的唯一区别：
+        多了 _update_host_leaf_status(node) 调用。
+        RadixCache 只需维护 evictable_leaves（GPU 层），
+        HiRadixCache 额外维护 evictable_host_leaves（Host 层），
+        确保 Host 内存不足时也能正确驱逐 Host 端 KV。
+        除此之外，lock_ref 的增减逻辑、evictable_size_/protected_size_ 统计完全一致。
+        """
         if self.disable:
             return IncLockRefResult(delta=0)
 
         delta = 0
         while node != self.root_node:
             if node.lock_ref == 0:
+                # 从可驱逐变为受保护 → 更新计数器
                 self.evictable_size_ -= len(node.key)
                 self.protected_size_ += len(node.key)
                 delta -= len(node.key)
             node.lock_ref += 1
-            self._update_leaf_status(node)
-            self._update_host_leaf_status(node)
+            self._update_leaf_status(node)        # GPU 层：更新 evictable_leaves
+            self._update_host_leaf_status(node)    # Host 层：更新 evictable_host_leaves（HiRadixCache 独有）
             node = node.parent
         return IncLockRefResult(delta=delta)
 
     def dec_lock_ref(
         self, node: TreeNode, params: Optional[DecLockRefParams] = None
     ) -> DecLockRefResult:
+        """引用计数 -1（沿路径到 root），同时更新 GPU 和 Host 两套可驱逐叶节点集合。
+
+        与 RadixCache.dec_lock_ref 的唯一区别：
+        多了 _update_host_leaf_status(node) 调用，原因同 inc_lock_ref。
+
+        额外维护 node.parent is None 的断言（RadixCache 也有），
+        防止跨树引用（不同 radix tree 实例）。
+        """
         if self.disable:
             return DecLockRefResult(delta=0)
 
         delta = 0
         while node != self.root_node:
             if node.lock_ref == 1:
+                # 从受保护变为可驱逐 → 更新计数器
                 self.evictable_size_ += len(node.key)
                 self.protected_size_ -= len(node.key)
                 delta += len(node.key)
             node.lock_ref -= 1
-            self._update_leaf_status(node)
-            self._update_host_leaf_status(node)
+            self._update_leaf_status(node)        # GPU 层：更新 evictable_leaves
+            self._update_host_leaf_status(node)    # Host 层：更新 evictable_host_leaves（HiRadixCache 独有）
             if node.parent is None:
                 assert (
                     node is self.root_node
@@ -1387,6 +1428,25 @@ class HiRadixCache(RadixCache):
 
     def evict(self, params: EvictParams) -> EvictResult:
         """驱逐 GPU 端 KV 以释放显存。
+
+        📌 完整调用链（从 scheduler 到 evict）：
+        scheduler.run_batch()
+          → prepare_for_decode / prepare_for_extend       (schedule_batch.py)
+            → alloc_for_decode / alloc_for_extend         (common.py)
+              → alloc_token_slots / alloc_paged_token_slots_extend  (common.py:272)
+                → evict_from_tree_cache(tree_cache, N)    (common.py:302)
+                  → tree_cache.evict(EvictParams(num_tokens=N))   ← 你在这
+        scheduler 在每次 alloc KV slot 之前检查显存。若不够，
+        先 evict 腾空间，再 alloc。这是 write_back / CPU offload 的核心触发点。
+
+        📌 阶段 0: 收集可驱逐叶子 → 按优先级建最小堆
+        📌 阶段 1: 循环驱逐
+           ├── lock_ref>0 → 跳过
+           ├── 未 backuped + write_back → write_backup(DMA)，记录到 write_back_nodes
+           ├── 未 backuped + write_through → _evict_regular(真删除)
+           └── 已 backuped → _evict_backuped(降级到 Host)
+        📌 阶段 2: write_back 两阶段收尾
+           └── writing_check(等 DMA 完成) → _evict_backuped(释放 GPU)
 
         ╔════════════════════════════════════════════════════════════════════════════╗
         ║  evict 的两条路径                                                             ║
@@ -1413,54 +1473,70 @@ class HiRadixCache(RadixCache):
         """
         start_time = time.perf_counter()
         num_tokens = params.num_tokens
+
+        # ── 阶段 0: 收集可驱逐的叶节点 ──
+        # 可驱逐叶子：lock_ref=0 且没有 GPU 上存在的子节点
         leaves = list(self.evictable_leaves)
+
+        # 按驱逐策略优先级构建最小堆（优先驱逐"冷"节点）
         eviction_heap = [
             (self.eviction_strategy.get_priority(node), node) for node in leaves
         ]
         heapq.heapify(eviction_heap)
 
         num_evicted = 0
-        write_back_nodes = []
+        write_back_nodes = []  # write_back 模式下先写 Host 再 evict 的节点（两阶段）
+
+        # ── 阶段 1: 按优先级循环驱逐 ──
         while num_evicted < num_tokens and len(eviction_heap):
             _priority, x = heapq.heappop(eviction_heap)
 
+            # 跳过被锁定的节点（正在被请求使用）
             if x.lock_ref > 0:
                 continue
 
             if not x.backuped:
                 if self.cache_controller.write_policy == "write_back":
-                    # write to host if the node is not backuped
+                    # write_back 模式：GPU→Host DMA，先备份，稍后 evict
                     written = self.write_backup(x, write_back=True)
                     num_evicted += written
                     if written > 0:
                         write_back_nodes.append(x)
                 else:
+                    # write_through 模式下未 backuped → 不该出现（write_through 会主动备份）
+                    # 若出现说明 write_backup 失败后节点仍未 backuped → 真删除
                     num_evicted += self._evict_regular(x)
             else:
+                # 已在 Host 有副本 → 直接释放 GPU slot（降级，节点仍在树中）
                 num_evicted += self._evict_backuped(x)
 
+            # ── 检查父节点是否变成新的可驱逐叶子 ──
+            # 驱逐一个节点后，如果父节点的所有子节点都被驱逐了，
+            # 父节点也变成"叶子"（可以被驱逐），加入堆中。
             for child in x.parent.children.values():
                 if child in write_back_nodes:
-                    continue
+                    continue  # write_back 节点还没真正 evict，不算
                 if not child.evicted:
-                    break
+                    break       # 还有子节点在 GPU，父节点不能驱逐
             else:
-                # all children are evicted or no children
+                # 所有子节点都已被驱逐（或无子节点）→ 父节点加入候选堆
                 new_priority = self.eviction_strategy.get_priority(x.parent)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
+        # ── 阶段 2: write_back 模式下的两阶段收尾 ──
+        # write_back 的 write_backup 只是发起了 DMA，数据还在飞行。
+        # 先等 DMA 完成（writing_check），再 evict GPU slot。
         if self.cache_controller.write_policy == "write_back":
-            self.writing_check(write_back=True)
+            self.writing_check(write_back=True)    # 等待所有 write_back DMA 完成
             for node in write_back_nodes:
-                assert node.backuped
-                self._evict_backuped(node)
+                assert node.backuped               # DMA 成功后 host_value 非空
+                self._evict_backuped(node)          # 释放 GPU slot，节点降级到 Host
 
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
 
     def _evict_backuped(self, node: TreeNode):
         """驱逐已备份到 Host 的节点：只释放 GPU slot，节点降级为 evicted 状态。
-
         ╔══════════════════════════════════════════════════════════════╗
         ║  驱逐前后节点状态变化                                          ║
         ╠══════════════════════════════════════════════════════════════╣
