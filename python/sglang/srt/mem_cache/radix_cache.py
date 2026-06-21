@@ -264,10 +264,12 @@ class TreeNode:
 
     @property
     def evicted(self):
+        #
         return self.value is None
 
     @property
     def backuped(self):
+        #
         return self.host_value is not None
 
     def protect_host(self):

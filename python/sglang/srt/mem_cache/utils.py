@@ -133,9 +133,27 @@ def hash_str_to_int64(hash_str: str) -> int:
 
 
 def compute_node_hash_values(node: Any, page_size: int) -> List[str]:
-    """Compute SHA256-based hash values for position-aware KV block IDs."""
+    """为 radix tree 节点计算逐页的 SHA256 哈希值（链式，位置感知）。
+
+    每个 page 的哈希值 = SHA256(当前 page 的 token IDs + 前一页的哈希值)。
+    通过链式哈希（类似区块链），使得每个 page 的 ID 同时编码了：
+      - 本页的 token 内容
+      - 该 page 在序列中的位置（因为依赖前一页哈希）
+
+    这样做的好处：
+      即使两个序列的某几页内容相同，只要它们在序列中的前缀不同，
+      其 page ID 也会不同，避免了错误的 cache 命中。
+
+    Args:
+        node:     radix tree 节点，包含 node.key（token 序列）和 node.parent（父节点）
+        page_size: 每个 page 包含的 token 数
+
+    Returns:
+        hash_values: 每个 page 对应的哈希值列表，长度 = ceil(len(tokens) / page_size)
+    """
     hash_values = []
 
+    # 从父节点获取上一页的哈希值作为初始链，体现前缀关系
     parent_hash = None
     if node.parent is not None and node.parent.hash_value is not None:
         if len(node.parent.key) > 0 and len(node.parent.hash_value) > 0:
@@ -146,9 +164,11 @@ def compute_node_hash_values(node: Any, page_size: int) -> List[str]:
         end = min(start + page_size, logical_len)
         if end <= start:
             continue
+        # 链式哈希：hash_page(start, end, parent_hash)
+        # parent_hash 即上一页的 hash，确保 position-awareness
         hash_val = node.key.hash_page(start, end, parent_hash)
         hash_values.append(hash_val)
-        parent_hash = hash_val
+        parent_hash = hash_val  # 传递给下一页
     return hash_values
 
 

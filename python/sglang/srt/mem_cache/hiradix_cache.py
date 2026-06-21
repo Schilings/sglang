@@ -82,19 +82,30 @@ class HiRadixCache(RadixCache):
     ║    │ value≠∅  │           │ 节点移除  │                                           ║
     ║    └──────────┘           └──────────┘                                           ║
     ║                                                                                  ║
-    ║  HiRadixCache 节点有三种状态：                                                      ║
-    ║    ┌──────────┐  write_backup  ┌──────────┐  write_backup_storage  ┌──────────┐  ║
-    ║    │ 在 GPU   │ ────────────→  │ 在 Host   │ ────────────────────→  │ 在Storage │ ║
-    ║    │ value≠∅  │  evict(GPU)    │ value=None│   backup              │           │ ║
-    ║    │ host=∅   │                │ host≠∅    │                       │           │ ║
-    ║    │ evicted=F│                │ evicted=T │                       │           │ ║
-    ║    │ backuped=F│               │ backuped=T│                       │           │ ║
-    ║    └──────────┘                └──────────┘                        └──────────┘  ║
-    ║         ↑  load_back               ↑  prefetch                                   ║
-    ║         └──────────────────────────┘──────────────────────────────────────────┘  ║
+    ║  HiRadixCache 节点状态流转（四态）：                                                 ║
     ║                                                                                  ║
-    ║  关键：evict 不是真删除，而是"降级"（GPU→Host），节点仍在树中。                           ║
-    ║  被驱逐的 KV 可以通过 load_back 从 Host 恢复，无需重新计算。                             ║
+    ║  GPU→Host 有两种触发路径：                                                               ║
+    ║    write_through: 新 token 立即 DMA → GPU+Host 共存（不等 evict）                        ║
+    ║    write_back:    等 GPU 内存不足 evict 时才 DMA → GPU 被释放                             ║
+    ║                                                                                             ║
+    ║                           write_backup                   write_backup_storage               ║
+    ║    ┌──────────┐  insert(wt)   ┌──────────┐  evict(GPU)  ┌──────────┐   backup  ┌──────────┐ ║
+    ║    │  GPU     │ ────────────→ │ GPU+Host │ ────────────→│  Host    │ ────────→ │ Storage  │ ║
+    ║    │ value≠∅  │               │ value≠∅  │              │ value=∅  │           │ host=∅   │ ║
+    ║    │ host=∅   │               │ host≠∅   │              │ host≠∅   │           │          │ ║
+    ║    │ backuped=F│              │ backuped=T│             │ evicted=T│           │          │ ║
+    ║    └──────────┘               └──────────┘              └──────────┘           └──────────┘ ║
+    ║         │                           ↑                        ↑  prefetch           ↑        ║
+    ║         │      evict(wb): 直接跳到这里                        └──────────────────────────────┘║
+    ║         └──────────────────────────────────────────────────┘                                   ║
+    ║                           ↑  load_back                                                         ║
+    ║                           └───────────────────────────────────────────────────────────────────┘║
+    ║                                                                                  ║
+    ║  关键区别：                                                                         ║
+    ║    write_through: GPU 和 Host 同时持有 KV（value≠∅, host≠∅），threshold=1              ║
+    ║    write_back:    evict 后才写 Host（value=∅, host≠∅），threshold=2                   ║
+    ║    evict 不是真删除，而是"降级"（GPU→Host），节点仍在树中。                              ║
+    ║    被驱逐的 KV 可以通过 load_back 从 Host 恢复，无需重新计算。                           ║
     ╚══════════════════════════════════════════════════════════════════════════════════╝
 
     ╔══════════════════════════════════════════════════════════════════════════════════╗
@@ -278,21 +289,79 @@ class HiRadixCache(RadixCache):
             extra_metric_labels=self.extra_metric_labels,
         )
 
-        # record the nodes with ongoing write through
+        # ═══════════════════════════════════════════════════════════════════
+        # 异步数据传输追踪器 — HiCache 的多层数据流是异步(non-blocking DMA)的，
+        # 需要追踪进行中的操作以确保事件回调和节点状态正确性。
+        # ═══════════════════════════════════════════════════════════════════
+
+        # ---- GPU→Host 写回追踪 ----
+        # key:   ack_id (node.id)
+        # value: (lock_node, backup_len, publish_nodes)
+        #   - lock_node:     持有读锁的节点(DMA期间防止KV被覆盖)
+        #   - backup_len:    写回的token长度(用于split后恢复)
+        #   - publish_nodes: DMA完成后标记为CPU_READY的节点列表
+        # 完整调用链:
+        #   创建: write_backup() → _track_write_through_node()
+        #   更新: radix tree split → _replace_pending_write_through_node() 替换旧节点
+        #   清除: scheduler writing_check() → _finish_write_through_ack() → pop + dec_lock_ref
         self.ongoing_write_through = {}
-        # record the node segments with ongoing load back
+
+        # ---- Host→GPU 加载追踪 ----
+        # key:   ack_id (last_hit_node.id)
+        # value: last_hit_node (加载任务对应的radix tree叶子节点)
+        # 完整调用链:
+        #   创建: scheduler → load_back() → ongoing_load_back[last_hit_node.id] = ...
+        #   清除: scheduler loading_check() → pop + dec_lock_ref(释放读锁)
         self.ongoing_load_back = {}
-        # record the ongoing prefetch requests
+
+        # ---- L3存储→Host 预取追踪 ----
+        # key:   req_id (请求ID)
+        # value: (last_host_node, prefetch_key, host_indices, operation)
+        #   - last_host_node: 最后一个已缓存的host节点
+        #   - prefetch_key:   待预取的token序列
+        #   - host_indices:   预取token在host pool中的位置
+        #   - operation:      存储后端返回的异步操作句柄
+        # 完整调用链:
+        #   创建: scheduler → prefetch_from_storage() → ongoing_prefetch[req_id] = ...
+        #   完成: scheduler prefill_check → del + release_host + 标记loaded tokens
+        #   取消: scheduler prefill_revoke → del + release_host
         self.ongoing_prefetch = {}
+
+        # ---- Host→L3存储 后备追踪 ----
+        # key:   operation_id (存储操作ID)
+        # value: node (被后备的radix tree节点)
+        # 完整调用链:
+        #   创建: write_backup_storage() → cache_controller.write_storage() → ongoing_backup[op_id] = node
+        #   清除: cache_controller ack_backup_queue 回调 → pop + entry.release_host()
         self.ongoing_backup = {}
-        # track per-request tokens loaded from storage (L3 hits)
-        # key: request_id, value: number of tokens actually loaded from storage
+
+        # ---- 统计: 每个请求从L3存储加载的token数 ----
+        # key:   request_id
+        # value: 该请求从存储中实际加载的token数(不含host cache命中)
+        # 用途:  监控/指标，评估 storage prefetch 的效果
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
+
+        # ---- NCCL集合通信异步句柄列表 ----
+        # 存储 torch.distributed.Work 对象, 用于attention group barrier同步
+        # 作用: 在跨TP/DP组同步时，等待所有成员完成通信
         self.work_list: List[torch.distributed.Work] = []
-        # todo: dynamically adjust the threshold
+
+        # ═══════════════════════════════════════════════════════════════════
+        # 阈值控制
+        # ═══════════════════════════════════════════════════════════════════
+
+        # write_through_threshold: 控制write-through vs write-back策略
+        #   =1 (write_through): 每个新token立即DMA到Host → 延迟低但带宽浪费
+        #       调用入口: scheduler → radix_cache.insert() → write_backup(node, write_back=False)
+        #   =2 (write_back):    累积2次访问后才写回 → 减少DMA次数,适合热token
+        #       调用入口: scheduler → radix_cache.evict() → write_backup(node, write_back=True)
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
         )
+
+        # load_back_threshold: 预取深度阈值
+        #   当L2 host cache命中点离序列末尾 < threshold 时, 提前从L3 storage预取后续token
+        #   调用入口: scheduler → match_prefix() 返回结果含 last_host_node → prefetch_from_storage()
         self.load_back_threshold = 10
 
         # Detach storage backend automatically on process shutdown
@@ -951,29 +1020,59 @@ class HiRadixCache(RadixCache):
     def _replace_pending_write_through_node(
         self, old_node: TreeNode, new_nodes: List[TreeNode]
     ) -> None:
+        """radix tree 节点 split 后，更新 write-through 等待队列中的节点引用。
+
+        背景：
+        GPU→Host DMA 写回是异步的（non_blocking），写回完成后通过 ack_id 确认。
+        split 操作在 DMA 完成之前可能发生：一个正在写回的节点因为新请求插入
+        共享前缀而被 split 成多个新节点。
+
+        此时 onboard_write_through 中的 publish_nodes 仍然持有 old_node 引用，
+        但 DMA 实际写回的是 old_node 对应的 KV 数据。如果不更新引用，
+        后续 _finish_write_through_ack 会把写入完成状态标到已被废弃的旧节点上。
+
+        本函数做的事：
+          将 publish_nodes 中的 old_node 替换为 new_nodes，
+          并给 new_nodes 打上相同的 ack_id，确保 DMA 完成时正确标记新节点。
+
+        Args:
+            old_node: split 前被替换的旧节点
+            new_nodes: split 后产生的新节点列表
+        """
+        # 1. 检查 old_node 是否在等待 write-through 完成
+        #    write_through_pending_id 非空 → 该节点的 KV 数据正在 DMA 写回中
         ack_id = old_node.write_through_pending_id
         if ack_id is None:
-            return
+            return  # 不在等待中，无需处理
 
+        # 2. 从全局等待队列中取出对应的 pending 记录
+        #    pending = (lock_node, backup_len, publish_nodes)
+        #    publish_nodes 就是 DMA 完成后需要标记的节点列表
         pending = self.ongoing_write_through.get(ack_id)
         if pending is None:
-            return
+            return  # ack 已经处理过了（极端情况）
 
         lock_node, backup_len, publish_nodes = pending
+
+        # 3. 遍历 publish_nodes，把 old_node 替换为 new_nodes
         updated_nodes = []
         replaced = False
         for node in publish_nodes:
             if node is old_node:
+                # old_node 已被 split 成 new_nodes（如 [new_inner, child]）
                 updated_nodes.extend(new_nodes)
                 replaced = True
             else:
                 updated_nodes.append(node)
 
         if not replaced:
-            return
+            return  # old_node 不在 publish_nodes 中（已被其他路径处理）
 
+        # 4. 新节点继承 ack_id，等待 DMA 完成确认
         for node in new_nodes:
             node.write_through_pending_id = ack_id
+
+        # 5. 用更新后的节点列表替换队列中的记录
         self.ongoing_write_through[ack_id] = (lock_node, backup_len, updated_nodes)
 
     def _finish_write_through_ack(self, ack_id: int, *, release_lock: bool) -> None:
@@ -1080,6 +1179,10 @@ class HiRadixCache(RadixCache):
         # 沿祖先路径生效：对一个节点加锁，它的所有祖先也会被加锁
 
         # 节点尚未在 Host 有备份，且命中数达到阈值 → 触发异步写回 Host
+        # ⚠️ 注意：_inc_hit_count 可能在没有 inc_lock_ref(node) 的情况下被调用
+        # （例如 insert 创建新节点时，line ~2240）。此时节点仅靠祖先节点的 lock_ref
+        # 间接保护，未被直接锁定。write_backup(node) 内部会补 inc_lock_ref(node)
+        # 来保护 DMA 飞行期间的节点（line ~1009）。
         if not node.backuped:
             if node.hit_count >= self.write_through_threshold:
                 self.write_backup(node)
@@ -1148,12 +1251,12 @@ class HiRadixCache(RadixCache):
         if finish_count > 0:
             logger.debug(f"Process {finish_count} write back operations")
 
-        # 按 FIFO 顺序收割已完成的 DMA —
+        # 📌按 FIFO 顺序收割已完成的 DMA —
         #   synchronize() 确认 GPU→Host DMA 真正完成（防假完成）
         #   → _finish_write_through_ack 清理 ongoing_write_through + 发 Store 事件
         #   → dec_lock_ref 释放 write_backup 时加的锁（release_lock=True）
         #
-        # ack_write_queue vs ongoing_write_through 的关系：
+        # 📌 ack_write_queue vs ongoing_write_through 的关系：
         #   ack_write_queue 每条记录 = 一次 flush_write DMA 操作
         #   ongoing_write_through 每条记录 = 一个树节点
         #   一次 DMA 可能合并写多个节点（merge），所以 ack_list 有多个 ack_id，
@@ -1162,13 +1265,13 @@ class HiRadixCache(RadixCache):
             _, finish_event, ack_list = self.cache_controller.ack_write_queue.pop(0)
             finish_event.synchronize()                  # 阻塞确认 DMA 物理完成
             for ack_id in ack_list:
-                # _finish_write_through_ack 收尾四件事：
+                # 📌 _finish_write_through_ack 收尾四件事：
                 #   1. ongoing_write_through.pop(ack_id)    ← 清除 pending 记录
                 #   2. node.write_through_pending_id = None ← DMA 确认，Host 已有副本
                 #   3. _record_store_event(CPU)             ← 通知下游索引器
                 #   4. if enable_storage: write_backup_storage ← 写第三层存储
                 #
-                # release_lock=True 的原因：
+                # 📌 release_lock=True 的原因：
                 #   write_through 模式下 write_backup 执行了 inc_lock_ref(node)
                 #   防止 DMA 飞行期间节点被 evict，这里 DMA 确认完成后释放锁。
                 #   对比 write_back 模式（line ~1113）release_lock=False：
@@ -1813,6 +1916,8 @@ class HiRadixCache(RadixCache):
             return self._empty_match_result
 
         # 沿 radix tree 匹配前缀，收集匹配节点的 value（GPU slot 索引）
+        # ⚠️ value只含有device上存在的indices
+        # ⚠️ last node是完整的匹配链的尾端node
         value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
             value = torch.cat(value)                        # 拼接各匹配节点的 device_indices
@@ -1825,18 +1930,22 @@ class HiRadixCache(RadixCache):
         while last_node.evicted:
             host_hit_length += len(last_node.host_value)    # 累加 Host 端的 slot 数
             last_node = last_node.parent                    # 继续往上找，直到遇到非 evicted 节点
-        # last_node 现在是最深的仍在 GPU 上的匹配节点（last_device_node）
+        # ⚠️ 排除末端的evicted节点，last_node 现在是最深的仍在 GPU 上的匹配节点（last_device_node）
 
-        # 从最深匹配节点向上找最近的 backuped 祖先，作为 load_back 的起点
         while not last_host_node.backuped:
             last_host_node = last_host_node.parent          # 找到最近的有 Host 副本的祖先
+        # ⚠️ 排除末端的非backuped节点，last_host_node是最近的有 Host 副本的祖先
 
         return MatchResult(
+            # ⚠️ value只含有device上存在的indices
             device_indices=value,
+            # ⚠️ 排除末端的evicted节点，last_node 现在是最深的仍在 GPU 上的匹配节点（last_device_node）
             last_device_node=last_node,                     # 最深仍在 GPU 上的匹配节点
+            # ⚠️ 排除末端的非backuped节点，last_host_node是最近的有 Host 副本的祖先
             last_host_node=last_host_node,                  # 最近有 Host 副本的祖先，load_back 起点
             # TODO(ispoblock): use best_match_node as start node for load_back
             best_match_node=last_host_node,
+            # evicted不代表backuped吧？
             host_hit_length=host_hit_length,                # Host 端命中的 token 数（需 load_back 的量）
         )
 
@@ -2012,6 +2121,7 @@ class HiRadixCache(RadixCache):
         child.key = child.key[split_len:]
         new_node.parent.children[key.child_key(self.page_size)] = new_node
 
+        # 📌 可能该节点还处于 GPU → CPU的DMA搬运中
         # 更新 write-through 待写队列：旧的 child 被替换为 [new_node, child]
         if child.backuped:
             self._replace_pending_write_through_node(child, [new_node, child])
