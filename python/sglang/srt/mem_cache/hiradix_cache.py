@@ -70,7 +70,7 @@ logger = logging.getLogger(__name__)
 
 """
     ╔══════════════════════════════════════════════════════════════════════════════════╗
-    ║  与 Scheduler 的完整交互流程                                                       ║
+    ║  与 Scheduler 的完整交互流程（GPU ↔ Host ↔ Storage 三层）                           ║
     ╠══════════════════════════════════════════════════════════════════════════════════╣
     ║                                                                                  ║
     ║  scheduler 每次迭代 = get_next_batch → run_batch → process_batch_result          ║
@@ -78,12 +78,23 @@ logger = logging.getLogger(__name__)
     ║                                                                                  ║
     ║  ════════════ get_next_batch_to_run() 阶段 ════════════                            ║
     ║                                                                                  ║
-    ║  ① check_hicache_events()        — 每轮调度前：                                    ║
-    ║      ├─ writing_check()           非阻塞收割 write_through DMA（GPU→Host）         ║
-    ║      └─ loading_check()           非阻塞收割 load_back DMA（Host→GPU）             ║
+    ║  ① check_hicache_events()        — 每轮调度前，统一收割异步事件：                  ║
+    ║      ├─ writing_check()           非阻塞收割 GPU→Host write_through DMA          ║
+    ║      │    └─ _finish_write_through_ack → write_backup_storage                   ║
+    ║      │       → ongoing_backup[op_id] = node → start Host→Storage 异步备份       ║
+    ║      ├─ loading_check()           非阻塞收割 Host→GPU load_back DMA              ║
+    ║      └─ drain_storage_control_queues()  (enable_storage=True 时)                 ║
+    ║           ├─ _drain_backup()  收割 Storage 写入完成 ack → pop + release_host     ║
+    ║           ├─ _drain_revoke()  取消进行中的 prefetch → pop + release_host         ║
+    ║           └─ _drain_release() 批量释放 Host 内存页                                ║
     ║                                                                                  ║
     ║  ② match_prefix(key)              — 查 radix tree，匹配最长前缀：                  ║
     ║      └─ 返回 MatchResult(device_indices, last_device_node, last_host_node, ...)   ║
+    ║                                                                                  ║
+    ║  ②a prefetch_from_storage(key)    — 前缀在 Storage 但不在 Host 时触发：           ║
+    ║      └─ cache_controller.read_storage() → 异步 Storage→Host DMA                  ║
+    ║         → ongoing_prefetch[req_id] = (node, ...) 注册追踪                        ║
+    ║         → 下轮 drain_storage_control_queues 收割完成结果                           ║
     ║                                                                                  ║
     ║  ③ init_load_back(params)         — 若 best_match_node 在 Host 不在 GPU：         ║
     ║      └─ load_back(node) → cache_controller.load() 入队 → start_loading 逐层 DMA  ║
@@ -104,22 +115,46 @@ logger = logging.getLogger(__name__)
     ║  ⑦ cache_finished_req(req)         — 请求完成时入树 + 释放 slot：                  ║
     ║      └─ insert + dec_lock_ref + free overallocated                               ║
     ║                                                                                  ║
+    ║  ════════════ L2(Host) ↔ L3(Storage) 分层数据流 ════════════                       ║
+    ║                                                                                  ║
+    ║  📤 Host → Storage（备份 L2→L3）：                                                 ║
+    ║    ① DMA 完成 → writing_check → _finish_write_through_ack                        ║
+    ║       → if enable_storage: write_backup_storage(node, backup_len)                ║
+    ║         → cache_controller.write_storage(host_value, key, hash, ...)             ║
+    ║           → ongoing_backup[op_id] = node  ← 注册，追踪异步写入                    ║
+    ║           → node.protect_host()           ← 锁定，禁止 evict_host 驱逐            ║
+    ║    ② 下轮 ① check → drain_storage_control_queues → _drain_backup                 ║
+    ║       → ack_backup_queue 收到写入完成确认                                         ║
+    ║       → ongoing_backup.pop(op_id) → node.release_host()  ← 解锁                  ║
+    ║       → 此时 Host KV 可被安全驱逐（数据已在 L3 持久化）                             ║
+    ║                                                                                  ║
+    ║  📥 Storage → Host（预取 L3→L2）：                                                 ║
+    ║    ① match_prefix 命中 Tree 节点但不在 Host → 触发 prefetch_from_storage           ║
+    ║       → cache_controller.read_storage() → Storage→Host 异步 DMA                   ║
+    ║       → ongoing_prefetch[req_id] = (node, tokens, indices, op)                    ║
+    ║    ② 下轮 ① check → drain_storage_control_queues 收割                            ║
+    ║       → prefetch 完成 → ongoing_prefetch.pop → loaded tokens 标记可用             ║
+    ║       → prefetch 超时 → prefetch_revoke_queue → _drain_revoke → pop + 回收        ║
+    ║                                                                                  ║
     ║  ════════════ 典型 Extend + Decode 时序 ════════════                               ║
     ║                                                                                  ║
     ║  Iter N (prefill):                                                                ║
-    ║    ① check → ② match_prefix → ③ init_load_back → ④ inc_lock_ref                   ║
-    ║    → ⑤ evict+alloc → run_batch → ⑥ cache_unfinished_req (insert+write_backup)    ║
+    ║    ① check (收割 L3 ack + DMA) → ② match → ②a prefetch_from_storage               ║
+    ║    → ③ init_load_back → ④ inc_lock_ref → ⑤ evict+alloc → run_batch                ║
+    ║    → ⑥ cache_unfinished_req (insert + DMA → 触发 L2→L3 备份)                      ║
     ║                                                                                  ║
     ║  Iter N+1 (decode):                                                               ║
-    ║    ① check (收割上次 write_backup DMA) → ⑤ evict+alloc → run_batch                 ║
-    ║    → (decode 不 cache_unfinished_req)                                              ║
+    ║    ① check (收割 N 轮的 write DMA + Storage backup ack) → ⑤ evict+alloc           ║
+    ║    → run_batch (decode 不 cache_unfinished_req)                                   ║
     ║                                                                                  ║
     ║  Iter N+K (finished):                                                             ║
     ║    → ⑦ cache_finished_req (insert + free)                                        ║
     ║                                                                                  ║
     ║  🔑 关键区别：                                                                     ║
     ║    write_through: insert 时异步 DMA，evict 时不等待，writing_check 每轮非阻塞收割   ║
+    ║       └─ DMA 完成 → write_backup_storage → Host→Storage 异步备份                  ║
     ║    write_back:    insert 时不 DMA，evict 时才紧急 write_backup + 阻塞等待          ║
+    ║       └─ write_back 仅 GPU↔Host，不触发 L3 备份                                   ║
     ║    decode 每步不调 cache_unfinished_req（每步仅 1 token，page_size>1 时浪费）      ║
     ╚══════════════════════════════════════════════════════════════════════════════════╝
 """
