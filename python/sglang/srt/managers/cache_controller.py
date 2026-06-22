@@ -1183,6 +1183,9 @@ class HiCacheController:
         self.write_queue.append(
             CacheOperation(host_indices, device_indices, node_id, priority)
         )
+        # ⚠️ 当前 write() 每次都立即调用 start_writing()，queue 在 merge_ops 后立刻 clear，
+        # 因此同一 batch 内多次 write() 各自独立 DMA，不会合并。merge_ops 在当前模式下是 no-op。
+        # 未来若要真正合并：去掉这行，改为在 batch 结束时由 scheduler 统一调用 start_writing()。
         self.start_writing()
         return host_indices
 
