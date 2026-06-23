@@ -17,17 +17,27 @@ from srt.utils import flatten_arrays_to_pinned_cpu, is_pin_memory_available, cei
 # limitations under the License.
 # ==============================================================================
 """
-Store information about requests and batches.
-
-The following is the flow of data structures for a batch:
-
-ScheduleBatch -> ForwardBatch
-
-- ScheduleBatch is managed by `scheduler.py::Scheduler`.
-  It contains high-level scheduling data. Most of the data is on the CPU.
-- ForwardBatch is managed by `model_runner.py::ModelRunner`.
-  It contains low-level tensor data. Most of the data consists of GPU tensors.
-  It is constructed directly from a ScheduleBatch by `ForwardBatch.init_new`.
+╔══════════════════════════════════════════════════════════════════════════════════════╗
+║  📋 ScheduleBatch & Req —— 请求状态和批次信息的核心数据结构                            ║
+╠══════════════════════════════════════════════════════════════════════════════════════╣
+║                                                                                      ║
+║  📦 数据流：ScheduleBatch (CPU, 调度器管理) → ForwardBatch (GPU, ModelRunner 管理)      ║
+║                                                                                      ║
+║  🧾 Req: 单个请求的完整状态                                                             ║
+║    ├─ origin_input_ids / output_ids   ← 输入输出 token 序列                            ║
+║    ├─ fill_len / seqlen               ← prefill 长度 / 当前序列总长                    ║
+║    ├─ last_node / cache_protected_len ← radix tree 匹配结果 + 锁状态                    ║
+║    ├─ swa_uuid_for_lock               ← SWA 锁边界标记                                 ║
+║    ├─ prefix_indices                  ← chunked prefill 的 KV 缓存索引                  ║
+║    └─ output_ids / check_stop         ← decode 结果 + 停止条件                          ║
+║                                                                                      ║
+║  📊 ScheduleBatch: 一次 GPU forward 的批次信息                                          ║
+║    ├─ reqs: List[Req]                 ← 本批次包含的请求列表                             ║
+║    ├─ forward_mode                    ← EXTEND / DECODE / IDLE / ...                  ║
+║    ├─ token_to_kv_pool_allocator      ← KV cache 分配器                                ║
+║    └─ hicache_consumer_index          ← HiCache load_back 的逐层同步索引                 ║
+║                                                                                      ║
+╚══════════════════════════════════════════════════════════════════════════════════════╝
 """
 
 import copy
@@ -658,7 +668,10 @@ class ReqLogprob:
 
 
 class Req(ReqDllmMixin):
-    """The input and output status of a request."""
+    """🧾 单个请求的完整状态 —— input/output tokens、KV cache 引用、停止条件。
+
+    👆 字段说明请见文件顶部模块注释。
+    """
 
     def __init__(
         self,
@@ -1724,7 +1737,10 @@ def _compute_chunked_req_next_prompt_token(
 
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
-    """Store all information of a batch on the scheduler."""
+    """📊 一次 GPU forward 的批次信息 —— reqs 列表、forward_mode、KV 分配器。
+
+    👆 字段说明请见文件顶部模块注释。
+    """
 
     # === Core: request list (ForwardBatch derives lora_ids / rids / grammars / positions from it) ===
     # 请求列表

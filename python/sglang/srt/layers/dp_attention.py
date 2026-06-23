@@ -341,6 +341,18 @@ def get_attention_tp_size() -> int:
     return get_attn_tensor_model_parallel_world_size()
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# 📐 CP (Context Parallelism) 相关 helper —— 封装 _ATTN_CP 组访问
+#
+# get_attention_cp_group() → _ATTN_CP ProcessGroup
+#   每个 cp 组内 ranks 按步长 attn_tp_size 采样
+#   组内 GPU 持有同一条 prefill 序列的不同 chunk
+#
+# attn_cp_all_gather_into_tensor() → CP 组内 AllGather
+#   用于 attention 输出和 KV cache 的跨 rank 合并
+#
+# get_moe_cp_group() → attn_cp_size > moe_dp_size 时 MoE DP = CP
+# ═══════════════════════════════════════════════════════════════════════════
 def get_attention_cp_group() -> GroupCoordinator:
     return get_attn_cp_group()
 

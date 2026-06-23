@@ -14,10 +14,19 @@ limitations under the License.
 
 Memory pool.
 
-SGLang has two levels of memory pool.
-ReqToTokenPool maps a request to its token locations.
-TokenToKVPoolAllocator manages the indices to kv cache data.
-KVCache actually holds the physical kv cache.
+╔══════════════════════════════════════════════════════════════════════════════════════╗
+║  💾 GPU KV Cache 内存池 —— 两级池设计                                                ║
+╠══════════════════════════════════════════════════════════════════════════════════════╣
+║                                                                                      ║
+║  📋 ReqToTokenPool          → 映射 request → token 在 KV pool 中的位置 (slot 索引)     ║
+║  🗂️ TokenToKVPoolAllocator  → 管理 KV pool slot 的分配/释放                           ║
+║  💾 KVCache                  → 实际存储 KV cache 的物理 tensor                         ║
+║                                                                                      ║
+║  └─ MHATokenToKVPool    标准 MHA (LLaMA/Qwen)                                       ║
+║  └─ MLATokenToKVPool    Multi-Head Latent Attention (DeepSeek-V2/V3)                ║
+║  └─ DSATokenToKVPool    Dual-Stream Attention 混合架构                                ║
+║                                                                                      ║
+╚══════════════════════════════════════════════════════════════════════════════════════╝
 """
 
 from __future__ import annotations
@@ -208,7 +217,12 @@ def _set_kv_buffer_prefix_valid_impl(
 
 
 class ReqToTokenPool:
-    """A memory pool that maps a request to its token locations."""
+    """📋 Request → Token Slot 映射池 —— 将每个 request 映射到其 KV cache token 位置。
+
+    size:            最大并发 request 数
+    max_context_len: 每个 request 的最大 context 长度
+    req_to_token:    形状 [size, max_context_len] 的 slot 索引张量
+    """
 
     enable_mamba_extra_buffer_lazy: bool = False
 
@@ -856,6 +870,10 @@ def unwrap_write_loc(loc_info):
 
 
 class KVCache(abc.ABC):
+    """💾 KV Cache 抽象基类 —— 定义 get/set key/value buffer 的统一接口。
+
+    👆 具体实现见 MHATokenToKVPool / MLATokenToKVPool / DSATokenToKVPool。
+    """
     @abc.abstractmethod
     def __init__(
         self,
@@ -952,6 +970,10 @@ class KVCache(abc.ABC):
 
 
 class MHATokenToKVPool(KVCache):
+    """💾 MHA KV Cache Pool —— 标准 Multi-Head Attention 模型的 GPU KV 缓存。
+
+    👆 字段和架构见文件顶部模块注释。
+    """
     def __init__(
         self,
         size: int,
@@ -2007,6 +2029,10 @@ class HybridLinearKVPool(KVCache):
 
 
 class MLATokenToKVPool(KVCache):
+    """💾 MLA KV Cache Pool —— Multi-Head Latent Attention 模型 (DeepSeek-V2/V3) 的 GPU KV 缓存。
+
+    👆 字段和架构见文件顶部模块注释。
+    """
     def __init__(
         self,
         size: int,
@@ -2398,6 +2424,10 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
 
 
 class DSATokenToKVPool(MLATokenToKVPool):
+    """💾 DSA KV Cache Pool —— Dual-Stream Attention 混合架构的 GPU KV 缓存。
+
+    👆 字段和架构见文件顶部模块注释。
+    """
     quant_block_size = 128
     index_k_with_scale_buffer_dtype = torch.uint8
     rope_storage_dtype = torch.bfloat16  # rope is always stored in bf16

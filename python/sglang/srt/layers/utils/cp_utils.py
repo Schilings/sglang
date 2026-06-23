@@ -5,6 +5,49 @@ from typing import Callable, List
 import torch
 import torch.nn.functional as F
 
+# ╔══════════════════════════════════════════════════════════════════════════════════════╗
+# ║  📐 Attn CP (Context Parallelism) —— 长序列 prefill 的序列并行核心                      ║
+# ╠══════════════════════════════════════════════════════════════════════════════════════╣
+# ║                                                                                      ║
+# ║  🔗 从 Scheduler 出发的完整调用链                                                       ║
+# ║                                                                                      ║
+# ║  Scheduler.get_next_batch_to_run()                                                    ║
+# ║    └─ get_new_batch_prefill() → ForwardBatch.init_new()                              ║
+# ║         └─ prepare_context_parallel_metadata()  ← 🎯 计算 zigzag 分块元数据             ║
+# ║              → ContextParallelMetadata(split_list, zigzag_index, ...)                ║
+# ║                                                                                      ║
+# ║  ModelRunner.forward()                                                                ║
+# ║    ├─ cp_split_and_rebuild_data()         ← 按 CP 拆分 input_ids / positions         ║
+# ║    └─ attention_backend.forward_extend()                                              ║
+# ║         ├─ cp_attn_forward_extend()       ← Q 切 prev/next 两半分别算 attention        ║
+# ║         └─ cp_allgather_and_save_kv_cache() ← AllGather KV → 写入 kv pool            ║
+# ║                                                                                      ║
+# ║  After attention:                                                                     ║
+# ║    └─ cp_all_gather_rerange_output()      ← AllGather attention 输出 → 恢复原始顺序    ║
+# ║                                                                                      ║
+# ║  ════════════ 🧩 Zigzag 分块原理 (in-seq-split) ════════════                           ║
+# ║                                                                                      ║
+# ║  每条序列分成 2*cp_size 个块，zigzag 分配到 cp_size 个 rank:                             ║
+# ║                                                                                      ║
+# ║  block0 | block1 | block2 | block3 | block4 | block5 | block6 | block7               ║
+# ║  rank 0: block0, block7     ← 一头一尾两段                                              ║
+# ║  rank 1: block1, block6                                                              ║
+# ║  rank 2: block2, block5                                                              ║
+# ║  rank 3: block3, block4                                                              ║
+# ║                                                                                      ║
+# ║  每个 rank 独立算自己两块的 attention，最后 AllGather 合并恢复原始顺序。                    ║
+# ║  cp_attn_forward_extend 将 Q 按 total_q_prev/total_q_next 切分，分两次调 attention。     ║
+# ║                                                                                      ║
+# ║  ════════════ ⚙️ Rank 布局 = (dp, cp, tp)，tp 最快变化 ════════════                       ║
+# ║                                                                                      ║
+# ║  attn_cp_group: rank每隔 attn_tp_size 采样 (见 parallel_state.py)                       ║
+# ║  attn_tp_size = tp_size / cp_size / dp_size                                          ║
+# ║                                                                                      ║
+# ║  关键文件: cp_utils.py (本文件) / parallel_state.py (_ATTN_CP) / dp_attention.py        ║
+# ║           / flashattention_backend.py / dsa_backend.py                                 ║
+# ║                                                                                      ║
+# ╚══════════════════════════════════════════════════════════════════════════════════════╝
+
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -23,6 +66,27 @@ from sglang.srt.server_args import get_global_server_args
 
 @dataclass
 class ContextParallelMetadata:
+    """📐 Zigzag 分块后的 CP 元数据 —— 由 prepare_context_parallel_metadata() 计算。
+
+    ╔══════════════════════════════════════════════════════════════════════════════════╗
+    ║  🗂️ Layout 字段 (长度 = bs * 2 * cp_size)                                         ║
+    ║    split_list          每个 block 的 token 数                                      ║
+    ║    zigzag_index        当前 rank 持有 block 的索引                                  ║
+    ║    cp_reverse_index    AllGather 后恢复原始顺序的逆序索引                             ║
+    ║                                                                                  ║
+    ║  📊 Per-rank 汇总 (长度 = cp_size)                                                 ║
+    ║    per_rank_actual_token  每个 rank 实际拥有的 token 数                              ║
+    ║                                                                                  ║
+    ║  ⚡ FlashAttention 所需张量 (shape [bs] 或 [bs+1], int32 CUDA)                     ║
+    ║    kv_len_prev/next          prev/next 两半的 KV 长度                              ║
+    ║    cu_seqlens_q_prev/next    FlashAttention 累积序列长度                             ║
+    ║    total_q_prev/next_tokens  prev/next 两半的总 token 数                            ║
+    ║                                                                                  ║
+    ║  📐 示意: cp_size=4 单个序列的 zigzag 分块                                          ║
+    ║    prev(前半): block0@r0 | block1@r1 | block2@r2 | block3@r3                      ║
+    ║    next(后半): block7@r0 | block6@r1 | block5@r2 | block4@r3                      ║
+    ╚══════════════════════════════════════════════════════════════════════════════════╝
+    """
     # Layout lists have length bs * cp_segment_num (= bs * 2 * cp_size).
     split_list: List[int] = None
     zigzag_index: List[int] = None

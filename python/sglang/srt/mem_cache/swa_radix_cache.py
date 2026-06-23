@@ -15,10 +15,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""
-The radix tree data structure for managing the hybrid (full and SWA) KV cache.
-"""
-
 import heapq
 import time
 from collections import defaultdict
@@ -55,6 +51,31 @@ logger = logging.getLogger(__name__)
 
 
 class TreeNode:
+    """Radix Tree 节点 —— 同时存在于 Full LRU 和 SWA LRU 两条链表上。
+
+    ╔══════════════════════════════════════════════════════════════════════════════════╗
+    ║  🏷️ 关键字段                                                                      ║
+    ╠══════════════════════════════════════════════════════════════════════════════════╣
+    ║                                                                                  ║
+    ║  value / host_value      Full KV 的 Device/Host slot 索引                        ║
+    ║  full_lock_ref            Full 锁定计数 → 被请求锁定时不可驱逐                      ║
+    ║  swa_lock_ref             SWA 锁定计数 → 只有 window 内的 SWA 被锁                  ║
+    ║  swa_tombstone            SWA KV 已被驱逐 → Full KV 仍在，但 SWA 无效               ║
+    ║  swa_uuid                 SWA 锁边界标记 → inc/dec_lock_ref 的边界控制             ║
+    ║  hash_value               每页 SHA256 → Storage 层去重/查找                       ║
+    ║                                                                                  ║
+    ║  ════════════ 🗂️ 双重 LRU 链表指针 ════════════                                    ║
+    ║                                                                                  ║
+    ║  full_lru_list:  prev / next            → 所有节点共享                            ║
+    ║  swa_lru_list:   swa_prev / swa_next    → 仅非 tombstone 节点                     ║
+    ║                                                                                  ║
+    ║  invariant:                                                                       ║
+    ║    1. full_lock_ref ≥ swa_lock_ref                                                ║
+    ║    2. swa_tombstone → swa_lock_ref == 0                                           ║
+    ║    3. 叶子节点不能是 tombstone                                                       ║
+    ║                                                                                  ║
+    ╚══════════════════════════════════════════════════════════════════════════════════╝
+    """
 
     counter = 0
     swa_uuid_counter = 1
@@ -393,7 +414,79 @@ class LRUList:
             raise Exception(msg)
 
 
+"""
+╔══════════════════════════════════════════════════════════════════════════════════════╗
+║  🪟 SWA Radix Cache —— 管理 Full KV + Sliding Window KV 的双重 Radix Tree          ║
+╠══════════════════════════════════════════════════════════════════════════════════════╣
+║                                                                                      ║
+║  ════════════ 🔗 从 Scheduler 出发的完整调用链 ════════════                             ║
+║                                                                                      ║
+║  Scheduler.get_new_batch_prefill()                                                    ║
+║    ├─ ① match_prefix(key)                    ← 查树命中 + SWA 安全截断               ║
+║    │      └─ _match_prefix_helper()           ← tombstone 感知的前缀匹配             ║
+║    ├─ ② inc_lock_ref(last_node)              ← Full 锁全部 / SWA 锁 window 大小      ║
+║    ├─ ③ alloc_for_extend / evict              ← 不够则 evict Full or SWA             ║
+║    │      └─ evict(full_num_tokens, swa_num_tokens)                                  ║
+║    │           ├─ Full LRU → get_leaf_lru_no_lock() → 驱逐叶子                       ║
+║    │           └─ SWA LRU → get_lru_no_lock() → tombstone 内部节点 or 驱逐叶子        ║
+║    └─ ④ run_batch(prefill/decode)                                                    ║
+║                                                                                      ║
+║  Scheduler.process_batch_result()                                                     ║
+║    ├─ ⑤ cache_unfinished_req(req)             ← chunked prefill 中间结果入树         ║
+║    │      └─ insert(key, value, prev_prefix_len) → re-match → 写回 req_to_token      ║
+║    │           → dec_lock_ref(旧) + inc_lock_ref(新) ← 锁交换                        ║
+║    └─ ⑥ cache_finished_req(req)              ← 请求完成，最终入树 + 释放锁           ║
+║                                                                                      ║
+║  decode 阶段（每步 forward 后）:                                                        ║
+║    └─ dec_swa_lock_only()  ← SWA 提前释放优化：decode 推进后旧窗口 KV 可回收          ║
+║                                                                                      ║
+║  ════════════ 🪦 核心概念：Tombstone ════════════                                     ║
+║                                                                                      ║
+║  Hybrid 模型（如 Qwen2.5-Omni）有两套 KV Cache:                                        ║
+║    📦 Full KV: 全局 attention 层的 KV，永不丢弃（直到驱逐）                            ║
+║    🪟 SWA KV:  sliding window attention 层的 KV，只有最近 W 个 token 有效              ║
+║                                                                                      ║
+║  Tombstone = "半死节点": Full KV 还在树中，但 SWA KV 已被驱逐。                          ║
+║                                                                                      ║
+║  ┌──────────┐   SWA evict    ┌──────────┐                                            ║
+║  │  正常节点  │ ────────────→ │ tombstone │                                           ║
+║  │ Full ✓   │                │ Full ✓   │                                            ║
+║  │ SWA  ✓   │                │ SWA  ✗   │  ← SWA 已驱逐，SWA LRU 列表中已移除         ║
+║  └──────────┘                └──────────┘                                            ║
+║                                   │                                                   ║
+║                                   │ 新请求 re-prefill 该段                              ║
+║                                   ↓                                                   ║
+║                              ┌──────────┐                                             ║
+║                              │  复活节点  │  ← insert 时用新 KV 修复                   ║
+║                              │ Full ✓   │                                             ║
+║                              │ SWA ✓(新) │  ← 重新加入 SWA LRU                       ║
+║                              └──────────┘                                             ║
+║                                                                                      ║
+║  ════════════ 🗂️ 双重 LRU ════════════                                                ║
+║                                                                                      ║
+║  每个 TreeNode 有两套链表指针(prev/next + swa_prev/swa_next), 同时在两条 LRU 链上:       ║
+║    📦 full_lru_list: 包含所有非 tombstone 节点 → 用于 Full 驱逐                       ║
+║    🪟 swa_lru_list:  只包含非 tombstone 节点 → 用于 SWA 驱逐                         ║
+║                                                                                      ║
+║  驱逐时 Full 只删叶子（维持树结构）, SWA 可 tombstone 内部节点（叶子也可删）。            ║
+║                                                                                      ║
+║  ════════════ 🔑 关键 invariant ════════════                                          ║
+║                                                                                      ║
+║  1. full_lock_ref ≥ swa_lock_ref  (有 SWA 锁必有 Full 锁)                              ║
+║  2. 叶子节点不能是 tombstone    (驱逐叶子时会级联删除父 tombstone)                        ║
+║  3. swa_lru_list 不能包含 tombstone 节点                                               ║
+║  4. swa_evictable_size_ 只统计 swa_lru_list 中的节点                                    ║
+║                                                                                      ║
+╚══════════════════════════════════════════════════════════════════════════════════════╝
+"""
+
 class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
+    """🪟 Hybrid 模型的 Radix Cache —— 管理 Full KV + Sliding Window KV 双重缓存。
+
+    ╔══════════════════════════════════════════════════════════════════════════════════╗
+    ║  👆 请先读文件顶部模块注释了解整体 Scheduler 调用链和 Tombstone 概念。                ║
+    ╚══════════════════════════════════════════════════════════════════════════════════╝
+    """
     def __init__(self, params: CacheInitParams):
         assert isinstance(params.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
         self.req_to_token_pool = params.req_to_token_pool
@@ -424,6 +517,14 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         return True
 
     def reset(self) -> None:
+        """🔄 重置所有状态 —— 清空 radix tree + 双 LRU + 统计计数器。
+
+        ╔══════════════════════════════════════════════════════════════════════════════════╗
+        ║  ① 新建 root_node（full_lock_ref=swa_lock_ref=1，永不被驱逐）                      ║
+        ║  ② 创建 full_lru_list (LRUList(is_swa=False)) + swa_lru_list (is_swa=True)      ║
+        ║  ③ 重置 evictable_size_ / protected_size_ 为 0                                    ║
+        ╚══════════════════════════════════════════════════════════════════════════════════╝
+        """
         self.root_node = TreeNode()
         self.root_node.key = []
         self.root_node.value = []
@@ -440,22 +541,27 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         self._record_all_cleared_event()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
-        """在 radix tree 中查找与 key 匹配的最长前缀。
+        """🔍 SWA 安全前缀匹配 —— 在 radix tree 中查找最长前缀，tombstone 感知截断。
 
-        【与 RadixCache.match_prefix 的核心区别】：
-        RadixCache 的 match_prefix 匹配到多长就返回多长，因为没有 tombstone 的概念。
-        SWARadixCache 的 match_prefix 需要额外考虑 SWA 安全性：
-        - 树中可能有 swa_tombstone 节点（SWA KV 被驱逐但 full KV 还在的"半死"节点）
-        - tombstone 节点的 SWA KV 已丢失，如果请求复用了 tombstone 节点的前缀，
-          在 SWA attention 中会读到空数据，导致计算错误
-        - 因此 match_prefix 必须截断：只返回"从 root 到最后一个 tombstone 之后，
-          连续非 tombstone 节点长度 ≥ sliding_window_size"的部分
-        - 这个截断由 _match_prefix_helper 返回的 best_value_len 实现，
-          _match_post_processor 做 value[:best_value_len] 截断
-
-        返回值：
-          device_indices: 截断后的 KV slot 索引（可能比实际匹配到的短）
-          last_device_node: 匹配链中最后一个节点（未截断的）
+        ╔══════════════════════════════════════════════════════════════════════════════════╗
+        ║  🔗 Scheduler → get_new_batch_prefill → match_prefix(key)                        ║
+        ╠══════════════════════════════════════════════════════════════════════════════════╣
+        ║                                                                                  ║
+        ║  ⚔️ vs RadixCache: RadixCache 匹配多长返回多长。SWARadixCache 必须考虑 tombstone:   ║
+        ║  tombstone 节点的 SWA KV 已丢失，若复用其前缀 SWA attention 读到空数据 → 错误！      ║
+        ║  因此 _match_prefix_helper 返回 best_value_len 做截断:                            ║
+        ║  只保留"最后一个 tombstone 后连续非 tombstone 长度 ≥ sliding_window"的部分         ║
+        ║                                                                                  ║
+        ║  🧠 核心逻辑:                                                                     ║
+        ║    ① _match_pre_processor(key)              ← page-align + bigram view           ║
+        ║    ② _match_prefix_helper(key)              ← 沿树走 + tombstone 感知             ║
+        ║         ├─ 非 tombstone: match_len_since_tombstone += page tokens               ║
+        ║         ├─ 遇 tombstone: 若连续段 ≥ window → 记录 best_value_len, 重置计数         ║
+        ║         └─ 循环结束: 最后一段 ≥ window → best_value_len = len(value)             ║
+        ║    ③ _match_post_processor(value, best_value_len) ← 截断 + 刷新双 LRU            ║
+        ║                                                                                  ║
+        ║  Returns: MatchResult(device_indices=截断后的KV索引, last_device_node=叶节点)       ║
+        ╚══════════════════════════════════════════════════════════════════════════════════╝
         """
 
         key = self._match_pre_processor(params)
@@ -483,22 +589,22 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         return self._match_post_processor(params, value, last_node, best_value_len)
 
     def insert(self, params: InsertParams) -> InsertResult:
-        """将请求的 KV 插入 radix tree，返回实际插入的 prefix 长度。
+        """📝 将请求的 KV 插入 radix tree，支持 tombstone 节点修复。
 
-        参数：
-          key                — 请求的 token_ids，已 page-aligned
-          value              — 每个 token 在 full_kv_pool 中的 slot 索引
-          prev_prefix_len     — 上次 match_prefix 匹配到了多少个 token
-                                只有 position ≥ prev_prefix_len 的 KV 是本次新计算的，
-                                之前的 KV 是上次 match 给的旧数据，不能用来覆盖 tombstone
-          swa_evicted_seqlen  — 该请求的 SWA KV 从哪个 position 开始被驱逐了
-                                决定了 tombstone 节点是否能被修复
-
-        整体流程（详见 _insert_helper）：
-          1. 从 root 出发遍历树，找到已有节点匹配到的前缀部分
-          2. 对每个已有节点，如果它是 tombstone 且在"本次新计算"范围内，
-             尝试用新 KV 修复它（三个分支：全部恢复 / 部分恢复+split / 无法恢复）
-          3. 遍历结束后，把树中不存在的后缀（key 剩余部分）新建节点追加到树上
+        ╔══════════════════════════════════════════════════════════════════════════════════╗
+        ║  🔗 Scheduler → cache_unfinished_req / cache_finished_req → insert()              ║
+        ╠══════════════════════════════════════════════════════════════════════════════════╣
+        ║                                                                                  ║
+        ║  📋 两阶段（详见 _insert_helper）:                                                 ║
+        ║    阶段1: 遍历已有节点 → 对 tombstone 在"本次新计算"范围内的尝试修复:                  ║
+        ║      Branch 1: 全部恢复  → free 旧 full + 写入新 full + swa_tombstone=False      ║
+        ║      Branch 2: 部分恢复  → _split_node + 前半 tombstone + 后半恢复                ║
+        ║      Branch 3: 无法恢复  → free 新 value，tombstone 保持原样                        ║
+        ║      正常节点: free 新 value（避免 double-alloc）                                   ║
+        ║    阶段2: key 剩余部分创建新节点 → 若 swa_evicted_seqlen 切在中间则前半 tombstone      ║
+        ║                                                                                  ║
+        ║  Returns: InsertResult(prefix_len=树中已有 prefix 的 token 数)                     ║
+        ╚══════════════════════════════════════════════════════════════════════════════════╝
         """
         if self.disable:
             return InsertResult(prefix_len=0)
@@ -709,6 +815,27 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         return self._total_size_helper()
 
     def evict(self, params: EvictParams) -> EvictResult:
+        """🗑️ 双重驱逐 —— 先驱逐 Full token，不够再驱逐 SWA token。
+
+        ╔══════════════════════════════════════════════════════════════════════════════════╗
+        ║  🔗 Scheduler → alloc_for_extend → 不够 → evict_from_tree_cache() → evict()      ║
+        ╠══════════════════════════════════════════════════════════════════════════════════╣
+        ║                                                                                  ║
+        ║  📦 阶段1: Full 驱逐 (full_num_tokens > 0)                                        ║
+        ║    full_lru_list.get_leaf_lru_no_lock()  ← 从尾部找第一个未锁叶子                  ║
+        ║    ├─ free(full + swa KV)                 ← 释放本叶子                            ║
+        ║    ├─ remove_node from full_lru + swa_lru ← 从双链表移除                          ║
+        ║    ├─ _delete_leaf(node)                  ← 从 radix tree 删除                    ║
+        ║    └─ _iteratively_delete_tombstone_leaf  ← 级联删除父 tombstone(维持叶子非TS约束)  ║
+        ║                                                                                  ║
+        ║  🪟 阶段2: SWA 驱逐 (swa_num_evicted < swa_num_tokens)                            ║
+        ║    swa_lru_list.get_lru_no_lock()         ← 找第一个未锁节点(可以是内部节点)        ║
+        ║    ├─ 内部节点: free_swa(v) → _tombstone_internal_node(node)  ← 变半死           ║
+        ║    ├─ 叶子节点(full_lock>0): free_swa(v) → swa_tombstone=True  ← SWA 提前释放残留  ║
+        ║    └─ 叶子节点(full_lock=0): free(full+swa) → _delete_leaf  ← 完全删除             ║
+        ║                                                                                  ║
+        ╚══════════════════════════════════════════════════════════════════════════════════╝
+        """
         if self.disable:
             return EvictResult()
         start_time = time.perf_counter()
@@ -816,21 +943,24 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         )
 
     def inc_lock_ref(self, node: TreeNode) -> IncLockRefResult:
+        """🔒 锁住节点路径 —— Full 锁全部，SWA 只锁 sliding_window 大小。
+
+        ╔══════════════════════════════════════════════════════════════════════════════════╗
+        ║  🔗 Scheduler → inc_lock_ref(last_node) ← match_prefix 后锁定匹配路径             ║
+        ╠══════════════════════════════════════════════════════════════════════════════════╣
+        ║                                                                                  ║
+        ║  Full 加锁: [node, root)       → 沿 parent 链一路加到 root                       ║
+        ║  SWA 加锁: [node, window_end) → 累计 tokens 超过 sliding_window_size 时停止      ║
+        ║             停止处设置 node.swa_uuid = gen_swa_uuid()                            ║
+        ║                                                                                  ║
+        ║  📐 示例: 树 Root→N1[0-32]→N2[32-64]→N3[64-96]→N4[96-128], window=64             ║
+        ║    Full: N4+N3+N2+N1 (全部上锁)                                                    ║
+        ║    SWA:  N4(32)+N3(32)=64 → 够 window 了 → swa_uuid_for_lock=N3.swa_uuid        ║
+        ║    → 解锁时只需解到 N3                                                             ║
+        ║                                                                                  ║
+        ║  Returns: IncLockRefResult(swa_uuid_for_lock) → 传给 dec_lock_ref 确定解锁边界     ║
+        ╚══════════════════════════════════════════════════════════════════════════════════╝
         """
-        Increment the lock reference count for the node. Returns the swa_uuid_for_lock, which needs
-        to be passed to dec_lock_ref.
-        It locks the full_lock_ref for nodes between the [last node, root), exclusive.
-        It locks the swa_lock_ref for nodes between the [last node, swa_uuid_for_lock], inclusive.
-        """
-        '''
-        树结构:  Root → N1[0-32] → N2[32-64] → N3[64-96] → N4[96-128]
-        请求匹配到 N4, sliding_window=64
-        
-        Full 加锁: N4 + N3 + N2 + N1 (全部)
-        SWA 加锁:  N4(32) + N3(32) = 64 → 到 N3 就够了
-          → swa_uuid_for_lock = N3.swa_uuid
-          → 解锁时只需解锁到 N3
-        '''
         if self.disable:
             return IncLockRefResult()
 
@@ -877,14 +1007,24 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
         params: Optional[DecLockRefParams] = None,
         skip_swa: bool = False,
     ) -> DecLockRefResult:
-        """
-        Decrement the lock reference count for the node.
-        It unlocks the full_lock_ref for nodes between the [last node, root), exclusive.
-        It unlocks the swa_lock_ref for nodes between the [last node, swa_uuid_for_lock], inclusive.
-        If swa_uuid_for_lock is None, it unlocks to the root, exclusive.
+        """🔓 解锁节点路径 —— Full 全解，SWA 解到 swa_uuid_for_lock 边界。
 
-        If skip_swa is True, only the full_lock_ref is decremented; the SWA lock is
-        assumed to have been released already (e.g. via `dec_swa_lock_only`).
+        ╔══════════════════════════════════════════════════════════════════════════════════╗
+        ║  🔗 Scheduler → cache_finished_req / cache_unfinished_req → dec_lock_ref         ║
+        ╠══════════════════════════════════════════════════════════════════════════════════╣
+        ║                                                                                  ║
+        ║  Full 解锁: [node, root)        → 沿 parent 链全部 -1                              ║
+        ║  SWA 解锁: [node, uuid_bound)  → 遇到 swa_uuid == swa_uuid_for_lock 时停止        ║
+        ║                                                                                  ║
+        ║  skip_swa=True: 仅解 Full 锁（SWA 锁已被 dec_swa_lock_only 提前释放）               ║
+        ║                                                                                  ║
+        ║  📐 示例: dec_lock_ref(N4, swa_uuid_for_lock=N3.swa_uuid)                         ║
+        ║    N4: full-1, swa-1                                                             ║
+        ║    N3: full-1, swa-1 → swa_uuid == uuid → SWA 解锁停止                           ║
+        ║    N2: full-1, swa 不碰                                                           ║
+        ║    N1: full-1, swa 不碰                                                           ║
+        ║                                                                                  ║
+        ╚══════════════════════════════════════════════════════════════════════════════════╝
         """
         swa_uuid_for_lock = params.swa_uuid_for_lock if params is not None else None
 
@@ -927,27 +1067,22 @@ class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
     def dec_swa_lock_only(
         self, node: TreeNode, swa_uuid_for_lock: Optional[int] = None
     ):
-        """
-        Decrement only the swa_lock_ref (and swa_protected_size_) along the chain
-        [node, swa_uuid_for_lock], inclusive. The full_lock_ref is left untouched
-        so the caller's full-cache protection is preserved.
+        """⚡ SWA 提前释放优化 —— decode 推进后旧窗口 KV 立即可回收。
 
-        Used to early-release the SWA portion of a request's tree lock once the
-        request's decode position has advanced past the sliding window, so the
-        protected window can be reclaimed.
-
-        For internal nodes, the standard protected -> evictable transition is
-        applied (node stays in swa_lru_list and may be evicted by SWA LRU later).
-        For leaf nodes, since `swa_lru_list` cannot contain a leaf with
-        `full_lock_ref > 0` (SWA-eviction would also delete the still-referenced
-        leaf), we instead free the SWA pool slots immediately and mark the leaf
-        as `swa_tombstone=True`. The full kv stays alive until the full-side
-        lock drops; future prefix-matches stop before this tombstoned leaf.
-
-        Caller must ensure this is invoked at most once per (node, swa_uuid_for_lock)
-        pair (track via e.g. `Req.swa_prefix_lock_released`). When the request
-        finally releases its full lock via `dec_lock_ref`, pass `skip_swa=True`
-        to avoid touching SWA state again.
+        ╔══════════════════════════════════════════════════════════════════════════════════╗
+        ║  🔗 Scheduler → decode forward → dec_swa_lock_only()  ← 每步 decode 后触发       ║
+        ╠══════════════════════════════════════════════════════════════════════════════════╣
+        ║                                                                                  ║
+        ║  Full 锁不动（保留），只减 SWA 锁。decode 时位置前移，旧 window 的 SWA 锁变无用。      ║
+        ║                                                                                  ║
+        ║  🌿 叶子节点: 立即 free_swa + remove from swa_lru + swa_tombstone=True            ║
+        ║     → SWA LRU 不能含 full_lock>0 的叶子，所以直接回收不等待                        ║
+        ║  🌳 内部节点: protected → evictable 标准语义，后续 SWA 驱逐时统一处理                ║
+        ║                                                                                  ║
+        ║  ⚠️ 每个 (node, swa_uuid_for_lock) 对只能调用一次（Req.swa_prefix_lock_released 追踪） ║
+        ║  ⚠️ 最终 dec_lock_ref 时需传 skip_swa=True，避免重复操作 SWA 状态                    ║
+        ║                                                                                  ║
+        ╚══════════════════════════════════════════════════════════════════════════════════╝
         """
         if self.disable:
             return

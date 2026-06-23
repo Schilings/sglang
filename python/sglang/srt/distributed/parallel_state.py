@@ -1962,8 +1962,43 @@ def initialize_model_parallel(
 
     attn_dp_size = attention_data_parallel_size
     attn_cp_size = attention_context_model_parallel_size
+    # ╔══════════════════════════════════════════════════════════════════════════════════╗
+    # ║  📐 attn_tp_size = tp_size / cp_size / dp_size                                   ║
+    # ║  Rank 布局 (dp, cp, tp)，其中 tp 最快变化                                          ║
+    # ║                                                                                  ║
+    # ║  例: tp_size=8, dp_size=2, cp_size=2 → attn_tp_size=2                            ║
+    # ║    GPU:  [0, 1, 2, 3, 4, 5, 6, 7]                                               ║
+    # ║    cp=0:[0,1] cp=1:[2,3]  |  dp=0                                               ║
+    # ║    cp=0:[4,5] cp=1:[6,7]  |  dp=1                                               ║
+    # ║  cp_group[0]: [0,2,4,6] (步长=2=attn_tp_size)                                     ║
+    # ║  cp_group[1]: [1,3,5,7]                                                          ║
+    # ╚══════════════════════════════════════════════════════════════════════════════════╝
     attn_tp_size = tensor_model_parallel_size // attn_cp_size // attn_dp_size
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 📐 创建 _ATTN_CP —— Attn Context Parallelism 通信组
+    #
+    # 每个 cp 组内 ranks 按步长 attn_tp_size 采样，确保同 CP 组的 GPU
+    # 持有同一条序列的不同 chunk。
+    #
+    # cp_group[cp_idx] = { rank | (rank // attn_tp_size) % cp_size == cp_idx }
+    #
+    # 例: tp=8, dp=2, cp=2, attn_tp_size=2
+    #   cp_group[0]: [g0, g2, g4, g6]  ← 持有 block0/block3
+    #   cp_group[1]: [g1, g3, g5, g7]  ← 持有 block1/block2
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 📐 创建 _ATTN_CP —— Attn Context Parallelism 通信组
+    #
+    # 每个 cp 组内 ranks 按步长 attn_tp_size 采样，确保同 CP 组的 GPU
+    # 持有同一条序列的不同 chunk。
+    #
+    # cp_group[cp_idx] = { rank | (rank // attn_tp_size) % cp_size == cp_idx }
+    #
+    # 例: tp=8, dp=2, cp=2, attn_tp_size=2
+    #   cp_group[0]: [g0, g2, g4, g6]  ← 持有 block0/block3
+    #   cp_group[1]: [g1, g3, g5, g7]  ← 持有 block1/block2
+    # ═══════════════════════════════════════════════════════════════════════════
     global _ATTN_CP
     assert (
         _ATTN_CP is None
@@ -2361,6 +2396,18 @@ def destroy_model_parallel():
         _MOE_TP.destroy()
     _MOE_TP = None
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # 📐 创建 _ATTN_CP —— Attn Context Parallelism 通信组
+    #
+    # 每个 cp 组内 ranks 按步长 attn_tp_size 采样，确保同 CP 组的 GPU
+    # 持有同一条序列的不同 chunk。
+    #
+    # cp_group[cp_idx] = { rank | (rank // attn_tp_size) % cp_size == cp_idx }
+    #
+    # 例: tp=8, dp=2, cp=2, attn_tp_size=2
+    #   cp_group[0]: [g0, g2, g4, g6]  ← 持有 block0/block3
+    #   cp_group[1]: [g1, g3, g5, g7]  ← 持有 block1/block2
+    # ═══════════════════════════════════════════════════════════════════════════
     global _ATTN_CP
     global _MOE_DP
     # Destroy _MOE_DP before _ATTN_CP since it may alias _ATTN_CP.

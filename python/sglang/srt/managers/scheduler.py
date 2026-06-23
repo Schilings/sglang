@@ -11,7 +11,49 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""A scheduler that manages a tensor parallel GPU worker."""
+"""
+╔══════════════════════════════════════════════════════════════════════════════════════╗
+║  ⏱️ Scheduler —— SGLang 的请求调度核心，每次迭代 = get_batch → run_batch → process   ║
+╠══════════════════════════════════════════════════════════════════════════════════════╣
+║                                                                                      ║
+║  🔗 主循环 (event_loop_normal / event_loop_overlap)                                    ║
+║                                                                                      ║
+║  while True:                                                                          ║
+║    │                                                                                  ║
+║    ├─ ① recv_requests()                    ← 从 TokenizerManager 接收新请求            ║
+║    │     └─ handle_batch_generate_request() → Req 入 wait_queue                       ║
+║    │                                                                                  ║
+║    ├─ ② get_next_batch_to_run()            ← 决定下一批执行什么                         ║
+║    │     ├─ check_hicache_events()          ← 收割 HiCache 异步事件                     ║
+║    │     ├─ get_new_batch_prefill()         ← 构建 prefill batch                       ║
+║    │     │     ├─ match_prefix(key) → radix tree 前缀匹配 → SWA 安全截断               ║
+║    │     │     ├─ inc_lock_ref(node) → 锁住匹配路径防驱逐                                ║
+║    │     │     ├─ alloc_for_extend → 不够 → evict_from_tree_cache()                   ║
+║    │     │     └─ cache_unfinished_req(req) ← chunked prefill 中间结果               ║
+║    │     └─ update_running_batch()         ← 构建 decode batch                        ║
+║    │           └─ dec_swa_lock_only()      ← SWA 提前释放优化                           ║
+║    │                                                                                  ║
+║    ├─ ③ run_batch(batch)                   ← 提交到 GPU worker (ModelRunner)          ║
+║    │     └─ tp_worker.forward_batch_generation(batch) → GenerationBatchResult         ║
+║    │                                                                                  ║
+║    └─ ④ process_batch_result(batch, result) ← 处理完成的批次结果                         ║
+║          ├─ cache_unfinished_req(req)       ← insert + re-match → 写回 req_to_token    ║
+║          ├─ cache_finished_req(req)         ← 请求完成: insert + free + dec_lock_ref   ║
+║          ├─ dec_swa_lock_only()             ← decode 后 SWA 提前释放                    ║
+║          ├─ 更新 req.output_ids / check_stop / logprob                               ║
+║          └─ send_to_detokenizer()           ← 结果发送给 TokenizerManager              ║
+║                                                                                      ║
+║  ════════════ 🏗️ 初始化流程 ════════════                                               ║
+║                                                                                      ║
+║  Scheduler.__init__()                                                                  ║
+║    ├─ init_tp_worker()          ← 创建 TpWorker + ModelRunner                        ║
+║    ├─ init_memory_pools()       ← 分配 KV cache pool + Radix Cache + HiCache          ║
+║    ├─ init_all_backends()       ← 初始化 attention backend + capture CUDA graph       ║
+║    ├─ init_deterministic_inference_config()                                           ║
+║    └─ init_handshake()          ← 与 TokenizerManager 交换 init info                   ║
+║                                                                                      ║
+╚══════════════════════════════════════════════════════════════════════════════════════╝
+"""
 
 import dataclasses
 import faulthandler
@@ -298,7 +340,30 @@ class Scheduler(
     SchedulerDllmMixin,
     SchedulerMlxOverlapMixin,
 ):
-    """A scheduler that manages a tensor parallel GPU worker."""
+    """⏱️ Scheduler —— 管理 TP GPU worker 的请求调度器。
+
+    ╔══════════════════════════════════════════════════════════════════════════════════╗
+    ║  👆 详细的主循环调用链和初始化流程，请阅读文件顶部的模块级注释。                        ║
+    ╚══════════════════════════════════════════════════════════════════════════════════╝
+    """
+
+    def __init__(
+        self,
+        server_args: ServerArgs,
+        port_args: PortArgs,
+        gpu_id: int,
+        tp_rank: int,
+        moe_ep_rank: int,
+        pp_rank: int,
+        attn_cp_rank: int,
+        moe_dp_rank: int,
+        dp_rank: Optional[int],
+    ):
+        self.is_initializing = True
+        # init_soft_watchdog starts a daemon thread that reads these on its first tick.
+        self.forward_ct: int = 0
+        self.cur_batch: Optional[ScheduleBatch] = None
+        self.init_soft_watchdog(server_args)
 
     def __init__(
         self,

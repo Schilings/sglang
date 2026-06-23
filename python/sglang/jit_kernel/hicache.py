@@ -1,3 +1,8 @@
+# ╔══════════════════════════════════════════════════════════════════════════════════════╗
+# ║  ⚡ HiCache JIT Kernels —— GPU↔Host DMA 的自定义 CUDA/Triton kernel                   ║
+# ║  transfer_hicache_all_layer / transfer_hicache_one_layer / ...                       ║
+# ╚══════════════════════════════════════════════════════════════════════════════════════╝
+
 from __future__ import annotations
 
 import logging

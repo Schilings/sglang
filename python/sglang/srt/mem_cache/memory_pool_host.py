@@ -73,6 +73,19 @@ if _is_npu:
 
 logger = logging.getLogger(__name__)
 
+# ╔══════════════════════════════════════════════════════════════════════════════════════╗
+# ║  💾 Host KV Cache 内存池 —— CPU Pinned Memory，HiCache L2 层                          ║
+# ╠══════════════════════════════════════════════════════════════════════════════════════╣
+# ║                                                                                      ║
+# ║  📤 GPU→Host: backup_from_device_all_layer()  ← 全层一次性 DMA                       ║
+# ║  📥 Host→GPU: load_to_device_per_layer(i)     ← 逐层 DMA + LayerDoneCounter 同步      ║
+# ║                                                                                      ║
+# ║  具体实现:                                                                              ║
+# ║    └─ MHAHostTokenToKVPool   标准 MHA 模型的 Host 端 KV Pool                          ║
+# ║    └─ MLATokenToKVPoolHost   MLA 模型的 Host 端 KV Pool                              ║
+# ║                                                                                      ║
+# ╚══════════════════════════════════════════════════════════════════════════════════════╝
+
 # Host RAM to leave free when sizing HiCache pools (OS, other processes).
 HICACHE_HOST_MEMORY_RESERVE_BYTES: int = 10 * (1024**3)
 
