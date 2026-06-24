@@ -2554,9 +2554,75 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
 
 
 class DSATokenToKVPool(MLATokenToKVPool):
-    """💾 DSA KV Cache Pool —— Dual-Stream Attention 混合架构的 GPU KV 缓存。
+    """💾 DSA KV Cache Pool —— DeepSeek Sparse Attention (DeepSeek-V3.2) 的 GPU KV 缓存。
+
+    👆 继承自 MLATokenToKVPool：完整复用 latent kv_buffer（nope+rope）的存取，
+       额外再挂一份 "indexer KV 缓存" 用于稀疏 topk 选择。
+
+    ╔══════════════════════════════════════════════════════════════════════════════════╗
+    ║  🧩 在 MLA 基础上新增的对外接口（框架通过这些方法使用本类）                            ║
+    ╠══════════════════════════════════════════════════════════════════════════════════╣
+    ║  set_index_k_scale_buffer(layer_id, loc, k, scale)  ✍️ 前向时写入 indexer 的 K+scale ║
+    ║  get_index_k_with_scale_buffer(layer_id)            📖 取整层 indexer buffer          ║
+    ║  get_index_k_continuous / get_index_k_scale_continuous 📖 分别连续读 K / scale        ║
+    ║  get_index_k_scale_buffer(...)                      📖 融合读 (K, scale)（Triton 高效）║
+    ║  —— 以下为重写父类方法，把 indexer 缓存与主 latent 一起处理 ——                        ║
+    ║  move_kv_cache         🚚 投机解码搬运：latent + indexer 同步搬                       ║
+    ║  get_cpu_copy/load     💿 offload/换入：latent + indexer 一起，避免 slot 复用读脏数据 ║
+    ║  get_state_buf_infos   🌐 PD 分离：把 indexer 作为 StateType.DSA 随主 KV 一起传输     ║
+    ║  get_kv_size_bytes     ⚙️ 显存统计：latent + indexer 两份相加                        ║
+    ╚══════════════════════════════════════════════════════════════════════════════════╝
+
+    ╔══════════════════════════════════════════════════════════════════════════════════╗
+    ║  🔑 与父类 MLATokenToKVPool 的关键区别（多实现类对比）                                ║
+    ╠══════════════════════════════════════════════════════════════════════════════════╣
+    ║                                                                                  ║
+    ║  ┌────────────┬─────────────────────────────┬─────────────────────────────────┐ ║
+    ║  │            │ MLATokenToKVPool（常规）     │ DSATokenToKVPool（稀疏）          │ ║
+    ║  ├────────────┼─────────────────────────────┼─────────────────────────────────┤ ║
+    ║  │ 缓存张量    │ 仅 kv_buffer（latent）       │ kv_buffer + index_k_with_scale  │ ║
+    ║  │            │                             │ _buffer（indexer 的 fp8 K+scale）│ ║
+    ║  │ attention  │ 对全部历史 token 做 MLA      │ indexer 先选 topk，只对 topk     │ ║
+    ║  │ 范围        │                             │ 个 token 做 MLA                  │ ║
+    ║  │ indexer    │ 无                          │ 1 head × 128 dim，per-page 分页  │ ║
+    ║  │ 量化        │ nope/rope 见父类            │ indexer K 存 fp8 + per-block     │ ║
+    ║  │            │                             │ scale（quant_block_size=128）    │ ║
+    ║  │ page_size  │ 任意                        │ 固定 64（非 HIP）/ 16 或 1(HIP)  │ ║
+    ║  └────────────┴─────────────────────────────┴─────────────────────────────────┘ ║
+    ║                                                                                  ║
+    ║  🎯 为什么这种场景用本类：                                                          ║
+    ║     超长上下文下对全量 token 做 attention 算力 ∝ 序列长度，代价高。DSA 用一个轻量      ║
+    ║     "indexer" 先对全部历史 token 打分、选出最相关的 topk 个（如 2048），后续 MLA       ║
+    ║     attention 只在这 topk 个 token 上计算，把复杂度从 O(seq) 降到 O(topk)。           ║
+    ║     代价是要额外缓存 indexer 自己的 K（与主 latent 不同的张量），故本类在父类之上       ║
+    ║     多维护一份 index_k_with_scale_buffer，并让搬运/offload/传输都带上它。              ║
+    ╚══════════════════════════════════════════════════════════════════════════════════╝
+
+    ╔══════════════════════════════════════════════════════════════════════════════════╗
+    ║  🔗 DSA 特有的 indexer 调用链（每层 forward）                                        ║
+    ╠══════════════════════════════════════════════════════════════════════════════════╣
+    ║                                                                                  ║
+    ║  ════════ 创建链 ════════                                                          ║
+    ║  ModelRunnerKVCacheMixin（is_dsa_model & use_mla_backend）                         ║
+    ║    └─ DSATokenToKVPool(index_head_dim=128, kv_cache_dim=含fp8 scale 的 override)   ║
+    ║       └─ HiRadixCache 时：attach_hybrid_dsa_pool_to_hiradix_cache                  ║
+    ║          └─ 建 INDEXER sidecar host pool，复用 KV 的 page indices 一起换入换出       ║
+    ║                                                                                  ║
+    ║  ════════ 前向 indexer + 稀疏 attention 链 ════════                                 ║
+    ║  forward_mla.py → Indexer(x, q_lora, positions, layer_id)   (dsa_indexer.py)       ║
+    ║    └─ Indexer.forward_cuda                                                        ║
+    ║       ├─ _store_index_k_cache → set_index_k_scale_buffer(...)  ✍️ 写本步 indexer K  ║
+    ║       └─ _get_topk_paged(decode) / _get_topk_ragged(extend)                        ║
+    ║          └─ get_index_k_scale_buffer / get_index_k_with_scale_buffer  📖 读全量历史 ║
+    ║          └─ query × 历史 indexer K → logits → 选出 topk_indices                    ║
+    ║    └─ topk_indices → DeepseekSparseAttnBackend.forward_*                           ║
+    ║       └─ 只对 topk token 取 latent（父类 get_key_buffer）做 MLA attention           ║
+    ╚══════════════════════════════════════════════════════════════════════════════════╝
     """
+
+    # indexer K 的 fp8 量化块大小：每 128 个元素共享一个 fp32 scale。
     quant_block_size = 128
+    # indexer buffer 以 uint8 存放（fp8 数据 + 打包的 fp32 scale 字节）。
     index_k_with_scale_buffer_dtype = torch.uint8
     rope_storage_dtype = torch.bfloat16  # rope is always stored in bf16
 
@@ -2576,10 +2642,29 @@ class DSATokenToKVPool(MLATokenToKVPool):
         end_layer: Optional[int] = None,
         index_buf_size: Optional[int] = None,
     ):
+        """🏗️ 构造 DSA KV 池：先建好父类的 latent kv_buffer，再额外建 indexer 缓存。
+
+        🔗 调用链定位（创建链）：
+            ModelRunnerKVCacheMixin（is_dsa_model & use_mla_backend）
+              └─ DSATokenToKVPool(...)  ← 当前函数
+                 └─ super().__init__(use_dsa=True, ...)  建 latent kv_buffer（父类）
+                 └─ 自建 index_k_with_scale_buffer            indexer 专属缓存
+
+        📥 关键参数（相对父类新增）：
+            index_head_dim : indexer key 的维度，DSA 固定为 128（单 head）
+            kv_cache_dim   : latent 单 token 宽度；若含 fp8 scale 会 ≠ lora+rope，
+                             此时转成 override 传给父类，让父类按真实宽度建 buffer
+            index_buf_size : indexer 缓存的 token 容量，默认与 size 相同
+        ⚠️ 注意：父类构造时传 use_dsa=True，会推迟显存日志，等本函数建完 indexer
+            buffer 后再统一 _finalize_allocation_log（含两份缓存的总量）。
+        """
+        # 仅当 latent 宽度被 fp8 scale 撑大、≠ (lora+rope) 时才覆写父类维度；
+        # 否则传 None，让父类用默认 kv_lora_rank + qk_rope_head_dim。
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
         )
 
+        # 先建父类的 latent kv_buffer；use_dsa=True 让父类跳过显存日志（留到本函数末尾）。
         super().__init__(
             size,
             page_size,
@@ -2598,26 +2683,37 @@ class DSATokenToKVPool(MLATokenToKVPool):
         # self.index_k_scale_dtype = torch.float32
         self.index_head_dim = index_head_dim
         if index_buf_size is None:
-            index_buf_size = size
+            index_buf_size = size  # indexer 缓存容量默认与主 KV 容量一致
         # num head == 1 and head dim == 128 for index_k in DSA
+        # DSA indexer 的 key 固定为单 head、128 维（与主 latent 维度无关），写死校验。
         assert index_head_dim == 128
 
+        # 各后端对 page_size 的硬约束（indexer 的分页 MQA 内核要求不同）：
         if _is_hip:
             if aiter_can_use_preshuffle_paged_mqa():
+                # AITER preshuffle paged MQA：page 必须 16 对齐
                 assert (
                     self.page_size % 16 == 0
                 ), f"HIP preshuffle requires page_size to be a multiple of 16, got {self.page_size}"
             else:
+                # HIP 旧路径：逐 token，page_size 只能为 1
                 assert (
                     self.page_size == 1
                 ), f"HIP legacy DSA path requires page_size == 1, got {self.page_size}"
         else:
+            # CUDA：deep_gemm paged MQA 内核固定按 64-token 页工作
             assert self.page_size == 64
         with (
+            # 与父类一致：PD+NVLink 场景用专用内存池，便于 indexer 缓存也能被远程访问。
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.custom_mem_pool
             else nullcontext()
         ):
+            # indexer 缓存：每层一个 [num_pages, per_page_bytes] 的 uint8 张量。
+            # per_page_bytes = page_size * (head_dim + head_dim/quant_block_size * 4)
+            #   ├─ page_size * head_dim          ：fp8 量化后的 indexer K 数据
+            #   └─ page_size * (head_dim/128) * 4：每 128 元素一个 fp32 scale（4 字节）
+            # 与主 latent kv_buffer 按 token 索引不同，这里按"页"索引（page-indexed）。
             self.index_k_with_scale_buffer = [
                 torch.zeros(
                     # Layout:
@@ -2638,25 +2734,48 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 )
                 for _ in range(layer_num)
             ]
+        # latent + indexer 两份缓存均已就绪，此刻统一统计显存并打日志（父类已推迟到这里）。
         self._finalize_allocation_log(size)
 
     def _clear_buffers(self):
+        """🧹 释放 GPU 缓存：父类只删 kv_buffer，这里要连 indexer 缓存一并删。"""
         del self.kv_buffer
         del self.index_k_with_scale_buffer
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
-        """Move latent KV and the DSA indexer cache (key + scale) in lockstep."""
+        """🚚 投机解码搬运 KV：latent 与 indexer 缓存必须"锁步"一起搬。
+
+        Move latent KV and the DSA indexer cache (key + scale) in lockstep.
+
+        🔗 调用链定位（⑤ 投机解码搬运）：
+            spec_utils.move_accept_tokens_to_target_kvcache
+            / base_spec_worker.duplicate_prefix_tail_to_draft_branches
+              └─ move_kv_cache(tgt, src)  ← 当前函数
+                 ├─ super().move_kv_cache(...)        搬主 latent kv_buffer（父类）
+                 └─ 再搬 index_k_with_scale_buffer    搬 indexer K+scale（本类）
+        ⚠️ 为什么必须一起搬：被接受 token 的稀疏 attention 依赖 indexer K 做 topk，
+            若只搬 latent 而漏搬 indexer，topk 选择会读到错位/陈旧的 indexer 数据。
+        """
+        # 第一步：复用父类逻辑搬运主 latent kv_buffer。
         super().move_kv_cache(tgt_loc, src_loc)
 
+        # 无被接受 token：父类已直接返回，这里同样早退，省去 indexer 的空操作。
         if tgt_loc.numel() == 0:
             return
 
         tgt_loc_flat = tgt_loc.view(-1).long()
         src_loc_flat = src_loc.view(-1).long()
+        # 第二步：逐层把 indexer 缓存的 src 行整块搬到 tgt 行（与 latent 同一组索引）。
         for index_k in self.index_k_with_scale_buffer:
             index_k[tgt_loc_flat] = index_k[src_loc_flat]
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
+        """📖 取整层 indexer 缓存（raw uint8 张量，含 fp8 K + scale）。
+
+        🔗 调用链定位：Indexer._get_topk_paged（decode）/ _store_index_k_cache
+            → 拿到整块 buf 后由 deep_gemm/triton 内核自行按页解析。
+        """
+        # 分层流水：异步逐层搬运时阻塞等本层就绪，避免读到半成品（同父类 get_key_buffer）。
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self.index_k_with_scale_buffer[layer_id - self.start_layer]
@@ -2667,6 +2786,11 @@ class DSATokenToKVPool(MLATokenToKVPool):
         seq_len: int,
         page_indices: torch.Tensor,
     ):
+        """📖 按 page_indices 把 indexer 的 fp8 K 收集成连续张量。
+
+        🔗 调用链定位：Indexer._get_topk_ragged_with_cp / forward_indexer（CP/NPU 路径）。
+        ⚙️ 委托 index_buf_accessor.GetK 内核完成 page → 连续 的 gather。
+        """
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
@@ -2680,6 +2804,10 @@ class DSATokenToKVPool(MLATokenToKVPool):
         seq_len: int,
         page_indices: torch.Tensor,
     ):
+        """📖 与 get_index_k_continuous 配套，单独收集 fp8 K 对应的 scale。
+
+        🔗 调用链定位：同上（CP/NPU 路径分两次分别取 K 和 scale）。
+        """
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
@@ -2695,7 +2823,11 @@ class DSATokenToKVPool(MLATokenToKVPool):
         seq_len_sum: int,
         max_seq_len: int,
     ):
-        """
+        """📖 一次性融合读取 indexer 的 (K, scale)，extend 阶段 topk 选择的主路径。
+
+        🔗 调用链定位：Indexer._get_topk_ragged（extend）→ 读全量历史 indexer K+scale
+            → 与 query 做 MQA logits → 选 topk token。比分两次单独读 K/scale 更快。
+
         Fused method to get both index K and scale data in a single call using Triton.
         More efficient than calling get_index_k_continuous and get_index_k_scale_continuous separately.
 
@@ -2709,6 +2841,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        # 委托 GetKAndS 内核：按 page_indices 同时 gather 出 fp8 K 与其 scale。
         return index_buf_accessor.GetKAndS.execute(
             self,
             buf,
@@ -2725,12 +2858,29 @@ class DSATokenToKVPool(MLATokenToKVPool):
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor,
     ) -> None:
+        """✍️ 写入本步 token 的 indexer K（fp8）+ scale —— DSA 前向的写入入口。
+
+        🔗 调用链定位（前向写 indexer）：
+            Indexer.forward_cuda → _store_index_k_cache
+              └─ set_index_k_scale_buffer(...)  ← 当前函数（fused/aiter 内核不可用时的回退路径）
+        ⚙️ 委托 SetKAndS 内核把 index_k 与 index_k_scale 打包写进 loc 指向的页内偏移；
+            布局与 __init__ 中描述一致（前段 fp8 数据、后段 fp32 scale 字节）。
+        """
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         index_buf_accessor.SetKAndS.execute(
             pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
         )
 
     def get_cpu_copy(self, indices, mamba_indices=None):
+        """💿 换出 GPU→CPU：latent 与 indexer 缓存都要 offload，返回 dict 打包两者。
+
+        🔗 调用链定位（⑦ CPU offload）：
+            Scheduler → Req.offload_kv_cache → allocator.get_cpu_copy
+              └─ get_cpu_copy(...)  ← 当前函数
+                 ├─ super().get_cpu_copy(...)   换出主 latent（父类，按 token 索引）
+                 └─ 再换出 index_k_with_scale_buffer（本类，按 page 索引）
+        ⚠️ 见下方原注释：indexer 也必须一起 offload，否则 resume 后会读到别的请求遗留的脏数据。
+        """
         # DSA keeps a page-indexed index_k_with_scale_buffer alongside kv_buffer.
         # Retract frees the slots/pages and they get reused by other reqs'
         # set_index_k_scale_buffer, so we must offload it here too -- otherwise
@@ -2738,28 +2888,42 @@ class DSATokenToKVPool(MLATokenToKVPool):
         # DSA attention reads garbage at those token positions.
         kv_cache_cpu = super().get_cpu_copy(indices, mamba_indices=mamba_indices)
 
+        # indexer 按页存储：把 token 索引降采样并换算成 page 索引（每页取一个代表）。
         page_indices = indices[:: self.page_size] // self.page_size
-        torch.cuda.synchronize()
+        torch.cuda.synchronize()  # 先同步，确保前向写入的 indexer 数据已落盘
         index_k_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
+        # 按页分块：token 级 chunk_size 换算成 page 级（至少 1 页），削峰拷贝。
         page_chunk_size = max(1, chunk_size // self.page_size)
         for layer_id in range(self.layer_num):
             index_k_cpu.append([])
             for i in range(0, len(page_indices), page_chunk_size):
                 chunk_page_indices = page_indices[i : i + page_chunk_size]
+                # 异步 D2H 拷贝整页 indexer 数据（fp8 K + scale 一并）。
                 idx_cpu = self.index_k_with_scale_buffer[layer_id][
                     chunk_page_indices
                 ].to("cpu", non_blocking=True)
                 index_k_cpu[-1].append(idx_cpu)
-        torch.cuda.synchronize()
+        torch.cuda.synchronize()  # 等所有异步拷贝完成再返回
 
+        # 用 dict 同时带回 latent 与 indexer，load_cpu_copy 按相同结构回灌。
         return {"kv": kv_cache_cpu, "index_k": index_k_cpu}
 
     def load_cpu_copy(self, kv_cache_cpu_dict, indices, mamba_indices=None):
+        """💿 换入 CPU→GPU：get_cpu_copy 的逆操作，latent 与 indexer 一起灌回。
+
+        🔗 调用链定位（⑦ CPU offload）：
+            Scheduler → Req.load_kv_cache → allocator.load_cpu_copy
+              └─ load_cpu_copy(dict, ...)  ← 当前函数
+                 ├─ super().load_cpu_copy(dict["kv"], ...)  灌回主 latent（父类）
+                 └─ 再把 dict["index_k"] 灌回 index_k_with_scale_buffer（本类）
+        """
+        # 先复用父类逻辑灌回主 latent kv_buffer。
         super().load_cpu_copy(
             kv_cache_cpu_dict["kv"], indices, mamba_indices=mamba_indices
         )
 
+        # 与换出对称：token 索引换算成 page 索引，按页回灌 indexer 缓存。
         page_indices = indices[:: self.page_size] // self.page_size
         index_k_cpu = kv_cache_cpu_dict["index_k"]
         torch.cuda.synchronize()
@@ -2768,27 +2932,39 @@ class DSATokenToKVPool(MLATokenToKVPool):
         for layer_id in range(self.layer_num):
             for i in range(0, len(page_indices), page_chunk_size):
                 chunk_page_indices = page_indices[i : i + page_chunk_size]
-                idx_cpu = index_k_cpu[layer_id][i // page_chunk_size]
-                assert idx_cpu.shape[0] == len(chunk_page_indices)
+                idx_cpu = index_k_cpu[layer_id][i // page_chunk_size]  # 按换出结构取回
+                assert idx_cpu.shape[0] == len(chunk_page_indices)  # 防御：页数须匹配
+                # 异步 H2D 拷回，再按 page 索引散点写回 GPU。
                 idx_chunk = idx_cpu.to(
                     self.index_k_with_scale_buffer[0].device, non_blocking=True
                 )
                 self.index_k_with_scale_buffer[layer_id][chunk_page_indices] = idx_chunk
-        torch.cuda.synchronize()
+        torch.cuda.synchronize()  # 等回灌完成，后续稀疏 attention 才能读到正确 indexer K
 
     def get_state_buf_infos(self):
+        """🌐 PD 分离传输：暴露 indexer 缓存的 (ptr, len, item) 给 KV 传输引擎。
+
+        🔗 调用链定位：disaggregation/utils.py 检测到本方法存在 → 把 indexer 作为
+            StateType.DSA 额外状态组件，随主 latent KV 一起从 prefill 端发往 decode 端。
+        ⚠️ 与父类 get_contiguous_buf_infos（暴露 latent）互补：稀疏 attention 在 decode
+            端同样需要 indexer K，故 indexer 也必须跨节点传输。
+        """
+        # 每层 indexer buffer 的裸指针 / 总字节数 / 单页字节数，供 RDMA/NVLink 注册。
         data_ptrs = [
             self.index_k_with_scale_buffer[i].data_ptr() for i in range(self.layer_num)
         ]
         data_lens = [
             self.index_k_with_scale_buffer[i].nbytes for i in range(self.layer_num)
         ]
+        # item_lens：一页（buf[0]）的字节数，传输按页对齐。
         item_lens = [
             self.index_k_with_scale_buffer[i][0].nbytes for i in range(self.layer_num)
         ]
         return data_ptrs, data_lens, item_lens
 
     def get_kv_size_bytes(self):
+        """⚙️ 显存统计：DSA 总占用 = 父类 latent 缓存 + indexer 缓存。"""
+        # 先取父类的 latent kv_buffer 字节数，再累加每层 indexer 缓存。
         kv_size_bytes = super().get_kv_size_bytes()
         for index_k_cache in self.index_k_with_scale_buffer:
             kv_size_bytes += get_tensor_size_bytes(index_k_cache)
