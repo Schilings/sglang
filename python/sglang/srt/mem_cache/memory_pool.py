@@ -2031,7 +2031,74 @@ class HybridLinearKVPool(KVCache):
 class MLATokenToKVPool(KVCache):
     """💾 MLA KV Cache Pool —— Multi-Head Latent Attention 模型 (DeepSeek-V2/V3) 的 GPU KV 缓存。
 
-    👆 字段和架构见文件顶部模块注释。
+    ╔══════════════════════════════════════════════════════════════════════════════════╗
+    ║  🧬 MLA 与 MHA 的本质区别：压缩 KV，单一缓冲                                         ║
+    ╠══════════════════════════════════════════════════════════════════════════════════╣
+    ║                                                                                  ║
+    ║  MHA：每层存完整的 K [size, head_num, head_dim] + V [size, head_num, head_dim]     ║
+    ║       → 两个独立 buffer，显存 ∝ 2 * head_num * head_dim                            ║
+    ║                                                                                  ║
+    ║  MLA：每层只存一份"低秩潜变量" latent KV，K 与 V 共享同一块压缩表示                  ║
+    ║       kv_buffer[layer] : [size + page_size, 1, kv_lora_rank + qk_rope_head_dim]    ║
+    ║         ├─ kv_lora_rank      (如 512)：压缩后的 c_kv，即 nope 部分                 ║
+    ║         └─ qk_rope_head_dim  (如  64)：解耦出来的 RoPE 位置编码，即 rope 部分       ║
+    ║       → 只有 1 个 buffer，head 维恒为 1，显存约为 MHA 的 1/10                       ║
+    ║                                                                                  ║
+    ║  ⚠️ 关键：get_value_buffer 只是 get_key_buffer 的前 kv_lora_rank 列切片，          ║
+    ║     K/V 在物理上是同一块内存；attention 算子内部再做上投影把 latent 还原成完整 KV。 ║
+    ║  ⚠️ +page_size 的"哨兵尾巴"：slot 0 区域用于承接 padding token 的 dummy 写入，      ║
+    ║     使越界/补齐写入不污染真实数据（见 _create_buffers 注释）。                       ║
+    ╚══════════════════════════════════════════════════════════════════════════════════╝
+
+    ╔══════════════════════════════════════════════════════════════════════════════════╗
+    ║  🔗 调用链：谁创建我 / 谁读写我 / 谁搬运我                                           ║
+    ╠══════════════════════════════════════════════════════════════════════════════════╣
+    ║                                                                                  ║
+    ║  ════════ ① 创建链（启动期，仅一次）════════                                         ║
+    ║  ModelRunner.__init__                                                             ║
+    ║    └─ ModelRunnerKVCacheMixin → MLATokenToKVPool(size, kv_lora_rank, ...)  本类    ║
+    ║       └─ PagedTokenToKVPoolAllocator(kvcache=self)   ← allocator 持有本 pool       ║
+    ║          └─ RadixCache / HiRadixCache(params)        ← 前缀缓存树持有 allocator    ║
+    ║             └─ HiRadixCache 额外建 MLATokenToKVPoolHost(self)  ← Host 三级镜像池   ║
+    ║       └─ AttentionBackend(model_runner)  ← backend 捕获 model_runner.token_to_kv_pool║
+    ║                                                                                  ║
+    ║  ════════ ② 调度 + 分配链（Scheduler 每轮，只给"位置"不写数据）════════               ║
+    ║  Scheduler.get_next_batch_to_run                                                  ║
+    ║    └─ RadixCache.match_prefix(key)   命中前缀 → 复用已有 slot（不重算不重写）        ║
+    ║    └─ allocator.alloc(need_size)     未命中部分 → 分配新的 slot 索引               ║
+    ║       └─ 写入 ReqToTokenPool.req_to_token[req, pos] = slot  ← 建立 req→slot 映射    ║
+    ║    （此刻本 pool 对应 slot 仍是空的，要等 ③ forward 才真正写入 KV）                  ║
+    ║                                                                                  ║
+    ║  ════════ ③ 前向写 KV 链（每层 forward，set / ✍️）════════                          ║
+    ║  model forward → RadixAttention(layer)                                            ║
+    ║    └─ AttentionBackend.forward_extend / forward_decode                            ║
+    ║       └─ set_mla_kv_buffer(layer, out_cache_loc, k_nope, k_rope)  ← 本类✍️         ║
+    ║          调用方：flashinfer_mla / trtllm_mla / flashattention / dsa_backend / ...  ║
+    ║       └─ (或) DeepseekV2AttentionMLA → get_token_to_kv_pool().set_mla_kv_buffer    ║
+    ║                                                                                  ║
+    ║  ════════ ④ 前向读 KV 链（每层 forward，get / 📖）════════                          ║
+    ║  AttentionBackend.forward_*                                                       ║
+    ║    └─ get_key_buffer(layer_id)      ← 拿整层 latent buffer（本类📖）               ║
+    ║       配合 forward_batch.kv_indices（源自 ReqToTokenPool）做 paged gather          ║
+    ║    └─ get_value_buffer(layer_id)    ← 同一 buffer 的前 kv_lora_rank 列切片          ║
+    ║    └─ get_mla_kv_buffer(layer, loc) ← 取出并拆成 (k_nope, k_rope)，供 absorb 计算   ║
+    ║                                                                                  ║
+    ║  ════════ ⑤ 投机解码搬运链（spec decoding，move / 🚚）════════                       ║
+    ║  EagleWorker 验证 draft tokens 通过后                                              ║
+    ║    └─ spec_utils.move_accept_tokens_to_target_kvcache                             ║
+    ║       └─ allocator.get_kvcache().move_kv_cache(tgt_loc, src_loc)  ← 本类🚚         ║
+    ║    └─ base_spec_worker.duplicate_prefix_tail_to_draft_branches（topk>1 复制尾页）  ║
+    ║                                                                                  ║
+    ║  ════════ ⑥ PD 分离传输链（disaggregation，🌐）════════                             ║
+    ║  Prefill / Decode BootstrapManager._init_kv_manager                               ║
+    ║    └─ get_contiguous_buf_infos()  ← 暴露 (ptr, len, item) 给 RDMA/NVLink 引擎注册🌐║
+    ║       MLA 只有一个 buffer，故只返回一份信息（区别于 MHA 的 K/V 两份）               ║
+    ║                                                                                  ║
+    ║  ════════ ⑦ CPU offload 链（KV 换出 / 换入，💿）════════                            ║
+    ║  Scheduler → Req.offload_kv_cache / load_kv_cache                                 ║
+    ║    └─ allocator.get_cpu_copy / load_cpu_copy                                      ║
+    ║       └─ 本类 get_cpu_copy(GPU→CPU) / load_cpu_copy(CPU→GPU)  按 chunk 分块搬运💿  ║
+    ╚══════════════════════════════════════════════════════════════════════════════════╝
     """
     def __init__(
         self,
@@ -2059,9 +2126,14 @@ class MLATokenToKVPool(KVCache):
             end_layer,
         )
 
+        # latent KV 的两段维度：nope(压缩 c_kv) + rope(解耦位置编码)
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
+        # use_dsa: DeepSeek Sparse Attention（DSA）模型走的特殊分支，
+        # 其 indexer KV 由子类/外部稍后分配，故此处推迟 _finalize_allocation_log。
         self.use_dsa = use_dsa
+        # DSA 专属：当以 fp8 直接存放 KV 且外部给定了 override 维度时，
+        # 走"fp8 字节布局"的写入/读取路径（见 set_mla_kv_buffer 的 dsa 分支）。
         self.dsa_kv_cache_store_fp8 = (
             use_dsa
             and dtype == torch.float8_e4m3fn
@@ -2069,14 +2141,18 @@ class MLATokenToKVPool(KVCache):
         )
         # When override_kv_cache_dim is provided with dsa model, we assume the
         # override kv cache dim is correct and use it directly.
+        # 单 token 在 buffer 最后一维的宽度：常规 MLA = nope + rope；
+        # DSA-fp8 模式信任外部传入的 override 维度（含量化 scale 等额外字节）。
         self.kv_cache_dim = (
             override_kv_cache_dim
             if self.dsa_kv_cache_store_fp8
             else (kv_lora_rank + qk_rope_head_dim)
         )
 
+        # 真正在 GPU 上申请 self.kv_buffer（每层一个 tensor）。
         self._create_buffers()
 
+        # data_ptrs：每层 buffer 的裸指针，供 triton/cuda 内核按层定位（避免每次 .data_ptr()）。
         self.data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.kv_buffer],
             dtype=torch.uint64,
@@ -2084,16 +2160,26 @@ class MLATokenToKVPool(KVCache):
         )
         if not use_dsa:
             # DSA will allocate indexer KV cache later and then log the total size
+            # 常规 MLA：buffer 已就绪，立即统计显存占用并打印 "KV Cache is allocated"。
             self._finalize_allocation_log(size)
 
     def _create_buffers(self):
+        # memory_saver_adapter.region：把这块显存登记到 torch_memory_saver，
+        # 支持运行期"挂起/释放"KV 显存（如多模型分时复用 GPU）。
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
+                # custom_mem_pool：PD 分离 + NVLink 场景下用专用内存池分配，
+                # 使 buffer 落在可被 RDMA/NVLink 直接访问的地址空间（配合 ⑥ 传输链）。
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
                 if self.custom_mem_pool
                 else nullcontext()
             ):
                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                # 形状 [size + page_size, 1, kv_cache_dim]：
+                #   - size+page_size：真实容量 + 一页"哨兵尾巴"，承接 padding token 的 dummy 写入；
+                #   - 中间 1：MLA 的 head 维恒为 1（K/V 已压缩进 latent，不再按头展开）；
+                #   - kv_cache_dim：nope + rope（或 DSA-fp8 的 override 宽度）。
+                # 每层一个 tensor，共 layer_num 份；store_dtype 在 fp8 时实际为 uint8。
                 self.kv_buffer = [
                     torch.zeros(
                         (self.size + self.page_size, 1, self.kv_cache_dim),
@@ -2104,9 +2190,11 @@ class MLATokenToKVPool(KVCache):
                 ]
 
     def _clear_buffers(self):
+        # 释放 KV 显存（memory saver 挂起/销毁池时调用）。
         del self.kv_buffer
 
     def get_kv_size_bytes(self):
+        # 汇总所有层 buffer 的字节数，供 _finalize_allocation_log 计算显存占用。
         assert hasattr(self, "kv_buffer")
         kv_size_bytes = 0
         for kv_cache in self.kv_buffer:
@@ -2115,27 +2203,37 @@ class MLATokenToKVPool(KVCache):
 
     # for disagg
     def get_contiguous_buf_infos(self):
+        # ⑥ PD 分离传输链：把每层 buffer 的"地址/总长/单页长"暴露给 KV 传输引擎注册。
         # MLA has only one kv_buffer, so only the information of this buffer needs to be returned.
+        # 与 MHA 不同——MLA 只有一份合并 buffer，故每项只返回一份（无需 K、V 各一份）。
         kv_data_ptrs = [self.kv_buffer[i].data_ptr() for i in range(self.layer_num)]
         kv_data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
+        # kv_item_lens：一"页"KV 的字节数 = 单 token 字节 × page_size（传输按页对齐）。
         kv_item_lens = [
             self.kv_buffer[i][0].nbytes * self.page_size for i in range(self.layer_num)
         ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
     def get_key_buffer(self, layer_id: int):
+        # ④ 读 KV 链入口：attention backend 拿"整层 latent buffer"，再用 kv_indices 做 paged gather。
+        # 对 MLA 而言 key buffer = 完整 latent（nope + rope），value 只是它的前缀切片。
         if self.layer_transfer_counter is not None:
+            # 分层流水：HiCache/PP 逐层异步搬运时，阻塞等待本层 KV 就绪再返回（避免读到半成品）。
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
+        # store_dtype != dtype：fp8 实际以 uint8 存储，对外按真实 dtype 重新解释（零拷贝 view）。
         if self.store_dtype != self.dtype:
             return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
 
+        # layer_id - start_layer：把全局层号换算成本 rank（PP 切分后）持有的本地索引。
         return self.kv_buffer[layer_id - self.start_layer]
 
     def get_value_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
+        # MLA 的 "value" 并非独立张量，而是同一 buffer 的前 kv_lora_rank 列（即 nope/c_kv 部分）；
+        # rope 部分只参与 query-key 的位置打分，不进入 value 上投影，故此处切掉。
         if self.store_dtype != self.dtype:
             return self.kv_buffer[layer_id - self.start_layer][
                 ..., : self.kv_lora_rank
@@ -2143,6 +2241,7 @@ class MLATokenToKVPool(KVCache):
         return self.kv_buffer[layer_id - self.start_layer][..., : self.kv_lora_rank]
 
     def get_kv_buffer(self, layer_id: int):
+        # 一次性返回 (key, value)，供同时需要两者的 backend 使用（二者底层指向同一块内存）。
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
 
     def set_kv_buffer(
@@ -2152,13 +2251,18 @@ class MLATokenToKVPool(KVCache):
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
     ):
+        # ③ 写 KV 链（合并写）：cache_k 已是拼好的完整 latent（nope+rope），直接整块写入。
+        # loc 即 forward_batch.out_cache_loc —— ② 阶段 allocator 分配、写进 ReqToTokenPool 的 slot。
         loc, _ = unwrap_write_loc(loc_info)
+        # 越界探针：loc 必须落在 [0, size+page_size)，防止脏索引污染 buffer（含哨兵尾巴）。
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA)")
         layer_id = layer.layer_id
+        # 本路径不处理 DSA-fp8 的分段量化布局（那条路走 set_mla_kv_buffer 的 dsa 分支）。
         assert not self.dsa_kv_cache_store_fp8
         if cache_k.dtype != self.dtype:
             cache_k = cache_k.to(self.dtype)
 
+        # 与 get_* 对称：fp8 时按 store_dtype(uint8) 重解释后散点写入对应 slot 行。
         if self.store_dtype != self.dtype:
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view(
                 self.store_dtype
@@ -2173,9 +2277,13 @@ class MLATokenToKVPool(KVCache):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ):
+        # ③ 写 KV 链（分段写，MLA 主路径）：nope 与 rope 分别传入，由 triton 内核融合写进同一 slot，
+        # 省去上游 concat 的开销。调用方=各 MLA backend / DeepseekV2AttentionMLA。
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA)")
         layer_id = layer.layer_id
 
+        # 分支一：ROCm(HIP) + DSA + fp8——使用原始 (nope|rope) 布局、无逐块 scale，
+        # 在写入时顺带把 BF16/FP16 量化成 FP8（cast 与 paged 写入融合在一个内核里）。
         if _is_hip and self.use_dsa and self.dtype == fp8_dtype:
             # HIP FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
             # Fuse BF16/FP16 -> FP8 cast with paged KV write.
@@ -2186,6 +2294,8 @@ class MLATokenToKVPool(KVCache):
                 cache_k_rope,
                 fp8_dtype,
             )
+        # 分支二：CUDA-DSA + fp8——nope 单独量化（带逐块 scale）、rope 保持 bf16 字节，
+        # 拼成 uint8 字节布局后复用通用两段写入内核。
         elif self.dsa_kv_cache_store_fp8:
             # OPTIMIZATION: Quantize k_nope and k_rope separately to avoid concat overhead
             # This also enables reuse of set_mla_kv_buffer_triton two-tensor write path
@@ -2203,10 +2313,13 @@ class MLATokenToKVPool(KVCache):
                 cache_k_nope_fp8,
                 cache_k_rope_fp8,
             )
+        # 分支三：常规 MLA（bf16/fp16，或 fp8 但非 DSA）——对齐 dtype 后由内核把
+        # nope 写入前段、rope 写入后段，二者落在同一行的 [0:lora_rank] 与 [lora_rank:] 区间。
         else:
             if cache_k_nope.dtype != self.dtype:
                 cache_k_nope = cache_k_nope.to(self.dtype)
                 cache_k_rope = cache_k_rope.to(self.dtype)
+            # fp8：再按 store_dtype(uint8) 重解释，使写入与 buffer 的物理 dtype 一致。
             if self.store_dtype != self.dtype:
                 cache_k_nope = cache_k_nope.view(self.store_dtype)
                 cache_k_rope = cache_k_rope.view(self.store_dtype)
@@ -2224,63 +2337,80 @@ class MLATokenToKVPool(KVCache):
         loc: torch.Tensor,
         dst_dtype: Optional[torch.dtype] = None,
     ):
+        # ④ 读 KV 链（分段读，set_mla_kv_buffer 的逆操作）：按 loc 把 latent 拆回 (nope, rope)，
+        # 供 DeepseekV2AttentionMLA 的 absorb/MHA 还原路径使用，可顺带 cast 到目标 dtype。
         # get k nope and k rope from the kv buffer, and optionally cast them to dst_dtype.
         layer_id = layer.layer_id
         kv_buffer = self.get_key_buffer(layer_id)
         dst_dtype = dst_dtype or self.dtype
+        # 预分配输出：nope 段 [n,1,kv_lora_rank]
         cache_k_nope = torch.empty(
             (loc.shape[0], 1, self.kv_lora_rank),
             dtype=dst_dtype,
             device=kv_buffer.device,
         )
+        # rope 段 [n,1,qk_rope_head_dim]
         cache_k_rope = torch.empty(
             (loc.shape[0], 1, self.qk_rope_head_dim),
             dtype=dst_dtype,
             device=kv_buffer.device,
         )
+        # triton 内核：从 kv_buffer 的 loc 行 gather，并切分前段→nope、后段→rope。
         get_mla_kv_buffer_triton(kv_buffer, loc, cache_k_nope, cache_k_rope)
         return cache_k_nope, cache_k_rope
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         """Relocate accepted-token combined MLA KV (latent + rope) per layer."""
+        # ⑤ 投机解码搬运链：EagleWorker 校验通过后，把 draft 临时 slot(src) 的 KV
+        # 整体（latent+rope 一并）搬到 target 正式 slot(tgt)，避免重算被接受的 token。
         size_limit = self.size + self.page_size
+        # 源/目标索引都要做越界检查（搬运误索引会跨层污染 KV）。
         maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
         maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
 
+        # 无被接受 token：直接返回，省去逐层空操作。
         if tgt_loc.numel() == 0:
             return
 
         tgt_loc_flat = tgt_loc.view(-1).long()
         src_loc_flat = src_loc.view(-1).long()
+        # 逐层把 src 行整块拷到 tgt 行（MLA 单 buffer，一次拷贝即搬完该层全部 KV）。
         for kv_cache in self.kv_buffer:
             kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
 
     def get_cpu_copy(self, indices, mamba_indices=None):
-        current_platform.synchronize()
+        # ⑦ CPU offload 链（换出 GPU→CPU）：Req.offload_kv_cache 经 allocator 转发至此，
+        # 把指定 indices 的 KV 拷到 host 内存暂存（如长上下文请求被挤出 GPU 时）。
+        # mamba_indices 仅供混合 Mamba 模型签名兼容，纯 MLA 用不到。
+        current_platform.synchronize()  # 先同步，确保前向写入的 KV 已落盘到 buffer
         kv_cache_cpu = []
-        chunk_size = self.cpu_offloading_chunk_size
+        chunk_size = self.cpu_offloading_chunk_size  # 分块（默认 8192）以削峰 host pinned 内存与拷贝
         for layer_id in range(self.layer_num):
             kv_cache_cpu.append([])
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
+                # non_blocking=True：异步 D2H 拷贝，循环结束统一 synchronize 等待。
                 kv_cpu = self.kv_buffer[layer_id][chunk_indices].to(
                     "cpu", non_blocking=True
                 )
                 kv_cache_cpu[-1].append(kv_cpu)
-        current_platform.synchronize()
+        current_platform.synchronize()  # 等全部异步拷贝完成再返回，保证数据完整
+        # 返回结构：List[layer][chunk] → CPU 张量，load_cpu_copy 按相同结构回灌。
         return kv_cache_cpu
 
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        # ⑦ CPU offload 链（换入 CPU→GPU）：get_cpu_copy 的逆操作，请求重新调度时把 KV 灌回 GPU slot。
         current_platform.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
-                kv_cpu = kv_cache_cpu[layer_id][i // chunk_size]
-                assert kv_cpu.shape[0] == len(chunk_indices)
+                kv_cpu = kv_cache_cpu[layer_id][i // chunk_size]  # 按换出时的 [layer][chunk] 结构取回
+                assert kv_cpu.shape[0] == len(chunk_indices)  # 防御：chunk 行数须与索引数一致
+                # H2D 异步拷回，再散点写入对应 GPU slot。
                 kv_chunk = kv_cpu.to(self.kv_buffer[0].device, non_blocking=True)
                 self.kv_buffer[layer_id][chunk_indices] = kv_chunk
-        current_platform.synchronize()
+        current_platform.synchronize()  # 等回灌完成，后续 forward 才能读到正确历史 KV
 
 
 class MLATokenToKVPoolFP4(MLATokenToKVPool):
@@ -2425,8 +2555,6 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
 
 class DSATokenToKVPool(MLATokenToKVPool):
     """💾 DSA KV Cache Pool —— Dual-Stream Attention 混合架构的 GPU KV 缓存。
-
-    👆 字段和架构见文件顶部模块注释。
     """
     quant_block_size = 128
     index_k_with_scale_buffer_dtype = torch.uint8
