@@ -2414,21 +2414,102 @@ class MLATokenToKVPool(KVCache):
 
 
 class MLATokenToKVPoolFP4(MLATokenToKVPool):
+    """💾 MLA KV Cache Pool (FP4) —— 把 MLA latent KV 以 4-bit 浮点(E2M1)分块量化存储的子类。
+
+    ╔══════════════════════════════════════════════════════════════════════════════════╗
+    ║  🧬 FP4 存储原理：双 buffer（packed 数据 + 逐块 scale）                                 ║
+    ╠══════════════════════════════════════════════════════════════════════════════════╣
+    ║  E2M1 = 4 bit/值(1 符号 + 2 指数 + 1 尾数)；PyTorch 无原生 4-bit dtype，故：         ║
+    ║    • store_dtype = uint8：两个 FP4 值"紧压"进 1 个字节(packed，故末维 = k//2)         ║
+    ║    • 每 16 个 FP4 值共享 1 个 uint8 的 block scale(MXFP4 风格，block=16)             ║
+    ║  每层分配两块显存(基类只有一块 kv_buffer)：                                            ║
+    ║    ┌───────────────────────────────┬────────────────────────────────────────────┐     ║
+    ║    │ kv_buffer[layer]              │ kv_scale_buffer[layer]                     │     ║
+    ║    │ [m, 1, kv_cache_dim // 2]     │ [m, kv_cache_dim // 16]                    │     ║
+    ║    │ ↑ packed FP4 数据(uint8)      │ ↑ 每块的 E8M0 指数 scale(uint8)             │     ║
+    ║    └───────────────────────────────┴────────────────────────────────────────────┘     ║
+    ║  其中 kv_cache_dim = kv_lora_rank + qk_rope_head_dim(nope 压缩段 + rope 解耦段)。    ║
+    ║  写 ✍️：BF16 → BlockFP4KVQuantizeUtil.batched_quantize → (packed fp4, scales)        ║
+    ║         → 两块分别散点写。                                                             ║
+    ║  读 📖：get_key_buffer 把 (packed fp4, scales) → batched_dequantize → BF16 在线还原。 ║
+    ╚══════════════════════════════════════════════════════════════════════════════════╝
+
+    ╔══════════════════════════════════════════════════════════════════════════════════╗
+    ║  🔑 与基类 MLATokenToKVPool 的关键区别                                                 ║
+    ╠══════════════════════════════════════════════════════════════════════════════════╣
+    ║  ┌────────────────┬──────────────────────────────┬──────────────────────────────┐  ║
+    ║  │ 维度           │ MLATokenToKVPool(基类)        │ MLATokenToKVPoolFP4(本类)    │  ║
+    ║  ├────────────────┼──────────────────────────────┼──────────────────────────────┤  ║
+    ║  │ 物理精度       │ BF16/FP16 或 FP8(单 buffer)  │ FP4(E2M1) packed + 逐块 scale │  ║
+    ║  │ buffer 数量    │ 1 个 kv_buffer              │ 2 个：kv_buffer + scale_buffer│  ║
+    ║  │ 单元素位宽     │ 16/8 bit                     │ 4 bit(两值一字节)            │  ║
+    ║  │ get_key_buffer │ 零拷贝 view(dtype)           │ 在线 dequant → BF16(重算)    │  ║
+    ║  │ set_mla_kv_buf │ 直写 / fp8 量化融合          │ 先 batched_quantize 再两段写 │  ║
+    ║  │ 显存占用       │ 1×                           │ ≈ 1/4 基类(4bit vs 16bit)    │  ║
+    ║  └────────────────┴──────────────────────────────┴──────────────────────────────┘  ║
+    ║  🎯 适用场景：kv_cache_dtype == torch.float4_e2m1fn_x2(--kv-cache-dtype fp4_e2m1)  ║
+    ║     时由 ModelRunnerKVCacheMixin 选用本类(见 model_runner_kv_cache_mixin.py:593)，   ║
+    ║     以 ~4× 显存压缩换取 attention 前在线 dequant 的算力开销，适合大上下文/显存吃紧。   ║
+    ╚══════════════════════════════════════════════════════════════════════════════════╝
+
+    ╔══════════════════════════════════════════════════════════════════════════════════╗
+    ║  🔗 调用链(仅列 FP4 专属读写环节，完整链路见基类 docstring)                              ║
+    ╠══════════════════════════════════════════════════════════════════════════════════╣
+    ║  ③ 写 KV：DeepseekV2AttentionMLA._set_mla_kv_buffer (forward_mha.py:455)         ║
+    ║    └─ set_mla_kv_buffer(layer, loc, k_nope, k_rope)  ← CUDA/AITER 主路径✍️        ║
+    ║       ├─ BlockFP4KVQuantizeUtil.batched_quantize  (nope/rope 各量化一次)          ║
+    ║       ├─ set_mla_kv_buffer_triton       → 写 kv_buffer(packed fp4 数据)          ║
+    ║       └─ set_mla_kv_scale_buffer_triton → 写 kv_scale_buffer(逐块 scale)         ║
+    ║  ④ 读 KV：attention backend / DeepseekV2AttentionMLA                               ║
+    ║    └─ get_key_buffer(layer_id)                       ← 拿整层 latent(本类📖)     ║
+    ║       └─ BlockFP4KVQuantizeUtil.batched_dequantize  (在线还原成 BF16)            ║
+    ╚══════════════════════════════════════════════════════════════════════════════════╝
+
+    ⚠️ 已知边界(仅注释，未改任何代码)：
+      1. set_mla_kv_buffer 中 `if self.dsa_kv_cache_store_fp8` 分支：本类构造时不传
+         use_dsa / override_kv_cache_dim，故 dsa_kv_cache_store_fp8 恒为 False，
+         该分支为沿用自基类的保留 dead path(待 FP4 支持 DSA 时再启用)。
+      2. set_mla_kv_buffer 末尾 `cache_k_nope/cache_k_rope = ...view(store_dtype)` 两行
+         重赋值的是入参局部变量，其后不再被使用(triton 实际用 *_fp4 变量)，
+         无副作用，疑为 fp8 路径的复制残留。
+      3. 本类未重写 move_kv_cache / get_cpu_copy / load_cpu_copy / get_contiguous_buf_infos，
+         这些基类方法只搬运 kv_buffer，不会同步搬运 kv_scale_buffer；若启用
+         spec-offload / hierarchical-cache / PD 分离传输，scale 会丢失，需上层避免或补齐。
+    """
+
     def _create_buffers(self):
+        """🧬 申请 FP4 双 buffer(packed 数据 + 逐块 scale)，每层一份。
+
+        🔗 调用链定位(① 创建链)：
+            MLATokenToKVPool.__init__  →  self._create_buffers()  ← 当前函数
+            (构造期唯一一次，见 model_runner_kv_cache_mixin.py:593 的实例化)
+
+        ⚙️ 行为：覆盖基类，建立两块显存——
+            • kv_buffer       : [size+page_size, 1, kv_cache_dim//2] uint8 (packed FP4)
+            • kv_scale_buffer : [size+page_size,    kv_cache_dim//16] uint8 (block scale)
+          +page_size 的"哨兵尾巴"承接 padding token 的 dummy 写入(同基类约定)。
+        ⚠️ store_dtype 在此显式置为 uint8(覆盖基类对 fp8 的推断)，因 FP4 无原生 dtype。
+        """
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
+                # custom_mem_pool：PD 分离 + NVLink 场景下用专用内存池，使 buffer 落在
+                # 可被 RDMA/NVLink 直接访问的地址空间(详见基类 _create_buffers 注释)。
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
                 if self.custom_mem_pool
                 else nullcontext()
             ):
                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
+                # m = 真实容量 + 一页哨兵；n=1 为 MLA 的 head 维；k = nope+rope 合并宽度。
                 m = self.size + self.page_size
                 n = 1  # head_num
                 k = self.kv_cache_dim  # head_dim
 
+                # FP4 块量化块大小：每 16 个 FP4 值共享 1 个 uint8 scale(E8M0 指数)。
                 scale_block_size = 16
+                # FP4 无原生 torch dtype，统一以 uint8 存储(packed：2 值/字节)。
                 self.store_dtype = torch.uint8
 
+                # 数据 buffer：k//2 字节(每字节装 2 个 FP4 值)，head 维=1。
                 self.kv_buffer = [
                     torch.zeros(
                         (m, n, k // 2),
@@ -2438,6 +2519,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
                     for _ in range(self.layer_num)
                 ]
 
+                # scale buffer：每 16 个元素 1 个 scale，故末维 = k // 16；与数据 buffer 行对齐。
                 self.kv_scale_buffer = [
                     torch.zeros(
                         (m, k // scale_block_size),
@@ -2448,14 +2530,31 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
                 ]
 
     def _clear_buffers(self):
+        """🧹 释放 FP4 双 buffer 显存(memory saver 挂起 / 销毁池时调用)。"""
+        # 与基类不同：FP4 多一块 scale buffer，需一并 del。
         del self.kv_buffer
         del self.kv_scale_buffer
 
     def get_key_buffer(self, layer_id: int):
+        """📖 读取整层 latent KV——把 FP4(packed)+scale 在线 dequant 还原为 BF16。
+
+        🔗 调用链定位(④ 前向读 KV)：
+            AttentionBackend.forward_* / DeepseekV2AttentionMLA
+              └─ get_key_buffer(layer_id)  ← 当前函数
+                 └─ BlockFP4KVQuantizeUtil.batched_dequantize  (在线反量化)
+
+        📥 参数：layer_id : 全局层号，会换算成 [layer_id - start_layer] 本地索引(PP 切分)。
+        📤 返回：整层 latent [m, 1, kv_cache_dim] 的 BF16 还原结果(含 nope+rope)。
+        ⚙️ 行为：分层流水时先 wait_until 本层就绪；store_dtype(uint8) != dtype(fp4) 时
+            走 dequant 路径，否则(理论未用)直接返回原 buffer。
+        ⚠️ 在线 dequant 每次读都重算，算力开销 >> 零拷贝 view(基类 fp8 路径)。
+        """
         if self.layer_transfer_counter is not None:
+            # 分层流水(HiCache/PP)：阻塞等本层 KV 搬运完成，避免读到半成品。
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
         if self.store_dtype != self.dtype:
+            # FP4 主路径：取 packed 数据 + 对应 scale，在线反量化成 BF16 供 attention 使用。
             cache_k_nope_fp4 = self.kv_buffer[layer_id - self.start_layer].view(
                 torch.uint8
             )
@@ -2465,6 +2564,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
                 BlockFP4KVQuantizeUtil,
             )
 
+            # batched_dequantize：unpack 两值/字节 → E2M1 LUT → 乘 block scale → BF16。
             cache_k_nope_fp4_dequant = BlockFP4KVQuantizeUtil.batched_dequantize(
                 cache_k_nope_fp4, cache_k_nope_fp4_sf
             )
@@ -2479,12 +2579,32 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
     ):
+        """✍️ 合并写路径——cache_k 已是拼好的完整 latent(nope+rope)，量化后写入双 buffer。
+
+        🔗 调用链定位(③ 前向写 KV)：
+            DeepseekV2AttentionMLA._set_mla_kv_buffer(NPU 等非 CUDA/AITER 平台)
+              └─ set_kv_buffer(layer, out_cache_loc, kv_a, k_pe)  ← 当前函数
+                 └─ BlockFP4KVQuantizeUtil.batched_quantize  (整段一次量化)
+
+        📥 参数：
+            layer    : 当前 attention 层，用 layer.layer_id 定位 buffer
+            loc_info : 写入目标 slot(= forward_batch.out_cache_loc)，可为 KVWriteLoc
+            cache_k  : 已 concat 的 latent [n,1,kv_cache_dim](BF16/FP16)
+            cache_v  : MLA 无独立 V，此处未用(签名兼容)
+        📤 返回：无(原地写入 kv_buffer + kv_scale_buffer)。
+        ⚙️ 行为：越界检查 → 整段 batched_quantize → 分别散点写 数据/scale。
+        ⚠️ 与 set_mla_kv_buffer 的区别：本路径把 nope+rope 当成整体量化(共享一套 scale)，
+           仅适用于上游已 concat 的场景；CUDA/AITER 主路径走 set_mla_kv_buffer 分段量化。
+        """
         # loc_info may be a KVWriteLoc; MLA pools have no SWA target.
         loc, _ = unwrap_write_loc(loc_info)
+        # 越界探针：loc 必须落在 [0, size+page_size)，防止脏索引污染 buffer(含哨兵尾巴)。
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA-FP4)")
         layer_id = layer.layer_id
+        # FP4 池构造时不传 use_dsa/override_kv_cache_dim，dsa_kv_cache_store_fp8 恒为 False。
         assert not self.dsa_kv_cache_store_fp8
         if cache_k.dtype != self.dtype:
+            # 输入是 BF16/FP16(≠ FP4) → 整段量化成 packed FP4 + block scale。
             from sglang.srt.layers.quantization.kvfp4_tensor import (
                 BlockFP4KVQuantizeUtil,
             )
@@ -2494,6 +2614,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
             )
 
         if self.store_dtype != self.dtype:
+            # FP4 路径：packed 数据与 scale 都是 uint8，分别散点写入对应 slot 行。
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k_fp4.view(
                 self.store_dtype
             )
@@ -2501,6 +2622,7 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
                 cache_k_fp4_sf.view(self.store_dtype)
             )
         else:
+            # 理论保留分支：若未来 dtype==store_dtype(非 FP4)，直写原值。
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
 
     def set_mla_kv_buffer(
@@ -2510,6 +2632,26 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ):
+        """✍️ 分段写路径(FP4 主路径)——nope / rope 分别量化，两段 triton 内核融合写。
+
+        🔗 调用链定位(③ 前向写 KV，CUDA / AITER 主路径)：
+            DeepseekV2AttentionMLA._set_mla_kv_buffer (forward_mha.py:464)
+              └─ set_mla_kv_buffer(layer, out_cache_loc, kv_a, k_pe)  ← 当前函数
+                 ├─ BlockFP4KVQuantizeUtil.batched_quantize  (nope、rope 各一次)
+                 ├─ set_mla_kv_buffer_triton       → 写 kv_buffer(packed fp4 数据)
+                 └─ set_mla_kv_scale_buffer_triton → 写 kv_scale_buffer(逐块 scale)
+
+        📥 参数：
+            layer        : 当前 attention 层，用 layer.layer_id 定位 buffer
+            loc          : 写入目标 slot(= forward_batch.out_cache_loc)
+            cache_k_nope : 压缩潜变量段 [n,1,kv_lora_rank](BF16/FP16)
+            cache_k_rope : 解耦位置段   [n,1,qk_rope_head_dim](BF16/FP16)
+        📤 返回：无(原地写入 kv_buffer + kv_scale_buffer)。
+        ⚙️ 行为：越界检查 → nope/rope 分别 batched_quantize → 两段 triton 内核把
+            数据与 scale 各自融合散点写进对应 buffer 行(避免上游 concat 开销)。
+        ⚠️ 注意：见类 docstring 的"已知边界"——dsa 分支为 dead path；
+            末尾对 cache_k_nope/cache_k_rope 的 view 重赋值无副作用。
+        """
         maybe_detect_oob(
             loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA-FP4)"
         )
@@ -2518,16 +2660,21 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
         if self.dsa_kv_cache_store_fp8:
             # original cache_k: (num_tokens, num_heads 1, hidden 576); we unsqueeze the page_size=1 dim here
             # TODO no need to cat
+            # ⚠️ dead path：本类 dsa_kv_cache_store_fp8 恒为 False(构造未传 use_dsa)。
+            #    沿用自基类，走 FP8 的 quantize_k_cache；待 FP4 支持 DSA 时再启用。
             cache_k = torch.cat([cache_k_nope, cache_k_rope], dim=-1)
             cache_k = quantize_k_cache(cache_k.unsqueeze(1)).squeeze(1)
             cache_k = cache_k.view(self.store_dtype)
             self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
         else:
+            # FP4 主路径
             if cache_k_nope.dtype != self.dtype:
                 from sglang.srt.layers.quantization.kvfp4_tensor import (
                     BlockFP4KVQuantizeUtil,
                 )
 
+                # nope、rope 分别量化：各自的 block scale 独立，精度更优；
+                # 返回 (packed fp4 uint8, scale uint8)。
                 cache_k_nope_fp4, cache_k_nope_fp4_sf = (
                     BlockFP4KVQuantizeUtil.batched_quantize(cache_k_nope)
                 )
@@ -2536,15 +2683,19 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
                 )
 
             if self.store_dtype != self.dtype:
+                # ⚠️ 此处对入参 cache_k_nope/cache_k_rope 的 view 重赋值后未再使用，
+                #    实际写入用的是上面的 *_fp4 变量；疑为 fp8 路径复制残留，无副作用。
                 cache_k_nope = cache_k_nope.view(self.store_dtype)
                 cache_k_rope = cache_k_rope.view(self.store_dtype)
 
+            # ① 写 packed FP4 数据：nope 段写入行前段、rope 段写入行后段(同一 buffer 行)。
             set_mla_kv_buffer_triton(
                 self.kv_buffer[layer_id - self.start_layer],
                 loc,
                 cache_k_nope_fp4,
                 cache_k_rope_fp4,
             )
+            # ② 写 block scale：与数据 buffer 的行一一对应，nope/rope scale 同样分段写入。
             set_mla_kv_scale_buffer_triton(
                 self.kv_scale_buffer[layer_id - self.start_layer],
                 loc,
@@ -2560,13 +2711,13 @@ class DSATokenToKVPool(MLATokenToKVPool):
        额外再挂一份 "indexer KV 缓存" 用于稀疏 topk 选择。
 
     ╔══════════════════════════════════════════════════════════════════════════════════╗
-    ║  🧩 在 MLA 基础上新增的对外接口（框架通过这些方法使用本类）                            ║
+    ║  🧩 在 MLA 基础上新增的对外接口（框架通过这些方法使用本类）                                ║
     ╠══════════════════════════════════════════════════════════════════════════════════╣
     ║  set_index_k_scale_buffer(layer_id, loc, k, scale)  ✍️ 前向时写入 indexer 的 K+scale ║
     ║  get_index_k_with_scale_buffer(layer_id)            📖 取整层 indexer buffer          ║
     ║  get_index_k_continuous / get_index_k_scale_continuous 📖 分别连续读 K / scale        ║
     ║  get_index_k_scale_buffer(...)                      📖 融合读 (K, scale)（Triton 高效）║
-    ║  —— 以下为重写父类方法，把 indexer 缓存与主 latent 一起处理 ——                        ║
+    ║  —— 以下为重写父类方法，把 indexer 缓存与主 latent 一起处理 ——                            ║
     ║  move_kv_cache         🚚 投机解码搬运：latent + indexer 同步搬                       ║
     ║  get_cpu_copy/load     💿 offload/换入：latent + indexer 一起，避免 slot 复用读脏数据 ║
     ║  get_state_buf_infos   🌐 PD 分离：把 indexer 作为 StateType.DSA 随主 KV 一起传输     ║
@@ -2578,16 +2729,16 @@ class DSATokenToKVPool(MLATokenToKVPool):
     ╠══════════════════════════════════════════════════════════════════════════════════╣
     ║                                                                                  ║
     ║  ┌────────────┬─────────────────────────────┬─────────────────────────────────┐ ║
-    ║  │            │ MLATokenToKVPool（常规）     │ DSATokenToKVPool（稀疏）          │ ║
+    ║  │            │ MLATokenToKVPool（常规）      │ DSATokenToKVPool（稀疏）          │ ║
     ║  ├────────────┼─────────────────────────────┼─────────────────────────────────┤ ║
-    ║  │ 缓存张量    │ 仅 kv_buffer（latent）       │ kv_buffer + index_k_with_scale  │ ║
+    ║  │ 缓存张量     │ 仅 kv_buffer（latent）       │ kv_buffer + index_k_with_scale  │ ║
     ║  │            │                             │ _buffer（indexer 的 fp8 K+scale）│ ║
-    ║  │ attention  │ 对全部历史 token 做 MLA      │ indexer 先选 topk，只对 topk     │ ║
+    ║  │ attention  │ 对全部历史 token 做 MLA        │ indexer 先选 topk，只对 topk     │ ║
     ║  │ 范围        │                             │ 个 token 做 MLA                  │ ║
-    ║  │ indexer    │ 无                          │ 1 head × 128 dim，per-page 分页  │ ║
-    ║  │ 量化        │ nope/rope 见父类            │ indexer K 存 fp8 + per-block     │ ║
+    ║  │ indexer    │ 无                           │ 1 head × 128 dim，per-page 分页  │ ║
+    ║  │ 量化        │ nope/rope 见父类             │ indexer K 存 fp8 + per-block     │ ║
     ║  │            │                             │ scale（quant_block_size=128）    │ ║
-    ║  │ page_size  │ 任意                        │ 固定 64（非 HIP）/ 16 或 1(HIP)  │ ║
+    ║  │ page_size  │ 任意                         │ 固定 64（非 HIP）/ 16 或 1(HIP)  │ ║
     ║  └────────────┴─────────────────────────────┴─────────────────────────────────┘ ║
     ║                                                                                  ║
     ║  🎯 为什么这种场景用本类：                                                          ║
