@@ -29,7 +29,8 @@ if TYPE_CHECKING:
 
 
 class ComponentType(int, Enum):
-    """Integer enum so that per-node list/tuple storage can be indexed directly."""
+    """🏷️ 组件类型枚举 —— 可直接当作 int 索引 component_data[ct] 和 LRU 指针 slot。"""
+
 
     FULL = 0
     SWA = 1
@@ -58,8 +59,12 @@ _LAST_ACCESS_TIME_COUNTER_FLOAT = float64(1.0)
 _COMPONENT_UUID_COUNTER = 1
 
 
+# ═════════════════════════ 🏷️ ComponentType & Data ═════════════════════════
+
+
 @dataclasses.dataclass
 class ComponentData:
+    """🧬 每节点单组件数据 —— value=设备端 KV 索引, host_value=Host 端备份, lock_ref>0 防驱逐。"""
     value: Optional[torch.Tensor] = None
     lock_ref: int = 0
     metadata: dict[str, Any] = dataclasses.field(default_factory=dict)
@@ -132,10 +137,15 @@ class TreeComponent(ABC):
     def node_has_component_data(
         self, node: UnifiedTreeNode, target: EvictLayer = EvictLayer.DEVICE
     ) -> bool:
+        """📖 查询节点是否有该组件的 Device 或 Host 数据。
+
+        🔗 被 _cascade_evict、LRU refresh、insert overlap 等内部逻辑调用。"""
         cd = node.component_data[self.component_type]
         if target is EvictLayer.DEVICE:
             return cd.value is not None
         return cd.host_value is not None
+
+    # ---- Utilities: node-level data queries ----
 
     def value_len(self, node: UnifiedTreeNode) -> int:
         value = node.component_data[self.component_type].value
@@ -147,6 +157,13 @@ class TreeComponent(ABC):
         node: UnifiedTreeNode,
         root_node: UnifiedTreeNode,
     ) -> None:
+        """🕐 按阶段刷新组件 LRU。
+
+        🔗 UnifiedRadixCache._touch_node (WALKDOWN) / _match_post_processor (MATCH_END) / _insert_helper (INSERT_END) 回调。
+
+        ⚙️ WALKDOWN: 单节点 reset_node_mru (仅当有 value)。
+           MATCH_END: 匹配路径全部提升到 MRU (子节点比父节点更 MRU)。
+           INSERT_END: WALKDOWN 已刷新过, 跳过。"""
         ct = self.component_type
         match phase:
             case LRURefreshPhase.WALKDOWN:
@@ -168,15 +185,12 @@ class TreeComponent(ABC):
     def create_match_validator(
         self, match_device_only: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
-        """Return a per-match stateful predicate that decides whether a node
-        is a valid match boundary for this component.
-        Called once per match_prefix; the returned closure may carry state.
-        When match_device_only is true, host-backed nodes must not be accepted
-        as valid match boundaries.
-        - Full: returns True if the node has full component data.
-        - SWA: tracks accumulated length since last gap; returns True only
-          when the contiguous window reaches swa_sliding_window_size.
-        - Mamba: returns True iff the node has mamba component data."""
+        """🔍 返回状态化闭包 —— 在 _match_prefix_helper 遍历 tree 时逐节点判断是否有效匹配边界。
+
+        🔗 UnifiedRadixCache._match_prefix_helper 每轮 match 只创建一次。
+            match_device_only=True 时 host backup 不能作为有效匹配边界。
+
+        📤 Full: value 非 None; SWA: 累计 >= sliding_window_size; Mamba: value 非 None。"""
         ...
 
     def finalize_match_result(
@@ -186,11 +200,10 @@ class TreeComponent(ABC):
         value_chunks: list[torch.Tensor],
         best_value_len: int,
     ) -> MatchResult:
-        """Post-process the match result after prefix matching completes.
-        - Full & SWA: pass through unchanged.
-        - Mamba: performs copy-on-write — allocates a new mamba slot, copies
-          the matched node's mamba state into the request pool, and records
-          branching_seqlen in result."""
+        """🔍 匹配完成后后处理。
+
+        🔗 _match_post_processor 在拼接 device_indices 后调用。
+            Full/SWA: pass through; Mamba: COW 分配新 Mamba slot + 复制 SSM state。"""
         return result
 
     def update_component_on_insert_overlap(
@@ -201,19 +214,18 @@ class TreeComponent(ABC):
         value_slice: torch.Tensor,
         params: InsertParams,
     ) -> int:
-        """Called per-node when an insert's key overlaps an existing node.
-        Returns the index within value_slice from which this component
-        consumed (took ownership of) the underlying KV pool slots.
-        Returns prefix_len if nothing was consumed (default).
-        _insert_helper uses this to free only the non-consumed duplicate
-        portion: value_slice[dup_start:consumed_from]."""
+        """📝 insert 时处理与已有节点的重叠 —— 返回组件"消费"了多少 KV slot。
+
+        🔗 _insert_helper 对每个重叠节点调用。返回的 consumed_from 决定释放范围。
+            Full/Mamba: 默认返回 prefix_len; SWA: 窗口内复活 tombstone 时可消费全部/部分。"""
         return prefix_len
 
     def should_skip_leaf_creation(
         self, total_prefix_len: int, key_len: int, params: InsertParams
     ) -> bool:
-        """Return True to veto leaf creation when the entire new leaf would
-        be a tombstone for this component."""
+        """📝 否决新叶创建 —— 当整个新叶对本组件都是 tombstone 时。
+
+        🔗 _insert_helper 在创建叶子前检查。任意组件返回 True 则跳过叶子创建。"""
         return False
 
     def recover_after_unevict(
@@ -223,10 +235,9 @@ class TreeComponent(ABC):
         total_prefix_len: int,
         params: InsertParams,
     ) -> None:
-        """Called after _unevict_node_on_insert restores the base (Full) value
-        on an evicted node. Aux components (e.g. SWA) override this to rebuild
-        their own data from the freshly assigned base value when their entry
-        is still tombstoned. Default no-op."""
+        """📝 unevict 后重建辅组件数据。
+
+        🔗 _unevict_node_on_insert 恢复了 Full value 后回调。SWA 用此 hook 从新 Full value 重建窗口内 SWA。"""
         return None
 
     def commit_insert_component_data(
@@ -236,32 +247,20 @@ class TreeComponent(ABC):
         params: InsertParams,
         result: InsertResult,
     ) -> None:
-        """Finalize component data on the target (leaf) node after the insert
-        walk completes. Called once per insert.
-        - Full: no-op (full data is handled by _add_new_node).
-        - SWA: for new leaves, checks whether the node straddles the SWA
-          eviction boundary (swa_evicted_seqlen). If so, splits the node
-          via _split_node — the parent becomes a tombstone (no SWA) and the
-          child (the deeper portion) receives SWA data. If the entire node
-          is within the window, sets SWA directly. If entirely outside,
-          leaves SWA as None (tombstone).
-        - Mamba: sets the mamba component value from params, inserts into
-          mamba LRU list, and increments evictable size. If the node already
-          has mamba data, resets its LRU position instead."""
+        """📝 insert 遍历完成后在目标节点上最终确定组件数据。
+
+        🔗 _insert_helper 末尾调用, 每 insert 仅一次。
+            Full: no-op; SWA: 可能按窗口边界再次分裂; Mamba: 设 mamba_value + 插入 LRU。"""
         pass
 
     @abstractmethod
     def redistribute_on_node_split(
         self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode
     ):
-        """Redistribute component data between new_parent and child when a
-        node is split. new_parent is the newly created prefix node.
-        - Full: copies child's lock_ref to new_parent.
-        - SWA: slices (or clones) the swa value for new_parent, copies
-          lock_ref and component_uuid metadata, then syncs child's swa
-          value with its (now-trimmed) full_value.
-        - Mamba: sets new_parent's mamba value to None and lock_ref to 0
-          (mamba data stays on the original leaf, not on prefix nodes)."""
+        """✂️ 节点分裂时在新 parent 和 child 间重分配组件数据。
+
+        🔗 _split_node 在创建 new_parent 后、插入 LRU 前调用。
+            Full: 复制 lock_ref; SWA: 切片 value + 复制 UUID; Mamba: parent 得 None。"""
         ...
 
     @abstractmethod
@@ -404,7 +403,7 @@ class TreeComponent(ABC):
     ) -> None:
         pass
 
-    # ---- HiCache Hooks ----
+    # ════════════════════════ 🔍 Match → 📝 Insert → ✂️ Split → 🗑️ Evict → 🔒 Lock → 💾 Cache → 💿 HiCache ═══
 
     def build_hicache_transfers(
         self,

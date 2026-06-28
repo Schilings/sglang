@@ -49,6 +49,13 @@ class FullComponent(TreeComponent):
     component_type = ComponentType.FULL
 
     def __init__(self, cache, params):
+        """📦 Full 组件初始化 —— 确定 free 策略和 HiCache Host Pool。
+
+        ⚙️ free 策略:
+            若 SWA 同时存在 → free_full = full_attn_allocator.free (仅 Free Full KV)
+            否则          → free_full = allocator.free (释放全部 KV, 无 SWA)
+            SWA 的 KV 由级联驱逐触发 SWAComponent.evict_component 释放。
+        """
         super().__init__(cache, params)
         allocator = cache.token_to_kv_pool_allocator
         # When SWA is present, only free full-attention KV here;
@@ -63,6 +70,12 @@ class FullComponent(TreeComponent):
     def create_match_validator(
         self, match_device_only: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
+        """🔍 返回闭包判断节点是否有效 Full 匹配边界。
+
+        🔗 UnifiedRadixCache._match_prefix_helper 每轮 match 只创建一次。
+            match_device_only=True: 仅 device data 非 None (用于 scheduler best_match_device_node)
+            match_device_only=False: device data 或 host backup 任意存在即为有效边界
+        """
         if match_device_only:
             return (
                 lambda node: node.component_data[self.component_type].value is not None
@@ -80,8 +93,12 @@ class FullComponent(TreeComponent):
         value_chunks: list[torch.Tensor],
         best_value_len: int,
     ) -> MatchResult:
-        # Compute Full KV host hit length: walk from last_host_node up to
-        # last_device_node, summing host_value lengths of evicted nodes.
+        """🔍 匹配后处理 —— 计算 Full KV 的 Host 命中长度 (host_hit_length)。
+
+        🔗 UnifiedRadixCache._match_post_processor 中调用。
+            从 best_match_node 向上走到 last_device_node, 累加 evicted 节点的 host_value 长度。
+            用于 HiCache: 告知 scheduler 需要从 Host load_back 多少 token。
+        """
         ct = self.component_type
         kv_host_hit = 0
         node = result.best_match_node
@@ -100,6 +117,12 @@ class FullComponent(TreeComponent):
     def redistribute_on_node_split(
         self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode
     ):
+        """✂️ 分裂时重分配 Full 数据 —— 把 lock_ref 复制到新 parent, 切片 value/host_value。
+
+        🔗 UnifiedRadixCache._split_node 中在创建 new_parent 后调用。
+            new_parent 得前 split_len 个 token 的 value/host_value clone。
+            child 保留后半段。
+        """
         ct = self.component_type
         new_parent.component_data[ct].lock_ref = child.component_data[ct].lock_ref
         child_cd = child.component_data[ct]
@@ -118,6 +141,12 @@ class FullComponent(TreeComponent):
         node: UnifiedTreeNode,
         target: EvictLayer = EvictLayer.DEVICE,
     ) -> tuple[int, int]:
+        """🗑️ 驱逐节点上的 Full KV 资源。
+
+        🔗 _cascade_evict → _evict_component_and_detach_lru 中调用。
+            DEVICE: free_full + 更新 evictable_size。⚠️ value=None 延迟到 _cascade_evict (SWA 的 free_swa 还需读 Full.value)。
+            HOST:   free host pool + host_value=None。
+        """
         cd = node.component_data[self.component_type]
         freed = 0
         host_freed = 0
@@ -140,11 +169,18 @@ class FullComponent(TreeComponent):
         return freed, host_freed
 
     def eviction_priority(self, is_leaf: bool) -> int:
+        """🗑️ 叶节点=0, 内部节点=2 (最高, 最后驱逐)。"""
         return 0 if is_leaf else 2
 
     def drive_eviction(
         self, params: EvictParams, tracker: dict[ComponentType, int]
     ) -> None:
+        """🗑️ 从 evictable_device_leaves 堆驱逐直到满足 request token 数。
+
+        🔗 UnifiedRadixCache.evict() 中遍历组件调用。
+            堆键 = eviction_strategy.get_priority(n) (基于 last_access_time 的 LRU/FIFO 策略)。
+            驱逐叶节点后, 若 parent 变成叶子则推入堆继续驱逐。
+        """
         request = params.num_tokens
         heap = [
             (self.cache.eviction_strategy.get_priority(n), n)
@@ -166,7 +202,9 @@ class FullComponent(TreeComponent):
     def drive_host_eviction(
         self, num_tokens: int, tracker: dict[ComponentType, int]
     ) -> None:
-        """Evict host leaves to free KV host pool space."""
+        """🗑️ 从 evictable_host_leaves 堆驱逐 Host 端 Full KV。
+
+        🔗 HostPoolGroup 在 Host 池满时调用。与 drive_eviction 结构对称, 操作 Host 端叶子。"""
         heap = [
             (self.cache.eviction_strategy.get_priority(n), n)
             for n in self.cache.evictable_host_leaves
@@ -190,6 +228,13 @@ class FullComponent(TreeComponent):
         result: IncLockRefResult,
         lock_host: bool = False,
     ) -> IncLockRefResult:
+        """🔒 Path-lock: 从 node 沿 parent 一路锁到 root。
+
+        🔗 UnifiedRadixCache.inc_lock_ref 中调用。
+            lock_host=True: 仅锁单节点的 host_lock_ref (只有最后一个 host node 需要保护)。
+            否则: 跳过底部 evicted 段 → 从首个 device-on 节点开始逐祖先 +1。
+            lock_ref 0→1 时 token 从 evictable_size 转 protected_size, 同时从 evictable_device_leaves 移除。
+        """
         ct = self.component_type
 
         # Only the last host node needs to be protected.
@@ -233,6 +278,13 @@ class FullComponent(TreeComponent):
         params: Optional[DecLockRefParams],
         lock_host: bool = False,
     ) -> None:
+        """🔓 Path-unlock: 从 node 沿 parent 一路解到 root (跳过 inc_lock 时跳过的 evicted 段)。
+
+        🔗 UnifiedRadixCache.dec_lock_ref 中调用。
+            lock_host=True: 仅解单节点的 host_lock_ref。
+            否则: 跳过 skip_lock_node_ids 中记录的被 inc_lock 跳过的 evicted 段。
+            lock_ref 1→0 时 token 转回 evictable_size, 节点可能加入 evictable_device_leaves。
+        """
         ct = self.component_type
         if lock_host:
             cd = node.component_data[ct]
@@ -262,7 +314,7 @@ class FullComponent(TreeComponent):
                 self.cache._update_evictable_leaf_sets(cur)
             cur = cur.parent
 
-    # ---- HiCache Hooks ----
+    # ═════════════════════════ 💿 HiCache Hooks ═════════════════════════
 
     def build_hicache_transfers(
         self,
@@ -274,6 +326,12 @@ class FullComponent(TreeComponent):
         prefetch_tokens: int = 0,
         last_hash: Optional[str] = None,
     ) -> Optional[list[PoolTransfer]]:
+        """💿 构建 Full KV 的 HiCache 传输描述符。
+
+        🔗 HybridCacheController 在 BACKUP_HOST / LOAD_BACK / BACKUP_STORAGE / PREFETCH 阶段回调。
+            BACKUP_HOST: Full KV 由主流程直接操作 host_value, 无需额外 PoolTransfer → None。
+            LOAD_BACK:   从 best_match_node 向上收集 evicted 节点的 host_value → PoolTransfer(KV)。
+        """
         ct = self.component_type
 
         if phase == CacheTransferPhase.BACKUP_HOST:
@@ -320,6 +378,12 @@ class FullComponent(TreeComponent):
         insert_result: Optional[InsertResult] = None,
         pool_storage_result: Optional[PoolTransferResult] = None,
     ) -> None:
+        """💿 完成 HiCache 传输后的状态提交。
+
+        🔗 HybridCacheController 在 DMA 完成后回调。
+            BACKUP_HOST: 将 host_indices clone 到 node.component_data[FULL].host_value。
+            LOAD_BACK:   将 device_indices 按 token 段切片写入各节点的 value, 更新 evictable_size 和叶子集合。
+        """
         ct = self.component_type
 
         if phase == CacheTransferPhase.BACKUP_HOST:
