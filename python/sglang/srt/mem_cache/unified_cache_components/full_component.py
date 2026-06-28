@@ -33,6 +33,19 @@ if TYPE_CHECKING:
 
 
 class FullComponent(TreeComponent):
+    """📦 Full Attention KV Cache 组件 —— 标准全注意力模型的缓存驱逐/锁定策略。
+
+    ╔══════════════════════════════════════════════════════════════════════════════════╗
+    ║  🔑 关键特征                                                                       ║
+    ║    Lock: Full path-lock (从 node 一路锁到 root)                                    ║
+    ║    驱逐: 用 evictable_device_leaves 叶子集合堆 (last_access_time 排序)              ║
+    ║    split: 复制 lock_ref 到新 parent，切片 value/host_value                         ║
+    ║    级联优先级: leaf=0, internal=2 (最高，最后被驱逐)                                 ║
+    ║    validator: 要求 Full device data 非 None (或 HiCache 匹配时有 host backup)       ║
+    ║                                                                                  ║
+    ║  ⚠️ 若 SWA 存在，free_full 指向 full_attn_allocator.free(仅 free Full, SWA 由级联)  ║
+    ╚══════════════════════════════════════════════════════════════════════════════════╝
+    """
     component_type = ComponentType.FULL
 
     def __init__(self, cache, params):

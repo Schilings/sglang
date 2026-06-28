@@ -1,5 +1,32 @@
 from __future__ import annotations
 
+# ╔══════════════════════════════════════════════════════════════════════════════════════╗
+# ║  🌳 Unified Radix Cache —— 基于组件的统一前缀缓存框架                                  ║
+# ╠══════════════════════════════════════════════════════════════════════════════════════╣
+# ║                                                                                      ║
+# ║  将 Full / SWA / Mamba 三种缓存统一到一棵 radix tree 中，通过可插拔的 TreeComponent     ║
+# ║  hook 接口实现各组件独立的锁、驱逐、匹配逻辑。                                           ║
+# ║                                                                                      ║
+# ║  🔗 从 Scheduler 出发的完整调用链                                                       ║
+# ║                                                                                      ║
+# ║  Scheduler.get_next_batch_to_run() → match_prefix(key)                                ║
+# ║    ├─ session.try_match_prefix()  ← 流式会话 shortcut                                ║
+# ║    └─ _match_prefix_helper()      ← 遍历 radix tree + 每个 component 的 validator    ║
+# ║         ├─ 每节点调 all 组件 create_match_validator() 闭包                              ║
+# ║         └─ _match_post_processor() → 刷新 LRU + finalize_match_result()              ║
+# ║                                                                                      ║
+# ║  Scheduler.process_batch_result() → cache_unfinished_req() / cache_finished_req()     ║
+# ║    ├─ prepare_for_caching_req() 每组件                                                  ║
+# ║    ├─ insert() → _insert_helper() → update_on_overlap / commit_insert / split        ║
+# ║    ├─ dec_lock_ref(old) + inc_lock_ref(new)                                           ║
+# ║    └─ cleanup_after_caching_req() 每组件                                                ║
+# ║                                                                                      ║
+# ║  evict() → drive_eviction() 每个组件按自己策略驱逐 → _cascade_evict 级联低优先级组件       ║
+# ║                                                                                      ║
+# ║  组件 hook 接口详见 tree_component.py / README-zh.md                                    ║
+# ║                                                                                      ║
+# ╚══════════════════════════════════════════════════════════════════════════════════════╝
+
 import logging
 import sys
 import threading
@@ -76,6 +103,24 @@ T = TypeVar("T")
 
 
 class UnifiedTreeNode:
+    """🌳 统一 radix tree 节点 —— 每个节点独立存储各组件的数据。
+
+    ╔══════════════════════════════════════════════════════════════════════════════════╗
+    ║  🏷️ component_data: list[ComponentData] 按 ComponentType 枚举索引                   ║
+    ║       component_data[FULL]   → Full 组件的 value/lock_ref/host_value               ║
+    ║       component_data[SWA]    → SWA 组件的 value/lock_ref/host_value                ║
+    ║       component_data[MAMBA]  → Mamba 组件的 value/lock_ref/host_value              ║
+    ║                                                                                  ║
+    ║  🗂️ lru_prev / lru_next: list 长度 = _NUM_COMPONENT_TYPES × 2                     ║
+    ║       前半段 = 各 component device LRU 指针                                         ║
+    ║       后半段(偏移 _NUM_COMPONENT_TYPES) = 各 component host LRU 指针                ║
+    ║                                                                                  ║
+    ║  🔑 关键属性:                                                                       ║
+    ║    priority: int         叶子节点驱逐优先级 (last_access_time 派生)                   ║
+    ║    hash_value            每页 SHA256 (HiCache/Storage 层用)                        ║
+    ║    last_access_time      最后访问时间戳 (sanity check + 叶子集合堆排序)                ║
+    ╚══════════════════════════════════════════════════════════════════════════════════╝
+    """
     counter = 0
 
     def __init__(self, tree_components: tuple[ComponentType, ...], priority: int = 0):
@@ -134,6 +179,20 @@ class UnifiedTreeNode:
 
 
 class UnifiedLRUList:
+    """🗂️ 统一 LRU 双向链表 —— 每个 TreeComponent 拥有自己的 device LRU + host LRU。
+
+    ╔══════════════════════════════════════════════════════════════════════════════════╗
+    ║  🔑 指针槽位设计: lru_prev/lru_next 是长度 N×2 的 list                              ║
+    ║     device LRU: slot = component_type              (前半段)                       ║
+    ║     host LRU:   slot = component_type + N          (后半段, use_host_ptr=True)    ║
+    ║     这样同一节点的 device/host LRU 指针互不冲突。                                    ║
+    ║                                                                                  ║
+    ║  📐 head(dummy) ↔ ... ↔ tail(dummy)                                              ║
+    ║     MRU 端在 head 后，LRU 端在 tail 前                                              ║
+    ║                                                                                  ║
+    ║  ⚡ O(1) insert/remove/reset_mru | O(L) 驱逐扫描(L=跳过的被锁节点数)                 ║
+    ╚══════════════════════════════════════════════════════════════════════════════════╝
+    """
     def __init__(
         self,
         component_type: ComponentType,
@@ -276,6 +335,57 @@ logger = logging.getLogger(__name__)
 
 
 class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
+    """🌳 统一 Radix Cache —— 基于可插拔 TreeComponent 的多缓存类型前缀缓存框架。
+
+    ╔══════════════════════════════════════════════════════════════════════════════════╗
+    ║  🧩 对外接口清单                                                                   ║
+    ╠══════════════════════════════════════════════════════════════════════════════════╣
+    ║                                                                                  ║
+    ║  match_prefix(key)       → 🔍 前缀匹配，所有组件 validator 都通过才推进              ║
+    ║  insert(key, value, ...) → 📝 插入 KV 入树，复用前缀 + tombstone 修复 + 释放重复     ║
+    ║  evict(params)           → 🗑️ 各组件按自己策略驱动驱逐，级联低优先级组件               ║
+    ║  inc_lock_ref(node)      → 🔒 锁定节点路径 (Full path-lock, SWA window-lock)        ║
+    ║  dec_lock_ref(node)      → 🔓 解锁节点路径，对称于 inc_lock_ref                      ║
+    ║  cache_finished_req(req) → 💾 请求完成后 KV 入树 + 释放锁                            ║
+    ║  cache_unfinished_req(req)→ 🚧 chunked prefill 中间结果入树 + 锁交换                 ║
+    ║                                                                                  ║
+    ║  ════════════ 🔗 从 Scheduler 出发的宏观调用链 ════════════                          ║
+    ║                                                                                  ║
+    ║  Scheduler.get_next_batch_to_run()                                                ║
+    ║    └─ Req.init_batch_info() → match_prefix(key)                                   ║
+    ║         ├─ session.try_match_prefix()    ← 流式会话 shortcut                       ║
+    ║         └─ _match_prefix_helper(key)     ← 从 root 遍历 tree                       ║
+    ║              ├─ 每节点调 all 组件 create_match_validator() 闭包                     ║
+    ║              ├─ 遇部分匹配 → _split_node() → redistribute_on_node_split()          ║
+    ║              └─ _match_post_processor() → 刷新 LRU + finalize_match_result()      ║
+    ║    └─ inc_lock_ref(last_node) → acquire_component_lock() 每组件                     ║
+    ║    └─ alloc / evict → evict() → drive_eviction() → _cascade_evict()               ║
+    ║                                                                                  ║
+    ║  Scheduler.process_batch_result()                                                 ║
+    ║    └─ cache_unfinished_req(req)             ← chunked prefill 中间结果              ║
+    ║         ├─ prepare_for_caching_req() 每组件                                        ║
+    ║         ├─ insert() → _insert_helper() → update_on_overlap / commit / split       ║
+    ║         ├─ re-match prefix → 写回 req_to_token_pool                               ║
+    ║         └─ dec_lock_ref(old) + inc_lock_ref(new) → 锁交换                          ║
+    ║    └─ cache_finished_req(req)               ← 请求完成                              ║
+    ║         └─ insert() + dec_lock_ref() + cleanup_after_caching_req()                 ║
+    ║                                                                                  ║
+    ║  ════════════ 🧬 核心数据结构 ════════════                                          ║
+    ║                                                                                  ║
+    ║  UnifiedTreeNode: 每个节点 component_data[ct] = ComponentData(value, lock_ref)     ║
+    ║  UnifiedLRUList:  每个 component 独立的 device/host LRU 双向链表                    ║
+    ║  TreeComponent:   组件 hook 接口 (create_match_validator, evict_component, ...)    ║
+    ║  COMPONENT_REGISTRY: {FULL→FullComp, SWA→SWAComp, MAMBA→MambaComp}               ║
+    ║                                                                                  ║
+    ║  ════════════ 🔑 关键设计 ════════════                                              ║
+    ║                                                                                  ║
+    ║  1. 树只操作 key (逻辑层)，所有物理资源管理由组件 hook 完成                            ║
+    ║  2. 级联驱逐：Full(2) > SWA(1) > Mamba(0)，驱逐时同步清理低优先级组件                  ║
+    ║  3. Full 驱逐用叶子集合堆 (last_access_time)，SWA/Mamba 用各自 LRU                  ║
+    ║  4. 流式会话: session.try_* 方法支持流式解码的前缀匹配                                 ║
+    ║                                                                                  ║
+    ╚══════════════════════════════════════════════════════════════════════════════════╝
+    """
     def __init__(
         self,
         params: CacheInitParams,

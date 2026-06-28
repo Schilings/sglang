@@ -104,6 +104,25 @@ def next_component_uuid() -> int:
 
 
 class TreeComponent(ABC):
+    """🧩 树组件抽象基类 —— 所有缓存类型 (Full/SWA/Mamba) 通过 hook 接口与 UnifiedRadixCache 交互。
+
+    ╔══════════════════════════════════════════════════════════════════════════════════╗
+    ║  🔗 调用者: UnifiedRadixCache 在 match/insert/evict/lock/cache 各阶段遍历组件调用 hook ║
+    ║                                                                                  ║
+    ║  🏷️ 子类必须设置 class attr component_type: ComponentType                           ║
+    ║                                                                                  ║
+    ║  📋 Hook 分组:                                                                     ║
+    ║    Match:    create_match_validator / finalize_match_result                      ║
+    ║    Insert:   update_component_on_insert_overlap / commit_insert_component_data    ║
+    ║    Split:    redistribute_on_node_split                                           ║
+    ║    Evict:    evict_component / eviction_priority / drive_eviction                 ║
+    ║    Lock:     acquire_component_lock / release_component_lock                      ║
+    ║    Cache:    prepare_for_caching_req / cleanup_after_caching_req                  ║
+    ║    HiCache:  build_hicache_transfers / commit_hicache_transfer                    ║
+    ║                                                                                  ║
+    ║  👆 详解见 README-zh.md 钩子参考表。                                                 ║
+    ╚══════════════════════════════════════════════════════════════════════════════════╝
+    """
     def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams):
         self.cache = cache
 

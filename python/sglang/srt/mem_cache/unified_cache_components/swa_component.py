@@ -40,13 +40,19 @@ if TYPE_CHECKING:
 
 
 class SWAComponent(TreeComponent):
-    """Sliding window attention component.
+    """🪟 Sliding Window Attention 组件 —— SWA KV 的 tombstone/窗口锁/驱逐策略。
 
-    Each SWA node stores translated SWA pool indices as its component
-    value, independent of the full attention indices on the same tree node.
-    When SWA data is evicted from an internal node the node is tombstoned
-    — its SWA component value becomes None while the full attention
-    value stays intact.
+    ╔══════════════════════════════════════════════════════════════════════════════════╗
+    ║  🔑 关键特征                                                                       ║
+    ║    value: 存储转换后的 SWA pool 索引 (独立于 Full 索引)                               ║
+    ║    Lock: window-lock, 向上累计直到 sliding_window_size, 边界用 component_uuid 标记   ║
+    ║    Tombstone: 内部节点 SWA 驱逐后 value=None, 节点保留在树中 (仅 Full 存活)            ║
+    ║    validator: 累计窗口 token 长度, >= sliding_window_size 才返回 True               ║
+    ║    驱逐: 从 SWA LRU 尾遍历, 内部 tombstone, 叶子全驱逐 + 级联                         ║
+    ║    insert: 若重叠节点在窗口边界内, 可复活 tombstone (恢复 SWA value)                    ║
+    ║    级联优先级: leaf=0, internal=1 (中等)                                            ║
+    ║    自由窗口 slot 释放: free_out_of_window_slots() 回收 decoder 前滑出的旧 SWA slot     ║
+    ╚══════════════════════════════════════════════════════════════════════════════════╝
     """
 
     def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams):

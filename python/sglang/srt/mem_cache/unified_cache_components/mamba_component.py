@@ -38,6 +38,20 @@ if TYPE_CHECKING:
 
 
 class MambaComponent(TreeComponent):
+    """🐍 Mamba/SSM 状态缓存组件 —— 单节点锁 + 写时复制 (COW) + ping-pong buffer。
+
+    ╔══════════════════════════════════════════════════════════════════════════════════╗
+    ║  🔑 关键特征                                                                       ║
+    ║    value: 存储 mamba pool 的 slot 索引 (每个叶子一组 mamba state)                     ║
+    ║    Lock: single-node lock (只锁自身, mamba state 是 per-leaf 不是 per-path)          ║
+    ║    COW: finalize_match_result() 中若有分支则分配新 mamba slot + 复制 SSM state        ║
+    ║    validator: 要求 Mamba device data 非 None (或 HiCache 时有 host backup)          ║
+    ║    split: parent 得 mamba value=None, lock_ref=0 (mamba 只留在叶子)                 ║
+    ║    驱逐: 从 Mamba LRU 尾遍历, 内部 tombstone, 叶子全驱逐 + 级联                       ║
+    ║    级联优先级: leaf=0, internal=0 (最低, 最先被驱逐)                                  ║
+    ║    ping-pong: prepare_for_caching_req 从 req pool 的 ping-pong buffer 取状态         ║
+    ╚══════════════════════════════════════════════════════════════════════════════════╝
+    """
     component_type = ComponentType.MAMBA
 
     def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams):

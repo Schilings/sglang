@@ -648,7 +648,7 @@ class HiCacheController:
         ║                                                                                                ║
         ╚════════════════════════════════════════════════════════════════════════════════════════════════╝
         """
-    def __init__(
+    def 写个__init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         mem_pool_host: HostKVCache,
