@@ -857,11 +857,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         📥 req: 已完成生成的请求。
         📥 is_insert: 是否将 KV 插入 radix tree (skip_radix_cache_insert 时为 False)。"""
+        # ① 流式会话 shortcut
         if self.session.try_cache_finished_req(req, is_insert=is_insert, **kwargs):
             return
 
         kv_committed_len = req.pop_committed_kv_cache()
 
+        # ② disable 路径: 直接 free KV + cleanup
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_committed_len
@@ -871,6 +873,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 comp.cleanup_after_caching_req(req, is_finished=True)
             return
 
+        # ③ 收集 token_ids 和 KV indices (从 req_to_token_pool 取值)
         token_ids = (req.origin_input_ids + req.output_ids)[:kv_committed_len]
         kv_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, :kv_committed_len
@@ -885,7 +888,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 priority=getattr(req, "priority", 0) or 0,
             )
 
-            # components prepare insert data + return effective cache_len
+            # ④ 各组件 prepare: 返回 effective_cache_len (可能截断)
             effective_cache_len = len(token_ids)
             for comp in self._components_tuple:
                 cl = comp.prepare_for_caching_req(
@@ -897,13 +900,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 if cl is not None:
                     effective_cache_len = min(effective_cache_len, cl)
 
-            # Truncate if needed
+            # ⑤ 截断: 若组件缩了缓存长度 → free 多余 KV slot
             if effective_cache_len < len(token_ids):
                 free_start = max(effective_cache_len, req.cache_protected_len)
                 self.token_to_kv_pool_allocator.free(kv_indices[free_start:])
                 token_ids = token_ids[:effective_cache_len]
                 kv_indices = kv_indices[:effective_cache_len]
 
+            # ⑥ page 对齐后 insert 入树
             radix_key = RadixKey(
                 token_ids, req.extra_key, is_bigram=self.is_eagle
             ).page_aligned(self.page_size)
@@ -914,17 +918,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             insert_params.value = values
             result = self.insert(insert_params)
 
-            # Free unaligned tail
+            # ⑦ 释放未对齐的尾部 KV (page 外, 不能入树)
             self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
         else:
+            # is_insert=False: 直接释放受保护的区间之外的 KV
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
 
+        # ⑧ 释放旧匹配路径的锁
         self.dec_lock_ref(
             req.last_node,
             DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
         )
 
-        # cleanup
+        # ⑨ 各组件清理
         for comp in self._components_tuple:
             comp.cleanup_after_caching_req(
                 req, is_finished=True, insert_result=result, insert_params=insert_params
@@ -948,11 +954,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         📥 req: chunked prefill 中的请求 (未完成)。
         📥 chunked: 是否 chunked prefill 模式。"""
+        # ① 流式会话 shortcut
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
 
         token_ids = req.get_fill_ids()
 
+        # ② disable 路径: 直接用 kv_indices 做 prefix_indices
         if self.disable:
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : len(token_ids)
@@ -964,7 +972,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             req.req_pool_idx, : len(token_ids)
         ]
 
-        # components prepare insert data + return effective cache_len
+        # ③ 各组件 prepare + 收集 effective_cache_len (可能截断)
         insert_params = InsertParams(
             prev_prefix_len=req.cache_protected_len,
             chunked=chunked,
@@ -981,12 +989,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if cl is not None:
                 effective_cache_len = min(effective_cache_len, cl)
 
+        # ④ SWA 窗口释放: decoder 前移产生的旧 SWA token
         if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
             for comp in self._components_tuple:
                 comp.free_out_of_window_slots(
                     req, effective_cache_len - 1, insert_params
                 )
 
+        # effective_cache_len <= 0 → 无有效缓存, 直接返回
         if effective_cache_len <= 0:
             req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
             for comp in self._components_tuple:
@@ -997,6 +1007,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         kv_indices = kv_indices_orig[:effective_cache_len]
 
+        # ⑤ page 对齐后 insert 入树
         radix_key = RadixKey(
             token_ids[:effective_cache_len],
             req.extra_key,
@@ -1009,30 +1020,35 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         insert_params.value = values
         result = self.insert(insert_params)
 
-        # Match prefix
+        # ⑥ re-match: 用相同 key 查询刚插入的树, 获取新的匹配路径
         match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
+        # cache_protected_len 不应超出重新匹配的范围
         assert (
             req.cache_protected_len <= len(new_indices) + self.page_size - 1
         ), f"{req.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
         assert new_prefix_len <= len(
             new_indices
         ), f"{new_prefix_len=}, {len(new_indices)=}"
+
+        # ⑦ 将新的匹配 indices 写回 req_to_token_pool
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
             new_indices[req.cache_protected_len :],
         )
 
+        # ⑧ 锁交换: 释放旧 last_node 的保护, 锁上新匹配节点
         self.dec_lock_ref(
             req.last_node,
             DecLockRefParams(swa_uuid_for_lock=getattr(req, "swa_uuid_for_lock", None)),
         )
         lock_result = self.inc_lock_ref(new_last_node)
 
-        # Update req fields
+        # ⑨ 更新 req 字段: indices, last_node, swa_uuid
         if len(new_indices) < len(kv_indices_orig):
+            # 新匹配 < 原始 kv: 拼接尾部 (在树外但仍在 req 中)
             req.prefix_indices = torch.cat(
                 [new_indices, kv_indices_orig[len(new_indices) :]]
             )
@@ -1042,7 +1058,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         req.last_node = new_last_node
         req.swa_uuid_for_lock = lock_result.swa_uuid_for_lock
 
-        # cleanup
+        # ⑩ 各组件清理
         for comp in self._components_tuple:
             comp.cleanup_after_caching_req(
                 req,
@@ -1079,67 +1095,78 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # nodes can also match, so we separately track the best device-resident
         # match for scheduler prefix indices and locking.
         node = self.root_node
-        child_key = key.child_key(self.page_size)
-        value: list[torch.Tensor] = []
-        best_match_node = node
-        best_match_device_node = node
-        best_match_device_value_len = 0
-        separate_device_match = self.cache_controller is not None
+        child_key = key.child_key(self.page_size)  # 取首 page 的 child key, 进入第一层
+        value: list[torch.Tensor] = []  # 收集匹配路径上各节点的 Full device value
+        best_match_node = node           # 最佳匹配 (含 Host 端, HiCache 用)
+        best_match_device_node = node    # 最佳设备匹配 (调度器用, 用于 prefix_indices + lock)
+        best_match_device_value_len = 0  # 设备匹配长度 = len(value)
+        separate_device_match = self.cache_controller is not None  # HiCache 启用时两套 validator
         if separate_device_match:
+            # HiCache: host_value 也算有效 → 用于 best_match_node (含 Host 的匹配节点)
             validators = tuple(
                 comp.create_match_validator() for comp in self._components_tuple
             )
+            # device_validators: 只认 device value → 用于 best_match_device_node
             device_validators = tuple(
                 comp.create_match_validator(match_device_only=True)
                 for comp in self._components_tuple
             )
         else:
+            # 无 HiCache: 只一套 validator, host/device 合一
             validators = tuple(
                 comp.create_match_validator(match_device_only=True)
                 for comp in self._components_tuple
             )
 
         def _all_valid(validators, node):
+            """所有组件 validator 都通过 → True"""
             return all([v(node) for v in validators])
 
         def _update_best_if_valid(node):
+            """若所有 validator 通过, 更新 best_match_node / best_match_device_node"""
             nonlocal best_match_node
             nonlocal best_match_device_value_len, best_match_device_node
             matched = _all_valid(validators, node)
             if matched:
-                best_match_node = node
+                best_match_node = node  # Host/Device 合一或 host 也有效 → best_match_node
 
             if not separate_device_match:
+                # 无 HiCache: host/device 合一, matched 就是 device match
                 if matched:
                     best_match_device_value_len = len(value)
                     best_match_device_node = node
                 return
+            # HiCache 模式: 额外检查纯设备端 validator
             if _all_valid(device_validators, node):
                 best_match_device_value_len = len(value)
                 best_match_device_node = node
 
+        # ② 从 root 向叶遍历 key
         while len(key) > 0 and child_key in node.children:
             child = node.children[child_key]
 
             # HiCache: dead node (evicted + not backuped) — stop traversal
+            # 设备驱逐了且 Host 也没备份 → 树在此断裂
             if child.evicted and not child.backuped:
                 break
 
             prefix_len = child.key.match(key, page_size=self.page_size)
             if prefix_len < len(child.key):
+                # 部分匹配: key 与 child.key 只重合了 prefix_len → split 后停止
                 node = self._split_node(child.key, child, prefix_len)
                 if not node.evicted:
                     value.append(node.component_data[BASE_COMPONENT_TYPE].value)
                 _update_best_if_valid(node)
                 break
 
+            # 完全匹配: key 覆盖了 child 的全部
             if not child.evicted:
                 value.append(child.component_data[BASE_COMPONENT_TYPE].value)
             node = child
             _update_best_if_valid(node)
-            key = key[prefix_len:]
+            key = key[prefix_len:]  # 截去已匹配的前缀
             if len(key):
-                child_key = key.child_key(self.page_size)
+                child_key = key.child_key(self.page_size)  # 下一 page 的 child key
 
         return (
             value,
@@ -1225,28 +1252,36 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             ④ 将 new_node 插入原 parent 的 children + 推入各辅组件 LRU。
             ⑤ split hash_value (用于 HiCache Storage)。
             ⑥ 若有 pending write-through, 替换引用 (_replace_pending_write_through_node)。"""
+        # ① 创建 new_node (作为 new_parent, 在 split_len 处截断)
         new_node = UnifiedTreeNode(self.tree_components, priority=child.priority)
         new_node.children = {key[split_len:].child_key(self.page_size): child}
-        new_node.parent = child.parent
-        new_node.key = child.key[:split_len]
+        new_node.parent = child.parent  # 继承原 parent
+        new_node.key = child.key[:split_len]  # new_node 持有前半段 key
         new_node.hit_count = child.hit_count
         new_node.creation_time = child.creation_time
 
+        # ② 从辅组件 LRU 中移除 child (分裂后需要重新插入)
         self._for_each_component_lru(child, UnifiedLRUList.remove_node)
 
+        # ③ child 变为 new_node 的子节点: key 截断为 [split_len:]
         child.parent = new_node
         child.key = child.key[split_len:]
+        # 分裂 hash_value: child 原有 hash 按 split_len 切分给两个节点
         new_node.hash_value, child.hash_value = split_node_hash_value(
             child.hash_value, split_len, self.page_size
         )
 
+        # ④ 各 component 重分配组件数据 (value/host_value/lock_ref/UUID)
         for component in self._components_tuple:
             component.redistribute_on_node_split(new_parent=new_node, child=child)
+        # 将 new_node 接入原 parent 的 children
         new_node.parent.children[key.child_key(self.page_size)] = new_node
 
+        # ⑤ HiCache write-through: 若 child 有 pending backup, 替换引用
         if child.backuped:
             self._replace_pending_write_through_node(child, [new_node, child])
 
+        # ⑥ 将 new_node 和 child 重新插入辅组件 LRU (MRU 位置)
         self._for_each_component_lru(
             new_node, UnifiedLRUList.insert_mru, skip_existing=True
         )
@@ -1255,6 +1290,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         child.last_access_time = get_and_increase_time_counter()
 
+        # ⑦ 更新驱逐叶子集合 (new_node/child 可能变成叶子)
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(child)
         return new_node
@@ -1346,11 +1382,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         priority = params.priority
         if priority is None:
             priority = 0
-        self._touch_node(node)
+        self._touch_node(node)  # 更新当前节点的访问时间
         node.priority = max(node.priority, priority)
         if len(key) == 0:
             return InsertResult(prefix_len=0, mamba_exist=True)
 
+        # ① 遍历已有子节点: 匹配 + 处理 overlap
         child_key = key.child_key(self.page_size)
         total_prefix_length = 0
         while len(key) > 0 and child_key in node.children:
@@ -1358,14 +1395,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self._touch_node(node)
             prefix_len = node.key.match(key, page_size=self.page_size)
             if prefix_len < len(node.key):
+                # 部分匹配: 需要 split 节点 (匹配只覆盖了 child 的前部分)
                 node = self._split_node(node.key, node, prefix_len)
             node.priority = max(node.priority, priority)
 
             if node.evicted:
+                # ── 分支 A: 节点曾被驱逐 (evicted=True) ──
+                # 用新 KV 恢复 Full device value; 辅组件可能有 tombstone 需重建
                 self._unevict_node_on_insert(node, value[:prefix_len])
-                # FULL was restored from the request's fresh KV. Aux
-                # components (e.g. SWA) may still hold tombstones and need
-                # to rebuild their value from the same slice.
                 for component in self._components_tuple:
                     if component.component_type == BASE_COMPONENT_TYPE:
                         continue
@@ -1376,9 +1413,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         params=params,
                     )
             else:
+                # ── 分支 B: 节点存活 (not evicted) ──
+                # 让各组件声明对重叠 KV slot 的所有权, 释放重复的旧 KV
                 value_slice = value[:prefix_len]
                 consumed_from = prefix_len
-                # Let each component claim ownership of overlapping KV slots
                 for component in self._components_tuple:
                     comp_consumed_from = component.update_component_on_insert_overlap(
                         node=node,
@@ -1389,22 +1427,25 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     )
                     consumed_from = min(consumed_from, comp_consumed_from)
 
+                # 释放旧 KV 中与新值重复的部分: [dup_start, consumed_from)
+                # dup_start: 不受 prev_prefix_len 保护的重叠起点
                 dup_start = max(0, params.prev_prefix_len - total_prefix_length)
                 if dup_start < consumed_from:
                     self.token_to_kv_pool_allocator.free(
                         value_slice[dup_start:consumed_from]
                     )
 
-            self._inc_hit_count(node, params.chunked)
+            self._inc_hit_count(node, params.chunked)  # 命中计数 → 可能触发 write_through backup
             total_prefix_length += prefix_len
-            key = key[prefix_len:]
-            value = value[prefix_len:]
+            key = key[prefix_len:]      # 截去已匹配前缀
+            value = value[prefix_len:]  # 对应截去 value
             if len(key):
-                child_key = key.child_key(self.page_size)
+                child_key = key.child_key(self.page_size)  # 下一 page
 
+        # ② 处理剩余 key 后缀: 可能创建新叶子
         is_new_leaf = False
-        # Create new leaf for remaining suffix
         if len(key):
+            # 任一组件拒绝叶子创建 → 放弃 (如 SWA: 整叶在窗口外)
             if any(
                 comp.should_skip_leaf_creation(
                     total_prefix_len=total_prefix_length,
@@ -1413,15 +1454,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 )
                 for comp in self._components_tuple
             ):
-                # TODO: When leaf creation is skipped, We should release all component
-                # resources here or propagate a flag so that
-                # cleanup_after_caching_req can free them properly.
-                self.token_to_kv_pool_allocator.free(value)
+                self.token_to_kv_pool_allocator.free(value)  # 释放未使用的 KV
                 return InsertResult(prefix_len=total_prefix_length)
             target_node = self._add_new_node(node, key, value, priority=priority)
             is_new_leaf = True
         else:
-            target_node = node
+            target_node = node  # 完整匹配已有节点, 不需要创建叶子
 
         # Finalize: let each component attach its data to the target node.
         # e.g. Mamba attaches mamba_value to the leaf node
@@ -1593,7 +1631,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         """
         ct = BASE_COMPONENT_TYPE
         cur = deleted_node.parent
+        # 从被删叶子向上遍历: 只要祖先已经没有子节点了, 就级联检查是否该删
         while cur != self.root_node and len(cur.children) == 0:
+            # 有锁 → 不删
             if any(
                 cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in cur.component_data
             ):
@@ -1603,10 +1643,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             has_host = cur.component_data[ct].host_value is not None
 
             if has_device:
+                # Full device 还在 → 保留为 D-leaf, 停止向上
                 self._update_evictable_leaf_sets(cur)
                 break
 
-            # Full device absent — clean up orphaned aux device data.
+            # Full device 已驱逐 → 清理这个祖先上的辅组件 device 残留
             for comp in self.components.values():
                 if comp.node_has_component_data(cur):
                     self._evict_component_and_detach_lru(
@@ -1614,10 +1655,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     )
 
             if has_host:
+                # Full host 还在 → 保留为 H-leaf, 停止向上
                 self._update_evictable_leaf_sets(cur)
                 break
 
-            # Full absent on both layers — evict remaining host data, delete.
+            # Full 两层都无 → 清理 Host 残留 + 删除节点, 继续向上
             for comp in self.components.values():
                 if comp.node_has_component_data(cur, target=EvictLayer.HOST):
                     self._evict_component_and_detach_lru(
@@ -1625,10 +1667,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     )
 
             self.evictable_host_leaves.discard(cur)
-            self._remove_leaf_from_parent(cur)
+            self._remove_leaf_from_parent(cur)  # 从 parent.children 移除
             parent = cur.parent
-            self._update_evictable_leaf_sets(parent)
-            cur = parent
+            self._update_evictable_leaf_sets(parent)  # parent 可能变成叶子
+            cur = parent  # 继续向上
 
     def _for_each_component_lru(
         self,
@@ -1736,18 +1778,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         """
         assert self._is_device_leaf(node), f"node {node.id} is not a D-leaf"
         if not node.backuped:
+            # ── 分支 1: write_back 策略 —— 先 D→H 备份, 再降级到 Host ──
             if (
                 self.cache_controller is not None
                 and self.cache_controller.write_policy == "write_back"
             ):
                 written = self.write_backup(node, write_back=True)
                 if written == 0:
-                    return
+                    return  # 备份失败 → 不驱逐
                 self.writing_check(write_back=True)
-                self._evict_to_host(node, tracker)
+                self._evict_to_host(node, tracker)  # 降级: 保留 Host 数据, 释放 Device
                 return
             else:
-                # Write-through: node has no backup, delete entirely.
+                # ── 分支 2: write_through 策略 —— 无备份, 整叶删除 ──
                 self._record_remove_event(node, medium=StorageMedium.GPU)
                 for comp in self._components_tuple:
                     self._evict_component_and_detach_lru(
@@ -1757,8 +1800,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 parent = node.parent
                 self._remove_leaf_from_parent(node)
                 self._update_evictable_leaf_sets(parent)
-                self._iteratively_delete_tombstone_leaf(node, tracker)
+                self._iteratively_delete_tombstone_leaf(node, tracker)  # 级联清理祖先
                 return
+        # ── 分支 3: 已 backup → 直接降级到 Host ──
         self._evict_to_host(node, tracker)
 
     def _evict_host_leaf(
@@ -1800,17 +1844,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.cache_controller is None:
             return 0
 
-        # Backup invariant (write-through): parent must be backuped first
+        # ① write-through 不变式: parent 必须先备份 (递归向上)
         if not write_back and (
             node.parent is not self.root_node and not node.parent.backuped
         ):
             if self.write_backup(node.parent) <= 0:
-                return 0
+                return 0  # 父节点备份失败 → 放弃
 
+        # ② 构造 Full KV 传输描述符
         device_value = node.component_data[BASE_COMPONENT_TYPE].value
         kv_xfer = PoolTransfer(name=PoolName.KV, device_indices=device_value)
 
-        # Build aux transfers, keyed per component.
+        # ③ 各辅组件构造各自的 BACKUP_HOST 传输 (如 SWA 的 host_indices)
         comp_xfers: dict[ComponentType, list] = {}
         for comp in self._components_tuple:
             if comp.component_type == BASE_COMPONENT_TYPE:
@@ -1822,24 +1867,25 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             CacheTransferPhase.BACKUP_HOST, kv_xfer, comp_xfers
         )
 
-        # Pre-evict host if insufficient
+        # ④ Host pool 不够 → 先驱逐 Host 腾空间
         kv_tokens = len(device_value)
         host_avail = self.cache_controller.mem_pool_host.available_size()
         if host_avail < kv_tokens:
             needed = kv_tokens - host_avail
             evicted = self.evict_host(needed)
             if evicted < needed:
-                return 0
+                return 0  # 驱逐后仍不够 → 放弃
 
+        # ⑤ 合并所有传输, 执行 D→H 拷贝
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
         host_indices = self.cache_controller.write(
             device_value, node_id=node.id, extra_pools=aux_xfers or None
         )
         if host_indices is None:
-            return 0
+            return 0  # 拷贝失败
 
-        # Commit
+        # ⑥ 各组件 commit: 将 host_indices 记录到 component_data.host_value
         kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=host_indices)
         self.components[BASE_COMPONENT_TYPE].commit_hicache_transfer(
             node,
@@ -1853,6 +1899,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 transfers=xfers,
             )
 
+        # ⑦ write_through 策略: 备份后 lock 路径 (防止被驱逐)
         lock_params = None
         if not write_back:
             lock_params = self.inc_lock_ref(node).to_dec_params()
@@ -1940,18 +1987,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return False
 
         start_time = time.perf_counter()
+        # ① 锁定 Host 锚点 (防止 load 过程中 Host 数据被驱逐)
         host_anchor_params = self.inc_host_lock_ref(best_match_node).to_dec_params()
-        # Build KV transfer
+        # ② Build KV transfer: Full 组件列出需要 load 的 host_indices
         kv_xfer = self.components[BASE_COMPONENT_TYPE].build_hicache_transfers(
             best_match_node, CacheTransferPhase.LOAD_BACK
         )[0]
 
-        # Lock path & pre-evict if device pool is insufficient
+        # ③ 锁定设备路径 + 提前驱逐腾空间
         result = self.inc_lock_ref(best_match_node)
         ancestor_lock_params = result.to_dec_params()
         kv_tokens = len(kv_xfer.host_indices)
 
-        # Build aux transfers, keyed per component.
+        # ④ 各辅组件构造 LOAD_BACK 传输 (如 SWA 的 tombstone host_value)
         comp_xfers: dict[ComponentType, list] = {}
         for comp in self._components_tuple:
             if comp.component_type == BASE_COMPONENT_TYPE:
@@ -1965,9 +2013,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             CacheTransferPhase.LOAD_BACK, kv_xfer, comp_xfers
         )
 
-        # Skip if there is nothing to load, or if the Full-KV transfer is too
-        # small / exceeds memory quota. Aux transfers should still run even
-        # when the Full-KV load is skipped by thresholding.
+        # ⑤ 跳过条件: 太小 (< threshold) 或超出内存配额
         if (kv_tokens < self.load_back_threshold and not comp_xfers) or (
             mem_quota is not None and kv_tokens > mem_quota + result.delta
         ):
@@ -1975,8 +2021,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.dec_host_lock_ref(best_match_node, host_anchor_params)
             return False
 
+        # ⑥ Device pool 不够 → 驱逐腾出空间
         if self.supports_swa():
-            avail = self.token_to_kv_pool_allocator.full_available_size()
+            avail = self.token_to_kv_pool_allocator.full_available_size()  # SWA: 只检查 Full pool
         else:
             avail = self.token_to_kv_pool_allocator.available_size()
         if avail < kv_tokens:
@@ -1985,9 +2032,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if result.num_tokens_evicted < needed:
                 self.dec_lock_ref(best_match_node, ancestor_lock_params)
                 self.dec_host_lock_ref(best_match_node, host_anchor_params)
-                return False
+                return False  # 驱逐不够 → 放弃 load
 
-        # Load H→D
+        # ⑦ 执行 H→D 拷贝 (cache_controller.load 分配 device indices + DMA)
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
         device_indices = self.cache_controller.load(
@@ -1996,12 +2043,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             extra_pools=aux_xfers or None,
         )
 
+        # ⑧ 释放设备路径锁 (load 完成, 数据已在 device)
         self.dec_lock_ref(best_match_node, ancestor_lock_params)
         if device_indices is None:
             self.dec_host_lock_ref(best_match_node, host_anchor_params)
-            return False
+            return False  # 拷贝失败
 
-        # Commit: each component gets only its own transfers
+        # ⑨ 各组件 commit: 将 device_indices 回填到 component_data.value
         kv_xfer.device_indices = device_indices
         self.components[BASE_COMPONENT_TYPE].commit_hicache_transfer(
             best_match_node,
@@ -2009,7 +2057,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             [kv_xfer],
         )
         for node in kv_xfer.nodes_to_load or ():
-            self._record_store_event(node, medium=StorageMedium.GPU)
+            self._record_store_event(node, medium=StorageMedium.GPU)  # 记录 GPU 存储事件
         for ct, xfers in comp_xfers.items():
             self.components[ct].commit_hicache_transfer(
                 best_match_node,
@@ -2017,6 +2065,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 xfers,
             )
 
+        # ⑩ 更新叶子集合 + 记录 ongoing_load_back (供后续确认回调)
         self._update_evictable_leaf_sets(best_match_node)
         self.ongoing_load_back[best_match_node.id] = (
             best_match_node,
