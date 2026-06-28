@@ -17,14 +17,15 @@ description: 按团队约定的"图文并茂 + 调用链"富注释风格为代�
 
 ## Workflow
 
-按顺序执行，**不要跳过调用链探索**。
+按顺序执行，**每一步都是强制要求，不可跳过**。
 
 1. **探索（动手前必做）**：读目标代码及其基类 / 关键依赖；用 search/grep 或 code-explorer 查清——谁创建本对象、谁调用本函数、对外暴露哪些接口、与哪些模块交互（scheduler / cache / attention / spec / disagg / offload 等），记录对端的文件 + 函数 + 行号。**调用链必须基于真实代码，严禁编造。**
 2. 写**类级宏观 docstring**（见下"① 类级注释"）。
-3. 为每个函数写**函数级 docstring + 行间注释**（见下"② 函数级注释"、"③ 行间注释"）。
-4. **按需**补"实现差异对比"（见下"④ 多实现类对比"）：仅当本类存在真实可比的同类、且对比确有启发时才写；若类是独立实现、或"同类"差异无足轻重，**跳过此节，不要硬凑**。
-5. **零污染校验**：通读 diff，确认未改任何一行可执行代码（含缩进、命名、顺序、空行结构）。
-6. **验证**：对修改文件运行 read_lints，确认无新增错误；改动区域外的既有警告保持不动。
+3. 为每个函数写**函数级 docstring**（见下"② 函数级注释"）。
+4. **⚠️ 必做：为每个函数体内部写行间注释**（见下"③ 行间注释"）。**这不是可选项 —— 注释、分支、循环、关键变量赋值处都必须有行间注释。** 执行完本步后自查：函数体内部是否每 10-20 行就有一行注释？关键 if/else 分支、循环体、数据变换语句前是否有注释？
+5. **按需**补"实现差异对比"（见下"④ 多实现类对比"）：仅当本类存在真实可比的同类、且对比确有启发时才写；若类是独立实现、或"同类"差异无足轻重，**跳过此节，不要硬凑**。
+6. **零污染校验**：通读 diff，确认未改任何一行可执行代码（含缩进、命名、顺序、空行结构）。
+7. **验证**：对修改文件运行 read_lints，确认无新增错误；改动区域外的既有警告保持不动。
 
 ---
 
@@ -48,14 +49,73 @@ description: 按团队约定的"图文并茂 + 调用链"富注释风格为代�
 1. **一句话职责**（带 Emoji，如 ✍️ 写 / 📖 读 / 🚚 搬运）。
 2. **🔗 调用链定位**：本函数在整体调用链中的第几步、谁调用它、它又调用谁（用 `├─ └─ →` 小图）。
 3. **详解**：📥 参数、📤 返回、⚙️ 行为 / 关键分支、⚠️ 注意 / 副作用 / 边界。
-4. docstring 之后，再写**行间注释**辅助逐行理解。
+4. ⚠️ **docstring 之后，必须在函数体内部写入行间注释**（见下"③ 行间注释"）。 这不算"完了"，行间注释是 docstring 的延续，同样强制。
 
 ## ③ 行间注释
 
-- 只解释"为什么 / 意图"，不复述代码字面（禁止 `i += 1  # i 自增`）。
-- 优先注释：关键分支、魔法数 / 维度、边界与哨兵、性能权衡、异步 / 同步点、易错点。
-- 在关键代码块开头用编号标出调用链位置（如 `# ③ 写 KV 链`）。
-- 保留原有注释（尤其原英文注释），中文注释叠加补充。
+**这是强制要求，不是可选项。** 每个函数体内部必须加入行间注释，解释"为什么 / 意图"而非复述代码。目标是读者只看注释就能理解代码逻辑，无需逐行推敲。
+
+### 必须注释的位置（按优先级排列）
+
+| 优先级 | 位置 | 示例 |
+|--------|------|------|
+| 🔴 必注 | 关键 if/else 分支入口 | `# 分支一：整节点在窗口内 → 全恢复` |
+| 🔴 必注 | 核心循环前 | `# ③ 遍历 LRU 尾端，驱逐直到满足 swa_num_tokens` |
+| 🔴 必注 | 数据变换 / 类型转换 | `# Full pool 索引 → SWA pool 索引 (通过 allocator 维护的映射表)` |
+| 🟡 应注 | 非显而易见的赋值 | `# inf 初始化使第一个 tombstone 就归零，保证"从根开始累计"语义` |
+| 🟡 应注 | 魔法数 / 维度来源 | `# + page_size 缓冲：驱逐边界是 page 对齐的，多保留一页避免误伤` |
+| 🟡 应注 | 状态变更（lock/unlock/tombstone）| `# lock_ref 1→0: 从 protected 移回 evictable` |
+| 🟢 可注 | 关键 assert 含义 | `# tombstone 不应被锁：lock_ref 必须为 0` |
+| 🟢 可注 | 哨兵 / 边界条件 | `# node is root → 停止向上遍历` |
+
+### 行间注释密度要求
+
+- 函数体每 **10-20 行代码** 至少应有一行中文注释。
+- 长函数（>40 行）在关键阶段开头用编号标注：`# ① 初始化` `# ② 遍历匹配` `# ③ 后处理`
+- 原有英文注释**必须保留**，中文注释**叠加补充**，不覆盖不删除。
+
+### 禁止事项
+
+- ❌ 禁止字面复述：`i += 1  # i 自增`
+- ❌ 禁止为了凑密度而加无意义注释
+- ❌ 禁止删除或覆盖原有英文注释
+
+### 行间注释范例
+
+```python
+def evict_component(self, node, target=EvictLayer.DEVICE):
+    ct = self.component_type
+    cd = node.component_data[ct]
+    freed = 0
+
+    # ── Device 层驱逐：释放 SWA pool 索引 → 变 tombstone ──
+    if EvictLayer.DEVICE in target and cd.value is not None:
+        # 用 full_indices 而非 swa_value: 无 SWA 映射的 slot 指向同一 sentinel,
+        # 直接 free swa_value 会导致 double-free
+        self.cache.token_to_kv_pool_allocator.free_swa(
+            node.component_data[BASE_COMPONENT_TYPE].value
+        )
+        freed = len(cd.value)
+        self.cache.component_evictable_size_[ct] -= freed
+        cd.value = None  # → tombstone (节点保留, 仅 SWA 数据清除)
+
+    # ── Host 层驱逐 ──
+    host_lru = self.cache.host_lru_lists[ct]
+    if EvictLayer.HOST in target and cd.host_value is not None:
+        host_freed = len(cd.host_value)
+        if self._swa_kv_pool_host is not None:
+            self._swa_kv_pool_host.free(cd.host_value)
+        cd.host_value = None
+        if host_lru.in_list(node):
+            host_lru.remove_node(node)
+
+    # ── 仅 DEVICE 层驱逐后: 若有残留 host_value, 移入 Host LRU 管理 ──
+    if target is EvictLayer.DEVICE and cd.value is None and cd.host_value is not None:
+        if not host_lru.in_list(node):
+            host_lru.insert_mru(node)
+
+    return freed, host_freed
+```
 
 ## ④ 多实现类对比（仅当确有可比同类时才写，否则跳过）
 
