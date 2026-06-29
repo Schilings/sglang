@@ -446,7 +446,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     ║  inc_lock_ref(node)      → 🔒 锁定节点路径 (Full path-lock, SWA window-lock)        ║
     ║  dec_lock_ref(node)      → 🔓 解锁节点路径，对称于 inc_lock_ref                      ║
     ║  cache_finished_req(req) → 💾 请求完成后 KV 入树 + 释放锁                            ║
-    ║  cache_unfinished_req(req)→ 🚧 chunked prefill 中间结果入树 + 锁交换                 ║
+    ║  cache_unfinished_req(req)→ 🚧 未完成请求 KV 入树 + re-match + 锁交换                  ║
     ║                                                                                  ║
     ║  ════════════ 🔗 从 Scheduler 出发的宏观调用链 ════════════                          ║
     ║                                                                                  ║
@@ -461,7 +461,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     ║    └─ alloc / evict → evict() → drive_eviction() → _cascade_evict()               ║
     ║                                                                                  ║
     ║  Scheduler.process_batch_result()                                                 ║
-    ║    └─ cache_unfinished_req(req)             ← chunked prefill 中间结果              ║
+    ║    └─ cache_unfinished_req(req)             ← prefill 后若未完成 / chunked 暂存      ║
     ║         ├─ prepare_for_caching_req() 每组件                                        ║
     ║         ├─ insert() → _insert_helper() → update_on_overlap / commit / split       ║
     ║         ├─ re-match prefix → 写回 req_to_token_pool                               ║
@@ -1086,9 +1086,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
-        """🚧 Chunked prefill 中间结果缓存 —— insert + re-match + 锁交换。
+        """🚧 未完成请求的 KV 缓存 —— insert + re-match + 锁交换。
 
-        🔗 Scheduler.process_batch_result() 对 chunked prefill 的中间批次调用。
+        🔗 两个调用点:
+            ① batch_result_processor.process_batch_result_prefill()
+               — 任何 prefill 完成后若请求未结束 (req.finished()==False) 就调用。
+               decode 阶段不调用 (避免每 decode 1 token 就 insert 的浪费)。
+            ② scheduler.stash_chunked_request()
+               — chunked prefill 暂存时调用, 传 chunked=True (不增 hit_count,
+               防止同一请求在多个 chunk 中虚增)。
 
         ⚙️ 流程:
             ① 收集 token_ids + kv_indices。
@@ -1101,8 +1107,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             ⑧ 更新 req.last_node, req.swa_uuid_for_lock 等字段。
             ⑨ component.cleanup_after_caching_req() 清理。
 
-        📥 req: chunked prefill 中的请求 (未完成)。
-        📥 chunked: 是否 chunked prefill 模式。"""
+        📥 req: 未完成的请求 (prefill 后但生成未结束)。
+        📥 chunked: True=chunked prefill 暂存场景 (不增 hit_count)。"""
         # ① 流式会话 shortcut
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
@@ -1858,14 +1864,43 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         skip_existing: bool = False,
     ):
         """Apply lru_op to each aux component's LRU that has data on this node.
-        If skip_existing=True, skip components already in the target LRU list."""
+        If skip_existing=True, skip components already in the target LRU list.
+
+        🔁 对节点上每个"辅助组件"(SWA/Mamba 等) 的 LRU 链表统一应用一个操作。
+
+        🔗 调用链定位:
+            ├─ _split_node()    → 分裂前 remove_node; 分裂后 insert_mru (×2, new_node+child)
+            └─ _evict_to_host() → device 驱逐后, 辅组件 host_value 入 Host LRU
+
+            本函数不直接驱逐, 仅作为"对节点各辅组件 LRU 批量施法"的统一入口;
+            真正的 LRU 操作由调用方通过 lru_op 传入 (UnifiedLRUList.remove_node /
+            insert_mru 这类未绑定方法, 签名 lru_op(lru, node))。
+
+        📥 node          : 要操作的树节点。
+        📥 lru_op        : 对 LRU 施加的操作 (未绑定方法, 第一参数 lru, 第二参数 node)。
+        📥 target        : DEVICE → 用 self.lru_lists 并看 cd.value;
+                           HOST   → 用 self.host_lru_lists 并看 cd.host_value。
+        📥 skip_existing : True 时跳过已在该 LRU 中的组件 (split 后重插时避免重复入链)。
+
+        ⚙️ 行为:
+            ① 选目标层 LRU 字典 (Device / Host)。
+            ② 遍历 tree_components, 跳过 Full (Full 用 leaf sets 管驱逐, 不走 LRU)。
+            ③ 仅对"该层有数据"的辅组件施法 —— 无数据的组件不在 LRU 中, 无需操作。
+            ④ skip_existing 时用 lru.in_list(node) 去重。
+
+        ⚠️ Full 组件必须跳过: Full 的驱逐由 evictable_device_leaves / evictable_host_leaves
+            叶子集合驱动, 不维护 LRU 链; 若误对 Full 施法会破坏叶子集合与 LRU 的一致性。"""
+        # ① 按 target 选 LRU 字典: Host 层用 host_lru_lists, Device 层用 lru_lists
         lru_dict = self.host_lru_lists if target is EvictLayer.HOST else self.lru_lists
+        # ② 遍历树启用的所有组件类型 (FULL / SWA / Mamba ...)
         for ct in self.tree_components:
             if ct == BASE_COMPONENT_TYPE:
                 continue  # Full uses leaf sets, not LRU
             cd = node.component_data[ct]
+            # ③ 仅处理"该层有数据"的辅组件: 无数据则不在 LRU 中, 施法无意义
             if (cd.host_value if target is EvictLayer.HOST else cd.value) is not None:
                 lru = lru_dict[ct]
+                # ④ skip_existing: split 后重插场景, 节点可能已在 LRU 中, 跳过避免重复
                 if skip_existing and lru.in_list(node):
                     continue
                 lru_op(lru, node)
