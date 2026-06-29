@@ -154,13 +154,45 @@ class UnifiedLRUList:
     """🗂️ 统一 LRU 双向链表 —— 每个 TreeComponent 拥有自己的 device LRU + host LRU。
 
     ╔══════════════════════════════════════════════════════════════════════════════════╗
+    ║  🧩 对外接口清单                                                                   ║
+    ╠══════════════════════════════════════════════════════════════════════════════════╣
+    ║  insert_mru / remove_node / reset_node_mru            ✍️ 单节点增删 / 重置        ║
+    ║  reset_node_and_parents_mru                          ✍️ 沿父链刷新 (Full/Mamba)  ║
+    ║  reset_node_and_window_ancestors_mru                 ✍️ 窗口限制刷新 (SWA)        ║
+    ║  in_list                                              📖 查询节点是否在 LRU       ║
+    ║  get_prev_no_lock / get_lru_no_lock                  📖 跳过被锁节点取 LRU 端     ║
+    ║  get_prev_leaf_no_lock / get_leaf_lru_no_lock        📖 仅取叶子 LRU 端           ║
+    ║  get_prev_no_host_lock / get_lru_no_host_lock        📖 Host 层 LRU 端            ║
+    ╚══════════════════════════════════════════════════════════════════════════════════╝
+
+    ╔══════════════════════════════════════════════════════════════════════════════════╗
+    ║  🔗 调用链 (谁使用本类)                                                            ║
+    ╠══════════════════════════════════════════════════════════════════════════════════╣
+    ║  UnifiedRadixCache.__init__()                                                       ║
+    ║    └─ lru_lists[ct]       = UnifiedLRUList(ct, ...)        ← device LRU           ║
+    ║    └─ host_lru_lists[ct]  = UnifiedLRUList(ct, ..., host)  ← host LRU             ║
+    ║                                                                                   ║
+    ║  UnifiedRadixCache._split_node() → _for_each_component_lru(remove_node/insert_mru)║
+    ║  UnifiedRadixCache._evict_component_and_detach_lru() → in_list/remove_node        ║
+    ║  TreeComponent.refresh_lru()  → reset_node_mru / reset_node_and_parents_mru       ║
+    ║                                  / reset_node_and_window_ancestors_mru (SWA)       ║
+    ║  TreeComponent.drive_eviction() → get_lru_no_lock / get_prev_no_lock              ║
+    ║  TreeComponent.drive_host_eviction() → get_lru_no_host_lock / get_prev_no_host    ║
+    ║  TreeComponent.acquire_component_lock() → in_list / remove_node                   ║
+    ╚══════════════════════════════════════════════════════════════════════════════════╝
+
+    ╔══════════════════════════════════════════════════════════════════════════════════╗
+    ║  🧬 设计要点                                                                       ║
+    ║                                                                                  ║
     ║  🔑 指针槽位设计: lru_prev/lru_next 是长度 N×2 的 list                              ║
     ║     device LRU: slot = component_type              (前半段)                       ║
     ║     host LRU:   slot = component_type + N          (后半段, use_host_ptr=True)    ║
-    ║     这样同一节点的 device/host LRU 指针互不冲突。                                    ║
+    ║     这样同一节点的 device/host LRU 指针互不冲突, 一个节点可同时在多条 LRU 中。      ║
     ║                                                                                  ║
-    ║  📐 head(dummy) ↔ ... ↔ tail(dummy)                                              ║
-    ║     MRU 端在 head 后，LRU 端在 tail 前                                              ║
+    ║  📐 head(dummy) ↔ MRU ... ↔ LRU ↔ tail(dummy)                                    ║
+    ║     MRU 端在 head 后 (新节点从 head 后插入), LRU 端在 tail 前 (驱逐从 tail 取)。    ║
+    ║                                                                                  ║
+    ║  🗃️ cache: dict[node.id → node] 是 O(1) 成员查询索引, 与链表同步维护。              ║
     ║                                                                                  ║
     ║  ⚡ O(1) insert/remove/reset_mru | O(L) 驱逐扫描(L=跳过的被锁节点数)                 ║
     ╚══════════════════════════════════════════════════════════════════════════════════╝
@@ -171,17 +203,28 @@ class UnifiedLRUList:
         tree_components: tuple[ComponentType, ...],
         use_host_ptr: bool = False,
     ):
+        """🆕 构造 —— 创建空的双向链表 + 选定本 LRU 在节点的指针槽位。
+
+        📥 component_type: 本 LRU 追踪的组件类型 (FULL/SWA/MAMBA)。
+        📥 tree_components: 树启用的组件类型元组 (用于构造 dummy 节点)。
+        📥 use_host_ptr: True=Host LRU (用后半段槽位), False=Device LRU (前半段槽位)。"""
         self.component_type = component_type
         # Pointer slot: host LRU uses offset slots so device/host pointers
         # never collide on the same node.
+        # 槽位计算: host LRU 用后半段 (offset _NUM_COMPONENT_TYPES), device 用前半段
         self._pt: int = component_type + (_NUM_COMPONENT_TYPES if use_host_ptr else 0)
+        # dummy head/tail: 避免边界判空, 真正节点总是 head.next ... tail.prev
         self.head = UnifiedTreeNode(tree_components)
         self.tail = UnifiedTreeNode(tree_components)
         self.head.lru_next[self._pt] = self.tail
         self.tail.lru_prev[self._pt] = self.head
+        # O(1) 成员索引: node.id → node (与链表节点同步维护)
         self.cache: dict[int, UnifiedTreeNode] = {}
 
     def _add_node_after(self, prev_node: UnifiedTreeNode, new_node: UnifiedTreeNode):
+        """🔗 在 prev_node 之后插入 new_node —— 双向链表标准插入。
+
+        ⚙️ 四步指针操作: prev ← new ← next; prev.next = new; next.prev = new。"""
         pt = self._pt
         new_node.lru_prev[pt] = prev_node
         new_node.lru_next[pt] = prev_node.lru_next[pt]
@@ -189,27 +232,41 @@ class UnifiedLRUList:
         prev_node.lru_next[pt] = new_node
 
     def _add_node(self, node: UnifiedTreeNode):
+        """➕ 在 head 之后插入 node → 变为 MRU 端。"""
         self._add_node_after(self.head, node)
 
     def _remove_node(self, node: UnifiedTreeNode):
+        """➖ 从链表中移除 node, 并清空其指针 (断引用环)。"""
         pt = self._pt
         node.lru_prev[pt].lru_next[pt] = node.lru_next[pt]
         node.lru_next[pt].lru_prev[pt] = node.lru_prev[pt]
         # Clear self pointers to break reference cycles among evicted nodes.
+        # 清空自身指针: 被驱逐节点可能引用环 → 防 GC 泄漏
         node.lru_prev[pt] = None
         node.lru_next[pt] = None
 
     def insert_mru(self, node: UnifiedTreeNode):
+        """✍️ 插入新节点到 MRU 端 (head 后)。
+
+        🔗 _split_node / _for_each_component_lru / acquire_component_lock / evict_component 等调用。
+        ⚠️  node 必须不在 cache 中 (assert 防止重复插入)。"""
         assert node.id not in self.cache
-        self.cache[node.id] = node
+        self.cache[node.id] = node  # 同步更新成员索引
         self._add_node(node)
 
     def remove_node(self, node: UnifiedTreeNode):
+        """✍️ 从 LRU 移除节点 —— 用于驱逐 / lock_ref 增到 1 / 节点分裂。
+
+        🔗 _split_node / _evict_component_and_detach_lru / acquire_component_lock 等调用。
+        ⚠️  node 必须在 cache 中。"""
         assert node.id in self.cache
-        del self.cache[node.id]
+        del self.cache[node.id]  # 同步删除成员索引
         self._remove_node(node)
 
     def reset_node_mru(self, node: UnifiedTreeNode):
+        """🔄 将已存在的节点移到 MRU 端 (等价于 remove + insert)。
+
+        🔗 TreeComponent.refresh_lru(WALKDOWN) 在路径遍历到节点时调用。"""
         assert node.id in self.cache
         self._remove_node(node)
         self._add_node(node)
@@ -220,11 +277,21 @@ class UnifiedLRUList:
         root_node: UnifiedTreeNode,
         should_include,
     ):
+        """🔄 沿父链向上: 每个满足 should_include 的祖先重新置为 MRU (子孙比祖先更"新")。
+
+        🔗 TreeComponent.refresh_lru(MATCH_END) 调用, Full/Mamba 用。
+
+        ⚙️ 子孙的 prev_node 是其父亲, 因此插入顺序天然保证"子孙 MRU > 父亲 MRU"。
+            这与 Full 组件用 last_access_time 递减的拓扑序保持一致。
+
+        📥 should_include: 回调 (node) → bool, 决定该祖先是否参与刷新
+              (例如只刷有 component value 的节点)。"""
         prev_node = self.head
         while node != root_node:
             if should_include(node):
                 assert node.id in self.cache
                 self._remove_node(node)
+                # 在上一刷新节点 (或 head) 后插入: 子节点总是比父节点更 MRU
                 self._add_node_after(prev_node, node)
                 prev_node = node
             node = node.parent
@@ -236,38 +303,64 @@ class UnifiedLRUList:
         window_size: int,
         should_include,
     ):
+        """🔄 滑动窗口受限的父链刷新 —— 累计 key 长度达到 window_size 即停止。
+
+        🔗 SWAComponent.refresh_lru(MATCH_END/INSERT_END) 专用。
+            SWA 只需保护滑动窗口内的祖先, 之外的祖先应保持可驱逐。
+
+        ⚙️ 与 reset_node_and_parents_mru 的唯一差别:
+            额外累加 len(node.key), 达到 window_size 时停止向上 (避免刷新窗口外的祖先)。
+
+        📥 window_size: sliding_window_size + page_size (caller 传入, 多 1 页缓冲)。"""
         prev_node = self.head
-        accumulated = 0
+        accumulated = 0  # 累计刷新路径上的 token 数
         while node != root_node and accumulated < window_size:
             if should_include(node):
                 assert node.id in self.cache
                 self._remove_node(node)
                 self._add_node_after(prev_node, node)
                 prev_node = node
-            accumulated += len(node.key)
+            accumulated += len(node.key)  # 累加 key 长度 (无论是否 include)
             node = node.parent
 
     def in_list(self, node: Optional[UnifiedTreeNode]):
+        """📖 节点是否在本 LRU 中 (O(1) dict 查询)。"""
         return node is not None and node.id in self.cache
 
     def get_prev_no_lock(self, node: UnifiedTreeNode, check_id: bool = True):
+        """📖 从 node 向 LRU 端走, 跳过 lock_ref>0 的节点, 返回第一个可驱逐节点。
+
+        🔗 TreeComponent.drive_eviction() 用于在 LRU 中找下一个驱逐目标。
+
+        ⚙️ 跳过被锁节点: lock_ref>0 的节点不能驱逐 (正在被 request 使用)。
+            若遍历到 head (dummy) → 返回 None (无可驱逐节点)。
+
+        📥 node: 起点节点。
+        📥 check_id: True=断言 node 在 cache 中 (驱逐循环外部调用可设 False)。"""
         if check_id:
             assert node.id in self.cache
         pt = self._pt
         ct = self.component_type
         x = node.lru_prev[pt]
+        # 跳过 lock_ref>0 的节点 (正在被某 request 锁定, 不可驱逐)
         while x.component_data[ct].lock_ref > 0:
             x = x.lru_prev[pt]
         if x == self.head:
-            return None
+            return None  # 全部被锁 → 无可驱逐
         return x
 
     def get_prev_leaf_no_lock(self, node: UnifiedTreeNode, check_id: bool = True):
+        """📖 从 node 向 LRU 端走, 跳过被锁节点和非叶子, 返回第一个可驱逐叶子。
+
+        🔗 Full 组件 drive_eviction() 用 (Full 只驱逐叶子, 内部不 tombstone)。
+
+        ⚙️ 比 get_prev_no_lock 多一个判断: len(x.children) > 0 的非叶子也跳过。"""
         if check_id:
             assert node.id in self.cache
         pt = self._pt
         ct = self.component_type
         x = node.lru_prev[pt]
+        # 跳过被锁节点 + 非叶子节点 (Full 只驱逐叶子)
         while x.component_data[ct].lock_ref > 0 or len(x.children) > 0:
             x = x.lru_prev[pt]
         if x == self.head:
@@ -275,7 +368,10 @@ class UnifiedLRUList:
         return x
 
     def get_prev_no_host_lock(self, node: UnifiedTreeNode, check_id: bool = True):
-        """Host-LRU walker: skip nodes whose component host_lock_ref > 0."""
+        """📖 Host-LRU 版的 get_prev_no_lock —— 跳过 host_lock_ref>0 的节点。
+
+        🔗 TreeComponent.drive_host_eviction() 用 (Host 层驱逐)。"""
+        # Host-LRU walker: skip nodes whose component host_lock_ref > 0.
         if check_id:
             assert node.id in self.cache
         pt = self._pt
@@ -288,12 +384,15 @@ class UnifiedLRUList:
         return x
 
     def get_lru_no_lock(self):
+        """📖 取 LRU 端第一个可驱逐节点 (从 tail 向 head 走, 跳过 lock_ref>0)。"""
         return self.get_prev_no_lock(self.tail, check_id=False)
 
     def get_leaf_lru_no_lock(self):
+        """📖 取 LRU 端第一个可驱逐叶子节点。"""
         return self.get_prev_leaf_no_lock(self.tail, check_id=False)
 
     def get_lru_no_host_lock(self):
+        """📖 取 Host LRU 端第一个可驱逐节点 (跳过 host_lock_ref>0)。"""
         return self.get_prev_no_host_lock(self.tail, check_id=False)
 
 
@@ -390,21 +489,25 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self,
         params: CacheInitParams,
     ):
+        # ── ① 基础 pool / page 配置 ──
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.page_size = params.page_size
         self.disable = params.disable
         self.is_eagle = params.is_eagle
+        # KV cache 事件追踪 (disaggregation 场景)
         self.enable_kv_cache_events = params.enable_kv_cache_events
         self.kv_event_queue = []
         self.eviction_policy = params.eviction_policy.lower()
         self.eviction_strategy = get_eviction_strategy(self.eviction_policy)
 
+        # ── ② 设备信息 ──
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
         else:
             self.device = torch.device("cpu")
 
+        # ── ③ 指标收集 ──
         if params.enable_metrics:
             self.init_metrics_collector()
         self._enable_metrics_flag = params.enable_metrics
@@ -412,14 +515,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.storage_metrics_collector: Optional[StorageMetricsCollector] = None
         self.extra_metric_labels = None
 
+        # ── ④ 组件注册: 按 tree_components 从 COMPONENT_REGISTRY 实例化各组件 ──
         assert params.tree_components is not None
         self.tree_components = tuple(params.tree_components)
         component_registry = COMPONENT_REGISTRY
         if params.component_registry_override:
+            # 允许用户覆盖默认组件类 (如自定义 SWA 实现)
             component_registry = {
                 **COMPONENT_REGISTRY,
                 **params.component_registry_override,
             }
+        # components[ct] = 组件实例; _components_tuple = 元组形式 (遍历用)
         self.components: dict[ComponentType, TreeComponent] = {
             ct: component_registry[ct](self, params) for ct in self.tree_components
         }
@@ -428,6 +534,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         self.sidecar_pool_specs: list[SidecarPoolSpec] = []
 
+        # ── ⑤ 流式会话: 始终启用, 非流式请求零开销 (try_* 短路) ──
         # Streaming session: embedded StreamingSession with self as inner.
         # Always on -- zero overhead when no streaming session is open (the
         # try_* entries short-circuit on non-streaming reqs / real TreeNodes).
@@ -435,6 +542,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # internal fall-through to self.inner.xxx never fires -- no recursion.
         self.session = StreamingSession(inner=self)
 
+        # ── ⑥ 分布式通信组 (TP / CP / PP) ──
         self.tp_group = params.tp_cache_group
         self.attn_cp_group = params.attn_cp_cache_group
         self.attn_tp_group = params.attn_tp_cache_group
@@ -446,17 +554,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
-        self.work_list: list[torch.distributed.Work] = []
+        self.work_list: list[torch.distributed.Work] = []  # 异步 send work 列表
 
-        # HiCache D↔H defaults (overridden by init_hicache)
+        # ── ⑦ HiCache D↔H 默认参数 (init_hicache 覆盖) ──
         self.cache_controller: Optional[HybridCacheController] = None
-        self.write_through_threshold = 256
+        self.write_through_threshold = 256  # write-through: 命中 N 次后触发 D→H backup
         self.prefetch_stop_policy = "best_effort"
-        self.prefetch_threshold = 256
+        self.prefetch_threshold = 256       # prefetch 最小 token 数
         self.prefetch_timeout_base = 1.0
         self.prefetch_timeout_per_page = 0.25
         self.hicache_storage_pass_prefix_keys = False
 
+        # ── ⑧ 初始化树状态 (root_node / LRU / 叶子集合 等) ──
         self.reset()
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
 
@@ -526,27 +635,37 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
+        # ── ① 创建 root_node: priority=-maxsize 保证 root 永远不被驱逐 ──
         self.root_node = UnifiedTreeNode(self.tree_components)
         self.root_node.priority = -sys.maxsize
         self.root_node.key = RadixKey(array("q"), None)
         self.root_node.component_data[BASE_COMPONENT_TYPE].value = []
         self.root_node.hash_value = []
+        # root 的每个组件 lock_ref=1: 永久锁定, 防止 root 被误驱逐
         for ct in self.tree_components:
             self.root_node.component_data[ct].lock_ref = 1
+
+        # ── ② 组件级 evictable / protected 计数器 ──
         self.component_evictable_size_ = {ct: 0 for ct in self.tree_components}
         self.component_protected_size_ = {ct: 0 for ct in self.tree_components}
 
+        # ── ③ Device LRU 链表 (每个辅组件一条) + 流式会话 slot 清空 ──
         self.lru_lists = {
             ct: UnifiedLRUList(ct, self.tree_components) for ct in self.tree_components
         }
         self.session.slots.clear()
 
+        # ── ④ 可驱逐叶子集合 (Full 用, 基于 last_access_time 堆排序) ──
         self.evictable_device_leaves: set[UnifiedTreeNode] = set()
         self.evictable_host_leaves: set[UnifiedTreeNode] = set()
+        # ── ⑤ Host LRU 链表 (HiCache 用, use_host_ptr=True) ──
         self.host_lru_lists = {
             ct: UnifiedLRUList(ct, self.tree_components, use_host_ptr=True)
             for ct in self.tree_components
         }
+
+        # ── ⑥ HiCache 异步操作追踪表 ──
+        # ongoing_write_through: {ack_id → (node, lock_params, publish_nodes)}
         self.ongoing_write_through: dict[
             int,
             tuple[
@@ -555,12 +674,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 list[UnifiedTreeNode],
             ],
         ] = {}
+        # ongoing_load_back: {node.id → (node, device_lock_params, host_lock_params)}
         self.ongoing_load_back: dict[
             int,
             tuple[UnifiedTreeNode, DecLockRefParams, DecLockRefParams],
         ] = {}
         self.enable_storage = False
         self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
+        # ongoing_prefetch: {req_id → (host_node, key, host_indices, op, lock_params, comp_xfers)}
         self.ongoing_prefetch: dict[
             str,
             tuple[
@@ -572,13 +693,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 dict[ComponentType, list[PoolTransfer]],
             ],
         ] = {}
+        # ongoing_backup: {operation_id → (node, host_lock_params)}
         self.ongoing_backup: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
 
+        # ── ⑦ 重置 cache_controller (HiCache 控制器) ──
         if self.cache_controller is not None:
             self.cache_controller.reset()
             self.cache_controller.mem_pool_host.clear()
             self.enable_storage = self.cache_controller.enable_storage
 
+        # ── ⑧ 空 MatchResult 缓存 (避免每次 match 空结果都创建新 tensor) ──
         self._empty_match_result = MatchResult(
             device_indices=torch.empty(
                 (0,),
@@ -597,7 +721,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             attach_hybrid_pool_to_unified_cache,
         )
 
-        # Direct IO layout fixup (must happen before pool creation)
+        # ── ① Direct IO 布局修正: direct IO 不支持 page_first, 自动切 page_first_direct ──
         if server_args.hicache_io_backend == "direct":
             if server_args.hicache_mem_layout == "page_first":
                 server_args.hicache_mem_layout = "page_first_direct"
@@ -606,11 +730,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     "switching to page first direct layout"
                 )
 
+        # ── ② HiCache 事件 + sidecar pool + 指标标签 ──
         self.load_cache_event = threading.Event()
         self.sidecar_pool_specs.clear()
         self.extra_metric_labels = server_args.extra_metric_labels
 
-        # Parse storage config once, share with assembler and tree
+        # ── ③ 解析 storage 配置 (prefetch_threshold / timeout / prefix_keys) ──
         storage_backend = server_args.hicache_storage_backend
         storage_extra_config = None
         storage_prefetch_threshold = 256
@@ -628,6 +753,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 server_args.hicache_storage_backend_extra_config
             )
 
+        # ── ④ 组装 hybrid pool (Host pool + Storage backend) 并挂载到本 cache ──
         attach_hybrid_pool_to_unified_cache(
             self,
             params,
@@ -640,13 +766,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             storage_prefetch_threshold=storage_prefetch_threshold,
         )
 
-        # State initialization
+        # ── ⑤ HiCache 策略参数 ──
+        # write_through: 命中 1 次即 backup; write_back: 命中 2 次后才 backup (驱逐时触发)
         self.write_through_threshold = (
             1 if server_args.hicache_write_policy == "write_through" else 2
         )
-        self.load_back_threshold = 10
+        self.load_back_threshold = 10  # H→D load_back 的最小 token 数
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
+        # ── ⑥ 若启用 Storage, 应用 runtime 配置 (prefetch 参数 + 指标) ──
         if storage_backend is not None:
             self._apply_storage_runtime_config(
                 storage_backend=storage_backend,
@@ -678,10 +806,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         📤 MatchResult: 含 device_indices (匹配到的 KV slot 索引)、
                           last_device_node (设备端锚点)、last_host_node (Host 端锚点)、
                           swa_host_hit_length (SWA 需 load_back 的 token 数)。"""
+        # ① 流式会话 shortcut: 正在解码的 session 直接返回缓存结果
         result = self.session.try_match_prefix(params)
         if result is not None:
             return result
 
+        # ② key 预处理: bigram 视图 (Eagle 投机解码) + page 对齐
         key = params.key
         key, _ = key.maybe_to_bigram_view(self.is_eagle)
         if self.disable or len(key) == 0:
@@ -690,6 +820,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if len(key) == 0:
             return self._empty_match_result
 
+        # ③ 树遍历 + 后处理
         (
             value,
             best_match_node,
@@ -720,15 +851,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.disable:
             return InsertResult(prefix_len=0)
 
+        # ① key/value 预处理: bigram 视图 + page 对齐
         key = params.key
         value = params.value
         key, value = key.maybe_to_bigram_view(self.is_eagle, value)
         key = key.page_aligned(self.page_size)
         if value is not None:
-            value = value[: len(key)]
+            value = value[: len(key)]  # 截断到 page 对齐长度
         else:
+            # value=None: 用 token_ids 做占位 (仅测 key 匹配, 不真正分配 KV)
             value = torch.tensor(key.token_ids[: len(key)], dtype=torch.int64)
 
+        # ② 递归插入: 从 root 开始遍历+匹配+分裂+创建叶子
         result = self._insert_helper(self.root_node, key, value, params)
         return result
 
@@ -753,17 +887,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if self.disable:
             return EvictResult()
         start_time = time.perf_counter()
+        # tracker: 跨组件共享的驱逐计数 {ComponentType → 已驱逐 token 数}
         tracker = {ct: 0 for ct in self.tree_components}
 
+        # ① 各组件独立驱动驱逐: Full 从叶子集合, SWA/Mamba 从各自 LRU
         for component in self._components_tuple:
             component.drive_eviction(params=params, tracker=tracker)
 
+        # ② write_back 策略: 驱逐后检查是否有 pending D→H 写回需要完成
         if (
             self.cache_controller is not None
             and self.cache_controller.write_policy == "write_back"
         ):
             self.writing_check(write_back=True)
 
+        # ③ 指标收集
         self.update_eviction_metrics(sum(tracker.values()), start_time)
         return EvictResult(
             num_tokens_evicted=tracker[BASE_COMPONENT_TYPE],
@@ -784,15 +922,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         📥 node: 待锁定的节点 (匹配锚点)。
         📤 IncLockRefResult: 含 delta (lock 前后 protected 差值), swa_uuid_for_lock。"""
+        # 流式会话 shortcut
         result = self.session.try_inc_lock_ref(node)
         if result is not None:
             return result
         if self.disable:
             return IncLockRefResult()
+        # 遍历所有组件: Full path-lock / SWA window-lock / Mamba single-node
         result = IncLockRefResult()
         for component in self._components_tuple:
             result = component.acquire_component_lock(node=node, result=result)
 
+        # locked 节点从可驱逐集合移除
         self._update_evictable_leaf_sets(node)
         return result
 
@@ -806,22 +947,29 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         ⚙️ 遍历 component.release_component_lock(node, params):
              与 inc 相反, lock_ref 递减, 1→0 时恢复可驱逐状态。
              SWA 在 UUID 边界停止 (只释放窗口覆盖的部分)。"""
+        # 流式会话 shortcut
         result = self.session.try_dec_lock_ref(node, params)
         if result is not None:
             return result
         if self.disable:
             return DecLockRefResult()
+        # 遍历所有组件释放锁
         for component in self._components_tuple:
             component.release_component_lock(node=node, params=params)
 
+        # unlocked 节点重新加入可驱逐集合
         self._update_evictable_leaf_sets(node)
         # TODO: delta is not aggregated from components; no caller uses it yet.
         return DecLockRefResult()
 
     def inc_host_lock_ref(self, node: Any) -> IncLockRefResult:
+        """🔒 Host 层锁定 —— 保护 Host KV 不被 host eviction 驱逐 (HiCache 用)。
+
+        🔗 write_backup / load_back / prefetch_from_storage 内部调用。"""
         if self.disable:
             return IncLockRefResult()
         result = IncLockRefResult()
+        # 遍历组件: lock_host=True → 操作 host_lock_ref 而非 device lock_ref
         for component in self._components_tuple:
             result = component.acquire_component_lock(
                 node=node, result=result, lock_host=True
@@ -833,6 +981,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def dec_host_lock_ref(
         self, node: Any, params: Optional[DecLockRefParams] = None
     ) -> DecLockRefResult:
+        """🔓 Host 层解锁 —— 对称于 inc_host_lock_ref。"""
         if self.disable:
             return DecLockRefResult()
         for component in self._components_tuple:
@@ -1233,7 +1382,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             host_hit_length=0,
         )
 
-        # 各组件后处理: SWA 标记 swa_host_hit_length 等
+        # Full: 标记host_hit_length
+        # SWA: 标记 swa_host_hit_length
         for component in self._components_tuple:
             result = component.finalize_match_result(
                 result=result,
@@ -1496,11 +1646,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         host_value: torch.Tensor,
         hash_value: list[str],
     ) -> InsertResult:
+        """📝 Host 树插入 —— 将 prefetch 的 host KV 插入 radix tree (仅 Host 层)。
+
+        🔗 check_prefetch_progress() 在 prefetch 完成后调用。
+
+        ⚙️ 与 _insert_helper 类似但只操作 host_value (不涉及 device value):
+            ① 遍历已有节点匹配前缀
+            ② 创建新叶子 (host_value + hash_value)
+            ③ 返回 InsertResult (含 inserted_host_node 供 commit 用)。"""
         total_len = len(key)
         self._touch_node(node)
         if total_len == 0:
             return InsertResult(prefix_len=0, mamba_exist=True)
 
+        # ① 遍历已有子节点匹配前缀
         child_key = key.child_key(self.page_size)
         matched_length = 0
         while len(key) > 0 and child_key in node.children:
@@ -1508,18 +1667,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self._touch_node(node)
             prefix_len = node.key.match(key, page_size=self.page_size)
 
+            # 截去已匹配部分 (key / host_value / hash_value 三者同步)
             key = key[prefix_len:]
             host_value = host_value[prefix_len:]
             hash_value = hash_value[prefix_len // self.page_size :]
             matched_length += prefix_len
 
             if prefix_len < len(node.key):
+                # 部分匹配 → split
                 node = self._split_node(node.key, node, prefix_len)
 
             if len(key):
                 child_key = key.child_key(self.page_size)
 
         result = InsertResult(prefix_len=matched_length, total_len=total_len)
+        # ② key 全部匹配: 若当前节点已有 host_value → 返回该节点
         if len(key) == 0:
             if (
                 node is not self.root_node
@@ -1528,6 +1690,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 result.inserted_host_node = node
             return result
 
+        # ③ 有剩余 key → 创建新 Host 叶子节点
         new_node = UnifiedTreeNode(self.tree_components, priority=node.priority)
         new_node.parent = node
         new_node.key = key
@@ -1605,13 +1768,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         target: EvictLayer = EvictLayer.DEVICE,
         tracker: Optional[dict[ComponentType, int]] = None,
     ) -> tuple[int, int]:
+        """🗑️ 驱逐单组件数据 + 从 LRU 移除 —— 驱逐流水线的原子步骤。
+
+        🔗 _cascade_evict / _evict_device_leaf / _evict_host_leaf 调用。
+
+        ⚙️ ① comp.evict_component() 释放 KV pool slot (返回 freed token 数)。
+            ② 累加到 tracker (跨组件共享计数)。
+            ③ 从对应 LRU 链表移除 (device LRU 或 host LRU)。"""
+        # ① 释放组件 KV 资源 (free pool slot, tombstone value)
         device_freed, host_freed = comp.evict_component(node, target=target)
+        # ② 累加到 tracker
         if tracker is not None:
             if EvictLayer.DEVICE in target:
                 tracker[comp.component_type] += device_freed
             elif EvictLayer.HOST in target:
                 tracker[comp.component_type] += host_freed
 
+        # ③ 从 LRU 链表移除: device LRU 和 host LRU 分别检查
         # Detach from the appropriate LRU list(s)
         ct = comp.component_type
         for layer, lru_lists in (
@@ -1714,10 +1887,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         Only the Full (base) component is required; auxiliary components
         (Mamba, SWA) are not mandatory for D-leaf membership."""
         ct = BASE_COMPONENT_TYPE
+        # root 或已驱逐 → 不是 D-leaf
         if node is self.root_node or node.evicted:
             return False
+        # 任一组件被锁 → 不可驱逐 → 不是 D-leaf
         if any(cd.lock_ref > 0 for cd in node.component_data):
             return False
+        # 有子节点在 device 上有 Full KV → 不是叶子 (还有可驱逐的更深层叶子)
         if any(
             child.component_data[ct].value is not None
             for child in node.children.values()
@@ -1730,12 +1906,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         Only the Full (base) component host_value is required; auxiliary
         components are not mandatory for H-leaf membership."""
+        # root 或未驱逐 → 不是 H-leaf (H-leaf 必须是 device 已驱逐的)
         if node is self.root_node or not node.evicted:
             return False
+        # 未 backup → 没有 host 数据 → 不是 H-leaf
         if not node.backuped:
             return False
+        # 任一组件 host 被锁 → 不可驱逐
         if any(cd.host_lock_ref > 0 for cd in node.component_data):
             return False
+        # 有子节点 → 不是叶子
         if len(node.children) > 0:
             return False
         return True
@@ -1756,18 +1936,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self, node: UnifiedTreeNode, tracker: Optional[dict[ComponentType, int]] = None
     ) -> None:
         """GPU→CPU demotion: release all device resources, node stays in tree."""
+        # 前提: 节点未驱逐 + 已 backup (Host 有数据)
         assert not node.evicted and node.backuped
+        # ① 驱逐 Full device value (Full 是 trigger, 优先级最高)
         trigger = self.components[BASE_COMPONENT_TYPE]
         self._evict_component_and_detach_lru(
             node, trigger, target=EvictLayer.DEVICE, tracker=tracker
         )
+        # ② 级联驱逐辅组件 device 数据 (SWA/Mamba)
         self._cascade_evict(node, trigger, tracker)
         self._record_remove_event(node, medium=StorageMedium.GPU)
 
+        # ③ device 驱逐后: 辅组件的 host_value 仍在 → 插入 Host LRU (可被 host eviction)
         # after device eviction, insert aux components into host LRU.
         self._for_each_component_lru(
             node, UnifiedLRUList.insert_mru, target=EvictLayer.HOST, skip_existing=True
         )
+        # parent 可能因 node 变成 evicted 而改变叶子状态
         self._update_evictable_leaf_sets(node.parent)
 
     def _evict_device_leaf(
@@ -1819,13 +2004,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         assert self._is_host_leaf(node), f"node {node.id} is not an H-leaf"
 
         self._record_remove_event(node, medium=StorageMedium.CPU)
+        # ① 驱逐所有组件的 Host 数据 (ALL = device + host, 但 H-leaf 已无 device)
         for comp in self._components_tuple:
             _, hf = self._evict_component_and_detach_lru(
                 node, comp, target=EvictLayer.ALL, tracker=None
             )
             tracker[comp.component_type] += hf
+        # ② 从可驱逐 Host 叶子集合移除
         self.evictable_host_leaves.discard(node)
+        # ③ 从 parent.children 删除
         self._remove_leaf_from_parent(node)
+        # ④ 级联向上清理无子节点的祖先
         self._iteratively_delete_tombstone_leaf(node, tracker)
 
     # ---- HiCache: Backup / LoadBack ----
@@ -1916,21 +2105,26 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         node: UnifiedTreeNode,
         lock_params: Optional[DecLockRefParams],
     ) -> None:
+        """📋 记录 write-through pending 状态 —— 备份完成后需 dec_lock_ref。"""
         node.write_through_pending_id = node.id
+        # ongoing_write_through[ack_id] = (lock_node, lock_params, publish_nodes)
+        # publish_nodes 初始为 [node], split 后可能变为 [new_parent, child]
         self.ongoing_write_through[node.id] = (node, lock_params, [node])
 
     def _replace_pending_write_through_node(
         self, old_node: UnifiedTreeNode, new_nodes: list[UnifiedTreeNode]
     ) -> None:
+        """🔄 split 时替换 pending write-through 引用 —— old_node 拆成 new_nodes。"""
         ack_id = old_node.write_through_pending_id
         if ack_id is None:
-            return
+            return  # 无 pending backup → 无需替换
 
         pending = self.ongoing_write_through.get(ack_id)
         if pending is None:
             return
 
         lock_node, lock_params, publish_nodes = pending
+        # 在 publish_nodes 中用 new_nodes 替换 old_node
         updated_nodes = []
         replaced = False
         for node in publish_nodes:
@@ -1943,6 +2137,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if not replaced:
             return
 
+        # 新节点继承 ack_id (后续 ack 回调时需要清理)
         for node in new_nodes:
             node.write_through_pending_id = ack_id
         self.ongoing_write_through[ack_id] = (
@@ -1952,13 +2147,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
 
     def _finish_write_through_ack(self, ack_id: int) -> None:
+        """✅ write-through D→H backup 完成 —— 释放锁 + 触发 H→Storage 备份。"""
         lock_node, lock_params, publish_nodes = self.ongoing_write_through.pop(ack_id)
+        # 清理所有相关节点的 pending 标记 + 记录 CPU 存储事件
         for node in publish_nodes:
             if node.write_through_pending_id == ack_id:
                 node.write_through_pending_id = None
             self._record_store_event(node, medium=StorageMedium.CPU)
+        # 释放 write_through 时获取的 device lock
         if lock_params is not None:
             self.dec_lock_ref(lock_node, lock_params)
+        # 若启用 Storage: 每个 fragment 都要 H→Storage 备份
         if self.enable_storage:
             # Back up each fragment: after a split, lock_node only holds the
             # suffix; the prefix fragment must be persisted as well.
@@ -2092,11 +2291,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         kv_xfer: PoolTransfer,
         comp_xfers: dict[ComponentType, list[PoolTransfer]],
     ) -> list[PoolTransfer]:
+        """🔗 构造 sidecar pool 传输 —— 从 KV/SWA/MAMBA 主 pool 派生 sidecar 传输描述符。
+
+        🔗 write_backup / load_back / write_backup_storage / prefetch_from_storage 调用。
+
+        ⚙️ sidecar pool 是附加的存储池 (如 disagg 场景的传输 buffer):
+            根据 spec.indices_from_pool 找到源 pool 的传输 (kv_xfer 或 comp_xfers),
+            复用其 keys + hit_policy 构造 sidecar 的 PoolTransfer。"""
         transfers: list[PoolTransfer] = []
         for spec in self.sidecar_pool_specs:
+            # 确定索引来源: KV 主 pool 或辅组件 pool (SWA/MAMBA)
             if spec.indices_from_pool == PoolName.KV:
                 indices_source = kv_xfer
             else:
+                # 从 PoolName 映射到 ComponentType
                 source_component = {
                     PoolName.SWA: ComponentType.SWA,
                     PoolName.MAMBA: ComponentType.MAMBA,
@@ -2108,7 +2316,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     )
                 matching_sources = comp_xfers.get(source_component, ())
                 if not matching_sources:
-                    continue
+                    continue  # 该辅组件无传输 → 跳过此 sidecar
                 indices_source = matching_sources[0]
                 if indices_source.name != spec.indices_from_pool:
                     raise AssertionError(
@@ -2116,17 +2324,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         f"resolved to {indices_source.name} during {phase}."
                     )
 
+            # BACKUP_HOST 用 device_indices, 其他阶段用 host_indices
             indices = (
                 indices_source.device_indices
                 if phase == CacheTransferPhase.BACKUP_HOST
                 else indices_source.host_indices
             )
             if indices is None or len(indices) == 0:
-                continue
+                continue  # 无索引 → 跳过
             transfers.append(
                 PoolTransfer(
                     name=spec.pool_name,
-                    keys=indices_source.keys,
+                    keys=indices_source.keys,  # 复用源 pool 的 keys
                     hit_policy=spec.hit_policy,
                     indices_from_pool=spec.indices_from_pool,
                 )
@@ -2151,6 +2360,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.write_backup(node)
 
     def write_backup_storage(self, node: UnifiedTreeNode) -> None:
+        """💿 H→Storage 备份 —— 将 Host KV 写入远程存储 (如 shared filesystem / S3)。"""
+        # 前提: 启用 storage + 有 controller + 节点已 backup (有 host 数据)
         if (
             not self.enable_storage
             or self.cache_controller is None
@@ -2158,10 +2369,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         ):
             return
 
+        # 可选: 传递 prefix hash keys (用于 storage 端的范围查询优化)
         prefix_keys = None
         if self.hicache_storage_pass_prefix_keys:
             prefix_keys = node.get_prefix_hash_values(node.parent)
 
+        # ① 各辅组件构造 BACKUP_STORAGE 传输
         comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
         for comp in self._components_tuple:
             if comp.component_type == BASE_COMPONENT_TYPE:
@@ -2173,6 +2386,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if transfers:
                 comp_xfers[comp.component_type] = transfers
 
+        # ② Full KV 传输: host_indices + hash_value (每页一个 hash)
         kv_xfer = PoolTransfer(
             name=PoolName.KV,
             host_indices=node.component_data[BASE_COMPONENT_TYPE].host_value,
@@ -2184,6 +2398,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
 
+        # ③ 异步写入 Storage, 返回 operation_id
         operation_id = self.cache_controller.write_storage(
             node.component_data[BASE_COMPONENT_TYPE].host_value,
             node.key.token_ids,
@@ -2191,6 +2406,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             prefix_keys,
             extra_pools=aux_xfers or None,
         )
+        # ④ 记录 ongoing_backup + 锁定 Host (防止 backup 过程中 Host 被驱逐)
         self.ongoing_backup[operation_id] = (
             node,
             self.inc_host_lock_ref(node).to_dec_params(),
@@ -2216,6 +2432,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if not self.enable_storage or self.cache_controller is None:
             return
 
+        # ① 构造 prefetch_key: 预测的新 token → page-aligned RadixKey
         extra_key = last_host_node.key.extra_key if last_host_node.key else None
         prefetch_key = RadixKey(
             new_input_tokens,
@@ -2223,18 +2440,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             is_bigram=self.is_eagle,
         ).page_aligned(self.page_size)
         prefetch_length = len(prefetch_key)
+        # 太小或限流 → 放弃 prefetch
         if (
             prefetch_length < self.prefetch_threshold
             or self.cache_controller.prefetch_rate_limited()
         ):
             return
 
+        # ② 锁定 Host 锚点 + 在 Host pool 申请空间
         anchor_lock_params = self.inc_host_lock_ref(last_host_node).to_dec_params()
         host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
         if host_indices is None:
+            # Host pool 不够 → 先驱逐
             self.evict_host(prefetch_length)
             host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
         if host_indices is None:
+            # 驱逐后仍不够 → 缩减 prefetch_length 到可用空间
             available_size = self.cache_controller.mem_pool_host.available_size()
             prefetch_length = available_size - (available_size % self.page_size)
             if prefetch_length >= self.prefetch_threshold:
@@ -2249,6 +2470,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.dec_host_lock_ref(last_host_node, anchor_lock_params)
             return
 
+        # ③ 各辅组件构造 PREFETCH 传输 (如 SWA 申请一个窗口的 host buffer)
         comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
         alloc_failed = False
         for comp in self._components_tuple:
@@ -2262,6 +2484,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 last_hash=last_hash,
             )
             if transfers == []:
+                # 辅组件 alloc 失败 (返回空列表) → 整体放弃
                 alloc_failed = True
                 break
             if transfers:
@@ -2271,6 +2494,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             CacheTransferPhase.PREFETCH, kv_xfer, comp_xfers
         )
         if alloc_failed:
+            # 释放已分配的 host buffer + 解锁
             self.cache_controller.append_host_mem_release(
                 host_indices=host_indices,
                 extra_pools=[x for xfers in comp_xfers.values() for x in xfers],
@@ -2278,6 +2502,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.dec_host_lock_ref(last_host_node, anchor_lock_params)
             return
 
+        # ④ 异步 prefetch: cache_controller 负责从 Storage 加载到 host_indices
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
         operation = self.cache_controller.prefetch(
@@ -2288,6 +2513,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             prefix_keys,
             extra_pools=aux_xfers or None,
         )
+        # ⑤ 记录到 ongoing_prefetch (后续 check_prefetch_progress 轮询)
         self.ongoing_prefetch[req_id] = (
             last_host_node,
             prefetch_key,
@@ -2306,9 +2532,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
 
     def can_terminate_prefetch(self, operation: PrefetchOperation) -> bool:
+        """🔍 判断 prefetch 是否可以终止 —— 按 stop_policy + 跨 TP rank 同步。
+
+        ⚙️ 三种策略:
+            best_effort: 立即可终止
+            wait_complete: 必须等所有 page 加载完成
+            timeout: 完成或超时可终止
+
+        ⚠️ 跨 TP rank all_reduce(MAX): 任一 rank 不可终止 → 全体不可终止。"""
         if self.prefetch_stop_policy == "best_effort":
             return True
 
+        # 检查是否已加载完所有 page
         if len(operation.hash_value) == 0:
             completed = False
         else:
@@ -2316,6 +2551,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 operation.completed_tokens == len(operation.hash_value) * self.page_size
             )
 
+        # 按 stop_policy 判断本 rank 是否可终止
         if self.prefetch_stop_policy == "wait_complete":
             can_terminate = completed
         elif self.prefetch_stop_policy == "timeout":
@@ -2324,6 +2560,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
         else:
             return True
+        # 即使 completed: 若辅组件 pool_transfers 未完成 → 不可终止
         if (
             completed
             and getattr(operation, "pool_transfers", None)
@@ -2331,12 +2568,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         ):
             can_terminate = False
 
+        # 跨 TP rank 同步: states = [1-can_terminate, operation_terminated]
         operation_terminated = operation.is_terminated()
         states = torch.tensor(
             [1 - int(can_terminate), int(operation_terminated)],
             dtype=torch.int,
         )
         self._all_reduce_attn_groups(states, torch.distributed.ReduceOp.MAX)
+        # MAX 后: states[0]>0 表示至少一个 rank 不可终止 → can_terminate=False
         can_terminate = states[0].item() == 0
         operation_terminated = states[1].item() == 1
         return can_terminate or operation_terminated
@@ -2350,7 +2589,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             若完成 → terminate_prefetch() + 跨 TP rank all_reduce(MIN) 对齐 →
             _insert_helper_host() 插入 Host 树 + 各 component.commit_hicache_transfer(PREFETCH)。"""
         if req_id not in self.ongoing_prefetch:
-            return True
+            return True  # 无 prefetch 记录 → 视为完成
 
         (
             last_host_node,
@@ -2361,15 +2600,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             comp_xfers,
         ) = self.ongoing_prefetch[req_id]
         if operation.host_indices is None:
-            return True
+            return True  # 无操作 → 完成
+        # ① 检查是否可终止 (跨 TP rank 同步)
         if not self.can_terminate_prefetch(operation):
-            return False
+            return False  # 未完成 → 继续等待
 
+        # ② 终止 prefetch, 获取已完成的 token 数
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
             operation
         )
         min_completed_tokens = completed_tokens
         hit_pages = operation.pool_storage_result.extra_pool_hit_pages
+        # ③ 跨 TP rank all_reduce(MIN): 取所有 rank 中最小的完成数 (保证一致)
         if self.tp_world_size > 1:
             # Reduce full completed tokens together with the sidecar pools that
             # this prefetch actually transferred, in one all_reduce.
@@ -2383,6 +2625,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             for i, p in enumerate(sidecar_pools, start=1):
                 hit_pages[p] = int(packed[i].item())
 
+        # ④ 将预取的 KV 插入 Host 树
         fetched_key = prefetch_key[:min_completed_tokens]
         insert_result = self._insert_helper_host(
             last_host_node,
@@ -2391,6 +2634,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             hash_value[: min_completed_tokens // self.page_size],
         )
 
+        # ⑤ 各辅组件 commit PREFETCH (如 SWA 填充 tombstone)
         for ct, xfers in comp_xfers.items():
             self.components[ct].commit_hicache_transfer(
                 last_host_node,
@@ -2400,16 +2644,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 pool_storage_result=operation.pool_storage_result,
             )
 
+        # ⑥ 释放 Host pool: 已插入树的部分 free, 多余部分 release
         self.cache_controller.mem_pool_host.free(
             host_indices[: insert_result.prefix_len]
         )
         self.cache_controller.append_host_mem_release(
             host_indices[min_completed_tokens:completed_tokens]
         )
+        # ⑦ 解锁 + 清理 ongoing_prefetch
         self.dec_host_lock_ref(last_host_node, anchor_lock_params)
         del self.ongoing_prefetch[req_id]
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
 
+        # ⑧ 记录指标: 从 storage 新加载的 token 数 = min_completed - 已匹配
         loaded_from_storage = min_completed_tokens - insert_result.prefix_len
         self.prefetch_loaded_tokens_by_reqid[req_id] = loaded_from_storage
         logger.info(
@@ -2471,9 +2718,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         extra_release_counts: Optional[dict[PoolName, int]],
         log_metrics: bool,
     ) -> None:
+        """🔧 实际执行队列消费 —— revoke / backup ack / release / extra release 四类。"""
         cc = self.cache_controller
 
         def _drain_queue(q: Queue[T], limit: Optional[int]) -> Iterator[T]:
+            """通用队列消费: 最多取 limit 个 (None=全部)"""
             drained = 0
             while limit is None or drained < limit:
                 try:
@@ -2484,6 +2733,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 yield item
 
         def _drain_revoke():
+            """处理 prefetch 撤销: 释放 host buffer + 解锁"""
             drained = 0
             for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
                 info = self.ongoing_prefetch.pop(req_id, None)
@@ -2508,6 +2758,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return drained
 
         def _drain_backup():
+            """处理 backup ack: 释放 host lock + 记录指标"""
             drained = 0
             for operation in _drain_queue(cc.ack_backup_queue, n_backup):
                 drained += 1
@@ -2526,6 +2777,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return drained
 
         def _drain_release():
+            """处理 host mem release: 批量 free host pool"""
             host_indices_list = []
             released_tokens = 0
             for host_indices in _drain_queue(cc.host_mem_release_queue, n_release):
@@ -2536,6 +2788,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return len(host_indices_list), released_tokens
 
         def _drain_extra_release():
+            """处理辅组件 pool (如 SWA host pool) 的 release"""
             drained: dict[PoolName, tuple[int, int]] = {}
             if not extra_release_counts:
                 return drained
@@ -2555,15 +2808,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 drained[pool_name] = (len(host_indices_list), released_tokens)
             return drained
 
+        # 依次消费四类队列
         _drain_revoke()
         _drain_backup()
         _drain_release()
         _drain_extra_release()
 
     def drain_storage_control_queues(self) -> None:
+        """🔧 消费 Storage 控制队列 —— 跨 TP rank all_reduce(MIN) 对齐后批量处理。
+
+        🔗 Scheduler 每轮调用, 处理 prefetch revoke / backup ack / mem release。"""
         cc = self.cache_controller
         extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
         extra_pool_names = list(extra_release_queues)
+        # 收集本地队列大小
         local_qsize_list = [
             cc.prefetch_revoke_queue.qsize(),
             cc.ack_backup_queue.qsize(),
@@ -2577,6 +2835,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             local_qsize_list,
             dtype=torch.int,
         )
+        # 跨 TP rank all_reduce(MIN): 取最小队列大小 (保证各 rank 处理一致数量)
         self._all_reduce_attn_groups(qsizes, torch.distributed.ReduceOp.MIN)
         qsize_list = list(map(int, qsizes.tolist()))
         n_revoke, n_backup, n_release = qsize_list[:3]
