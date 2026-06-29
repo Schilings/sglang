@@ -178,10 +178,12 @@ class SWAComponent(TreeComponent):
     def _translate_full_to_swa(self, full_indices: torch.Tensor) -> torch.Tensor:
         """🔄 Full pool 索引 → SWA pool 索引。
 
-        🔗 被以下方法调用:
-            ├─ update_component_on_insert_overlap()  — 复活 tombstone 时转换新 Full    (↓ :197)
-            ├─ recover_after_unevict()                — unevict 后重建 SWA (:247)
-            └─ commit_insert_component_data()         — 新叶 SWA value 生成   (:273)
+        🔗 调用场景: SWA 模型有双池 (Full pool + SWA pool), 每个 token 有两份 KV。
+            insert 时 Full value 已由 _add_new_node / _unevict_node_on_insert 写入,
+            但 SWA value 需要从 Full value 翻译得到。被以下方法调用:
+            ├─ update_component_on_insert_overlap()  — tombstone 复活时转换新 Full
+            ├─ recover_after_unevict()                — Full unevict 后重建 SWA
+            └─ commit_insert_component_data()         — 新叶 SWA value 生成
 
         📥 full_indices: Full pool 中的 KV slot 索引 (BASE_COMPONENT_TYPE.value 的内容)。
         📤 对应的 SWA pool 索引。
@@ -240,11 +242,10 @@ class SWAComponent(TreeComponent):
     def _restore_device_value(self, node: UnifiedTreeNode, value: torch.Tensor) -> None:
         """🔄 Tombstone 复活 —— 写回 SWA value, 从 Host LRU 迁移到 Device LRU, 更新 evictable_size。
 
-        🔗
-          被以下方法调用:
-            ├─ update_component_on_insert_overlap()  — 重叠 tombstone 复活 (:200, :215)
-            ├─ recover_after_unevict()               — Full unevict 后重建 SWA (:257)
-            └─ commit_hicache_transfer(LOAD_BACK)   — HiCache load_back 回填 (:688)
+        🔗 调用场景: SWA tombstone (value=None) 恢复为有效状态的统一入口, 被以下三种场景调用:
+            ① update_component_on_insert_overlap() — insert 路径穿过窗口内 tombstone, 复活 SWA
+            ② recover_after_unevict()              — Full unevict 后从新 Full value 重建 SWA
+            ③ commit_hicache_transfer(LOAD_BACK)   — HiCache H→D 加载完成后回填 SWA device value
 
         ⚙️ 三步:
             ① 写回 cd.value ← value (结束 tombstone 状态)。
@@ -369,7 +370,10 @@ class SWAComponent(TreeComponent):
     ) -> int:
         """📝 处理 insert 路径与 tombstone 节点的重叠 —— 窗口内复活 SWA, 三分支: 全恢复/部分恢复/不消费。
 
-        🔗 _insert_helper() 对每个重叠节点调用 (:1213), 返回值 consumed_from 决定释放多少旧 KV slot。
+        🔗 调用场景: cache_finished_req / cache_unfinished_req → insert → _insert_helper 遍历树时,
+            若路径上的节点 SWA value=None (tombstone, 曾被 SWA LRU 驱逐), 且该节点现在落在
+            滑动窗口内, 则可以"复活"——从新 Full value 重新翻译出 SWA value 并写回。
+            这是 SWA 独有的机制: Full 数据在树中保留, SWA 数据可驱逐/复活。
 
         ⚙️ 三分支逻辑 (基于 swa_evicted_seqlen —— 当前窗口左边界):
             Branch 1: 整节点在窗口内 (swa_evicted_seqlen <= total_prefix_len)
@@ -448,7 +452,10 @@ class SWAComponent(TreeComponent):
     ) -> bool:
         """📝 否决新叶创建 —— 当整个新叶的 SWA 数据都在窗口外时 (全 tombstone)。
 
-        🔗 _insert_helper() 在创建叶子前调用 (:1239)。任意组件返回 True 则跳过叶子创建。
+        🔗 调用场景: _insert_helper 遍历完已有节点后, 若有剩余 key 后缀需要创建新叶子,
+            在 _add_new_node 前检查。任意组件返回 True 则放弃叶子创建 (free value 后返回)。
+            SWA 场景: 新叶若完全在 swa_evicted_seqlen 之外, 对 SWA 是纯 tombstone,
+            创建了也没有 SWA 数据 → 跳过避免无意义的叶子。
 
         ⚙️ swa_evicted_seqlen 是窗口左边界, >= total_prefix_len + key_len 意味着
             整叶都在左边界之外 → 对 SWA 完全是 tombstone → 不需要创建 SWA 叶子。"""
@@ -463,18 +470,15 @@ class SWAComponent(TreeComponent):
     ) -> None:
         """📝 Full unevict 后, 从新的 Full value 重建窗口内的 SWA value。
 
-        🔗 _unevict_node_on_insert() 恢复 Base Full value 后, 遍历辅组件调用 (:1202)。
-
-        ⚙️ 前提: _unevict_node_on_insert 已经把 request 的新 KV slice 写入 Full value。
-            此时 SWA value 要么是 None (tombstone), 要么已有值 (无需重建)。
-            若 tombstones, 且窗口边界内有内容, 则翻译 Full→SWA 并 _restore_device_value。
+        🔗 调用场景: _insert_helper 遍历树时遇到 evicted 节点 (Full value=None),
+            _unevict_node_on_insert 用新 KV 恢复了 Full value 后, 遍历辅组件调用本方法。
+            SWA 可能仍是 tombstone (曾随 Full 一起被驱逐), 需要从新 Full value 重建。
             与 update_component_on_insert_overlap 类似但更简单 —— 不需要 free 旧 Full value,
             因为 unevict 的 Full value 已经是新的。
 
-        📥 node: unevict 后的节点 (Full value 已更新)。
-        📥 prefix_len: 当前节点 key 长度。
-        📥 total_prefix_len: 累计到本节点之前的 token 数。
-        📥 params: InsertParams (含 swa_evicted_seqlen)。"""
+        ⚙️ 三分支 (同 update_component_on_insert_overlap):
+            整节点在窗口内 → 翻译 SWA; 骑跨边界 → split 后翻译右半; 整节点在窗口外 → 保持 tombstone。"""
+
         # _unevict_node_on_insert already wrote the request's fresh KV slice
         # into the base value. We just need to rebuild SWA from that slice for
         # the in-window portion. There is no old SWA slot to free here.
@@ -514,19 +518,16 @@ class SWAComponent(TreeComponent):
     ) -> None:
         """📝 Insert 完成后在目标节点上提交 SWA 数据 —— 分配 SWA value 并按窗口边界 split。
 
-        🔗 _insert_helper() 末尾调用所有 component (:1260), 每次 insert 仅一次。
+        🔗 调用场景: _insert_helper 遍历完所有重叠节点 + 创建新叶子后, 末尾调用各组件 commit。
+            Full 的 value 已由 _add_new_node 写入, 但 SWA value 需要在此处从 Full value 翻译并分配。
+            每次 insert 仅调用一次。
 
-        ⚙️ 对非新叶节点无操作。对新叶节点 (is_new_leaf=True):
+        ⚙️ 对非新叶节点无操作 (SWA 已在 overlap/unevict 步骤处理)。对新叶节点:
             ① 计算 split_pos = swa_evicted_seqlen - node_start (窗口边界在节点内的位置)
-            ② 如果 split_pos <= 0: 整叶在窗口内 → 从 Full value 翻译 SWA, 插入 LRU
-            ③ 如果 0 < split_pos < len(key): 骑跨边界 → split 节点, child 有 SWA, parent tombstone
-            ④ 如果 split_pos >= len(key): 整叶在窗口外 → 保持 tombstone (无操作)
-            ⑤ 调用 _maybe_split_leaf_for_swa_lock 裁剪尾部到窗口大小
-
-        📥 node: 目标节点 (插入位置)。
-        📥 is_new_leaf: 是否是新创建的叶子。
-        📥 params: InsertParams (含 swa_evicted_seqlen)。
-        📥 result: InsertResult (含 prefix_len)。"""
+            ② split_pos <= 0: 整叶在窗口内 → 翻译 SWA, 插入 LRU
+            ③ 0 < split_pos < len(key): 骑跨边界 → split, child 有 SWA, parent tombstone
+            ④ split_pos >= len(key): 整叶在窗口外 → 保持 tombstone
+            ⑤ _maybe_split_leaf_for_swa_lock 裁剪尾部到窗口大小"""
         if not is_new_leaf:
             # 非新叶节点: SWA 数据已在之前的 overlap/unevict 步骤处理完
             return
@@ -602,20 +603,16 @@ class SWAComponent(TreeComponent):
     ):
         """✂️ 节点分裂时重分配 SWA 数据 —— 切片 value/host_value + 复制 lock_ref + 搬运 UUID。
 
-        🔗 _split_node() 在创建 new_parent 后、插入 LRU 前调用每个 component (:1106)。
+        🔗 调用场景: _split_node 在 match/insert 遇部分匹配时分裂节点,
+            创建 new_parent 后、重新插入 LRU 前调用每个组件。
+            SWA 的 value/host_value/lock_ref/UUID 都需要按 split_len 切分到两个节点。
 
         ⚙️ 动作:
-            ① lock_ref: new_parent 继承 child 的 lock_ref (分裂前的锁状态向上移动)。
-            ② SWA value: 若 child 有 value, 按 key 长度切成两部分:
-                 new_parent: value[:split_len]
-                 child:      value[split_len:]
+            ① lock_ref: new_parent 继承 child 的 lock_ref (分裂前的锁保护整段, 分裂后两段都需保护)。
+            ② SWA value: 按 key 长度切片 → new_parent[:split_len], child[split_len:]
             ③ SWA host_value: 同样切片语义。
-            ④ Host LRU 管理: 若切出来的是 tombstone (device value=None) 但有 host_value,
-                 插入 Host LRU。
-            ⑤ UUID 传递: new_parent 继承 child 的 swa_uuid (用于 window-lock 边界识别)。
-
-        📥 new_parent: 分裂后新增的父节点。
-        📥 child: 分裂后的子节点 (原始节点, key 变短)。"""
+            ④ Host LRU: 若切出 tombstone (device value=None) 但有 host_value → 插入 Host LRU。
+            ⑤ UUID: new_parent 继承 child 的 swa_uuid (window-lock 边界标记向上移动)。"""
         # ① lock_ref 继承
         new_parent.component_data[self.component_type].lock_ref = child.component_data[
             self.component_type
@@ -668,25 +665,22 @@ class SWAComponent(TreeComponent):
     ) -> tuple[int, int]:
         """🗑️ 释放节点的 SWA KV 资源 —— 变 tombstone (value→None), 返回释放的 token 数。
 
-        🔗
-          调用者 (unified_radix_cache.py):
-            ├─ _evict_component_and_detach_lru()  → DEVICE 层驱逐 (:1383)
-            ├─ _evict_device_leaf()              → ALL 层 (整叶删除) (:1383)
-            └─ _cascade_evict()                  → 级联驱逐同/低优先级组件
+        🔗 调用场景: 驱逐流水线中的原子步骤, 被以下路径调用:
+            ① drive_eviction → _evict_component_and_detach_lru
+               (SWA LRU 主动驱逐内部节点 → tombstone)
+            ② _cascade_evict → _evict_component_and_detach_lru
+               (Full 驱逐时级联清理 SWA, 因 Full(2) > SWA(1))
+            ③ _evict_device_leaf / _evict_host_leaf → ALL 层
+               (整叶删除时清理 SWA)
+            ④ _evict_to_host → DEVICE 层
+               (HiCache D→H 降级时 tombstone SWA device, 保留 host)
 
-        ⚙️ 分层驱逐:
-            DEVICE: free 后 value→None (保持 tombstone)。
-                    若有残留 host_value, 将其插入 Host LRU。
-                    用 free_swa(full_indices) 而非 free_swa(swa_value), 因为
-                    所有无 SWA 映射的 slot 指向同一个 sentinel, 直接 free swa_value
-                    会导致 double-free。
-
-            HOST: free host pool 后 host_value→None, 从 Host LRU 移除。
-            ALL: 同时执行 DEVICE + HOST。
-
-        📥 node: 待驱逐节点。
-        📥 target: 驱逐层级 (DEVICE | HOST | ALL)。
-        📤 tuple (device_freed, host_freed) — 释放的 token 数。"""
+        ⚙️ DEVICE 层: free_swa(full_indices) + value→None (tombstone)。
+            ⚠️ 用 full_indices 而非 swa_value: 无 SWA 映射的 slot 指向同一 sentinel,
+            直接 free swa_value 会 double-free。
+            若有残留 host_value → 插入 Host LRU (HiCache: Host 侧仍可用)。
+        HOST 层: free host pool + host_value→None, 从 Host LRU 移除。
+        ALL: 同时执行 DEVICE + HOST (整叶删除场景)。"""
         ct = self.component_type
         cd = node.component_data[ct]
         freed = 0
@@ -743,8 +737,9 @@ class SWAComponent(TreeComponent):
     ) -> None:
         """🗑️ 从 SWA LRU 尾遍历驱逐 —— 直到满足 swa_num_tokens 请求。
 
-        🔗 UnifiedRadixCache.evict() → 遍历每个 component 调用 (:715)。
-            当 SWA pool 空闲空间不足时触发。
+        🔗 调用场景: SWA pool 空闲空间不足时, alloc_token_slots → evict_from_tree_cache
+            → UnifiedRadixCache.evict() → 遍历组件调 drive_eviction。
+            SWA 用 LRU 链表 (与 Full 的叶子集合堆不同), 因为 SWA 可以 tombstone 内部节点。
 
         ⚙️ 遍历 SWA LRU 从 LRU (最久未用) 端开始:
             对每个节点:
@@ -869,7 +864,11 @@ class SWAComponent(TreeComponent):
     ) -> None:
         """🔓 反向释放 Window-Lock —— 递减 lock_ref, 遇到 UUID 边界时停止。
 
-        🔗 UnifiedRadixCache.dec_lock_ref(node) → 遍历 component 调用 (:752)。
+        🔗 调用场景:
+            ① lock_host=False (device unlock): 请求完成 (cache_finished_req) 或锁交换
+               (cache_unfinished_req) 时调 dec_lock_ref, 释放对旧匹配路径的 SWA 窗口保护。
+            ② lock_host=True (host unlock): HiCache DMA 完成后 (load_back / prefetch 结束)
+               调 dec_host_lock_ref, 释放 Host 锚点保护。
 
         ⚙️ 与 acquire 反向: 从 node 向上走, lock_ref 递减。
             当遇到 swa_uuid_for_lock 标记的 UUID 节点时 dec_swa=False (该节点及以上不再递减)。
@@ -877,11 +876,7 @@ class SWAComponent(TreeComponent):
 
             lock_ref 从 1→0 时:
               Device: 从 protected_size 移回 evictable_size。
-              Host: 若有 host_value 且 device tombstone, 重新插入 Host LRU (使可被 host eviction)。
-
-        📥 node: 开始释放的节点。
-        📥 params: DecLockRefParams (含 swa_uuid_for_lock / swa_uuid_for_host_lock / skip_lock_node_ids)。
-        📥 lock_host: True 时释放 Host 侧锁。"""
+              Host: 若有 host_value 且 device tombstone, 重新插入 Host LRU (使可被 host eviction)。"""
         ct = self.component_type
         root = self.cache.root_node
         swa_uuid_for_lock = (

@@ -1575,9 +1575,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     )
             else:
                 # ── 分支 B: 节点存活 (not evicted) ──
-                # 让各组件声明对重叠 KV slot 的所有权, 释放重复的旧 KV
+                # insert 路径上的已有节点与新 key 重叠: 各组件声明对重叠 KV slot 的所有权。
+                #
+                # 🔗 解耦: _insert_helper 只做通用树遍历 (匹配/split/创建叶子),
+                #    重叠时各组件如何处理自己的数据由组件 hook 决定, 互不干扰。
+                #
+                # 各组件实现:
+                #   Full/Mamba: 不 override, 基类默认 return prefix_len (不消费, 直接复用)
+                #   SWA:        override, 三分支:
+                #     - 窗口内 tombstone → 复活 (return 0=全消费, 不释放旧 slot)
+                #     - 骑跨窗口边界   → 部分复活 (return start_idx=部分消费)
+                #     - 窗口外 tombstone → 不消费 (return prefix_len, 保持 tombstone)
                 value_slice = value[:prefix_len]
-                consumed_from = prefix_len
+                consumed_from = prefix_len  # 默认: 整段被复用, 无重复 slot 需释放
                 for component in self._components_tuple:
                     comp_consumed_from = component.update_component_on_insert_overlap(
                         node=node,
@@ -1586,10 +1596,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         value_slice=value_slice,
                         params=params,
                     )
+                    # 取最小值: 任一组件消费了某个前缀位置 → 该位置之前的 slot 已被复用, 不可释放
                     consumed_from = min(consumed_from, comp_consumed_from)
 
-                # 释放旧 KV 中与新值重复的部分: [dup_start, consumed_from)
-                # dup_start: 不受 prev_prefix_len 保护的重叠起点
+                # 释放重复 KV: [dup_start, consumed_from) 范围的 slot
+                #   - 既有节点已有这些 KV, 新 insert 又分配了相同位置的 slot → 重复
+                #   - dup_start: 不受 prev_prefix_len 保护的重叠起点
+                #     (prev_prefix_len 之前的 slot 已被上次 insert 保护, 不能 free)
+                #   - consumed_from 之后的 slot 被某组件消费 (复用), 也不能 free
+                #   - 仅 [dup_start, consumed_from) 之间的 slot 是"重复且无人消费" → 可释放
                 dup_start = max(0, params.prev_prefix_len - total_prefix_length)
                 if dup_start < consumed_from:
                     self.token_to_kv_pool_allocator.free(
@@ -1606,7 +1621,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # ② 处理剩余 key 后缀: 可能创建新叶子
         is_new_leaf = False
         if len(key):
-            # 任一组件拒绝叶子创建 → 放弃 (如 SWA: 整叶在窗口外)
+            # 任一组件拒绝叶子创建 → 放弃 (free value 后返回)
+            # 实现: 仅 SWAComponent override (Full/Mamba 用基类默认 return False)
+            #
+            # swa_evicted_seqlen: 请求序列中 SWA KV 已释放的前缀长度 ([0, swa_evicted_seqlen)
+            #   的 SWA KV 已因滑出窗口被释放回 pool)。随 decode 单调递增,
+            #   由 maybe_evict_swa() 更新: evict_threshold = pre_len - sliding_window_size - page_size
+            #
+            # SWA 跳过条件: swa_evicted_seqlen >= total_prefix_len + key_len
+            #   → 整叶在滑动窗口左边界之外 → 对 SWA 是纯 tombstone → 跳过
+            #   正常情况不会触发 (-page_size 缓冲保护尾部), 仅为防御性检查。
+            #   可能的边缘场景: disagg PD 分离 / 开启 SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN
             if any(
                 comp.should_skip_leaf_creation(
                     total_prefix_len=total_prefix_length,
@@ -1615,7 +1640,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 )
                 for comp in self._components_tuple
             ):
-                self.token_to_kv_pool_allocator.free(value)  # 释放未使用的 KV
+                self.token_to_kv_pool_allocator.free(value)  # 释放已分配但未使用的 KV slot
                 return InsertResult(prefix_len=total_prefix_length)
             target_node = self._add_new_node(node, key, value, priority=priority)
             is_new_leaf = True
