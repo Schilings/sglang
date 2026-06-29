@@ -1,32 +1,4 @@
 from __future__ import annotations
-
-# ╔══════════════════════════════════════════════════════════════════════════════════════╗
-# ║  🌳 Unified Radix Cache —— 基于组件的统一前缀缓存框架                                  ║
-# ╠══════════════════════════════════════════════════════════════════════════════════════╣
-# ║                                                                                      ║
-# ║  将 Full / SWA / Mamba 三种缓存统一到一棵 radix tree 中，通过可插拔的 TreeComponent     ║
-# ║  hook 接口实现各组件独立的锁、驱逐、匹配逻辑。                                           ║
-# ║                                                                                      ║
-# ║  🔗 从 Scheduler 出发的完整调用链                                                       ║
-# ║                                                                                      ║
-# ║  Scheduler.get_next_batch_to_run() → match_prefix(key)                                ║
-# ║    ├─ session.try_match_prefix()  ← 流式会话 shortcut                                ║
-# ║    └─ _match_prefix_helper()      ← 遍历 radix tree + 每个 component 的 validator    ║
-# ║         ├─ 每节点调 all 组件 create_match_validator() 闭包                              ║
-# ║         └─ _match_post_processor() → 刷新 LRU + finalize_match_result()              ║
-# ║                                                                                      ║
-# ║  Scheduler.process_batch_result() → cache_unfinished_req() / cache_finished_req()     ║
-# ║    ├─ prepare_for_caching_req() 每组件                                                  ║
-# ║    ├─ insert() → _insert_helper() → update_on_overlap / commit_insert / split        ║
-# ║    ├─ dec_lock_ref(old) + inc_lock_ref(new)                                           ║
-# ║    └─ cleanup_after_caching_req() 每组件                                                ║
-# ║                                                                                      ║
-# ║  evict() → drive_eviction() 每个组件按自己策略驱逐 → _cascade_evict 级联低优先级组件       ║
-# ║                                                                                      ║
-# ║  组件 hook 接口详见 tree_component.py / README-zh.md                                    ║
-# ║                                                                                      ║
-# ╚══════════════════════════════════════════════════════════════════════════════════════╝
-
 import logging
 import sys
 import threading
@@ -334,6 +306,34 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
 logger = logging.getLogger(__name__)
 
 
+"""
+╔══════════════════════════════════════════════════════════════════════════════════════╗
+║  🌳 Unified Radix Cache —— 基于组件的统一前缀缓存框架                                  ║
+╠══════════════════════════════════════════════════════════════════════════════════════╣
+║                                                                                      ║
+║  将 Full / SWA / Mamba 三种缓存统一到一棵 radix tree 中，通过可插拔的 TreeComponent     ║
+║  hook 接口实现各组件独立的锁、驱逐、匹配逻辑。                                           ║
+║                                                                                      ║
+║  🔗 从 Scheduler 出发的完整调用链                                                       ║
+║                                                                                      ║
+║  Scheduler.get_next_batch_to_run() → match_prefix(key)                                ║
+║    ├─ session.try_match_prefix()  ← 流式会话 shortcut                                ║
+║    └─ _match_prefix_helper()      ← 遍历 radix tree + 每个 component 的 validator    ║
+║         ├─ 每节点调 all 组件 create_match_validator() 闭包                              ║
+║         └─ _match_post_processor() → 刷新 LRU + finalize_match_result()              ║
+║                                                                                      ║
+║  Scheduler.process_batch_result() → cache_unfinished_req() / cache_finished_req()     ║
+║    ├─ prepare_for_caching_req() 每组件                                                  ║
+║    ├─ insert() → _insert_helper() → update_on_overlap / commit_insert / split        ║
+║    ├─ dec_lock_ref(old) + inc_lock_ref(new)                                           ║
+║    └─ cleanup_after_caching_req() 每组件                                                ║
+║                                                                                      ║
+║  evict() → drive_eviction() 每个组件按自己策略驱逐 → _cascade_evict 级联低优先级组件       ║
+║                                                                                      ║
+║  组件 hook 接口详见 tree_component.py / README-zh.md                                    ║
+║                                                                                      ║
+╚══════════════════════════════════════════════════════════════════════════════════════╝
+"""
 class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     """🌳 统一 Radix Cache —— 基于可插拔 TreeComponent 的多缓存类型前缀缓存框架。
 
@@ -1133,10 +1133,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if not separate_device_match:
                 # 无 HiCache: host/device 合一, matched 就是 device match
                 if matched:
+                    # 节点数
                     best_match_device_value_len = len(value)
                     best_match_device_node = node
                 return
+
             # HiCache 模式: 额外检查纯设备端 validator
+            # HiCache模式的确实是Host Node链要比Device Node链长！
             if _all_valid(device_validators, node):
                 best_match_device_value_len = len(value)
                 best_match_device_node = node
@@ -1154,8 +1157,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if prefix_len < len(child.key):
                 # 部分匹配: key 与 child.key 只重合了 prefix_len → split 后停止
                 node = self._split_node(child.key, child, prefix_len)
+                # value就按照device的情况匹配
                 if not node.evicted:
                     value.append(node.component_data[BASE_COMPONENT_TYPE].value)
+                #
                 _update_best_if_valid(node)
                 break
 
