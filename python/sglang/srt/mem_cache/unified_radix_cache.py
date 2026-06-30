@@ -1565,7 +1565,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if node.evicted:
                 # ── 分支 A: 节点曾被驱逐 (evicted=True) ──
                 # 用新 KV 恢复 Full device value; 辅组件可能有 tombstone 需重建
-                self._unevict_node_on_insert(node, value[:prefix_len])
+                # 解耦了"unevict 后的辅组件重建"与"Full 恢复逻辑"：
+                # _unevict_node_on_insert 只负责恢复 Full（通用操作）
+                # 各辅组件自己决定恢复后要不要重建、怎么重建（组件特定逻辑）
+                # 没有这个 hook 的话，SWA 的 tombstone 重建逻辑会硬编码在 _insert_helper 里（if has_swa: translate_full_to_swa...），与 Full/Mamba 逻辑混在一起。
+                self._unevict_node_on_insert(node, value[:prefix_len]) 
                 for component in self._components_tuple:
                     if component.component_type == BASE_COMPONENT_TYPE:
                         continue
@@ -1649,8 +1653,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         else:
             target_node = node  # 完整匹配已有节点, 不需要创建叶子
 
-        # Finalize: let each component attach its data to the target node.
-        # e.g. Mamba attaches mamba_value to the leaf node
+        # ③ Finalize: 各组件在目标节点上提交自己的数据。
+        #
+        # 🔗 解耦: _insert_helper 负责通用树操作 (遍历/split/创建叶子),
+        #    Full value 已由 _add_new_node 写入。辅组件需要在此 hook 中
+        #    分配/附加自己的数据 (SWA value / Mamba state)。
+        #
+        # 各组件实现:
+        #   Full:  不 override (基类 pass) — value 已由 _add_new_node 写入, 无需额外操作
+        #   Mamba: override — 在叶子节点上设置 mamba_value + 插入 Mamba LRU
+        #   SWA:   override — 从 Full value 翻译 SWA value, 按窗口边界 split, 插入 SWA LRU
+        #          + _maybe_split_leaf_for_swa_lock 裁剪叶子到窗口大小
         result = InsertResult(prefix_len=total_prefix_length)
         for component in self._components_tuple:
             component.commit_insert_component_data(
@@ -1660,10 +1673,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 result=result,
             )
 
+        # ④ 刷新辅组件 LRU (INSERT_END 阶段)。
+        # Full 跳过 (用 last_access_time, 不走 LRU)。
+        #
+        # 各组件实现:
+        #   Mamba: reset_node_and_parents_mru — 沿父链全部刷新为 MRU
+        #   SWA:   reset_node_and_window_ancestors_mru — 仅刷新窗口内祖先
+        #          (sliding_window_size + page_size 范围, 窗口外祖先保持可驱逐)
         if target_node is not self.root_node:
             for component in self._components_tuple:
                 if component.component_type == BASE_COMPONENT_TYPE:
-                    continue
+                    continue  # Full 用 last_access_time, 不走 LRU
                 component.refresh_lru(
                     LRURefreshPhase.INSERT_END, target_node, self.root_node
                 )
@@ -2000,11 +2020,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         """GPU→CPU demotion: release all device resources, node stays in tree."""
         # 前提: 节点未驱逐 + 已 backup (Host 有数据)
         assert not node.evicted and node.backuped
+
         # ① 驱逐 Full device value (Full 是 trigger, 优先级最高)
         trigger = self.components[BASE_COMPONENT_TYPE]
         self._evict_component_and_detach_lru(
             node, trigger, target=EvictLayer.DEVICE, tracker=tracker
         )
+
         # ② 级联驱逐辅组件 device 数据 (SWA/Mamba)
         self._cascade_evict(node, trigger, tracker)
         self._record_remove_event(node, medium=StorageMedium.GPU)
@@ -2041,8 +2063,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self.writing_check(write_back=True)
                 self._evict_to_host(node, tracker)  # 降级: 保留 Host 数据, 释放 Device
                 return
+
             else:
-                # ── 分支 2: write_through 策略 —— 无备份, 整叶删除 ──
+                # ── 分支 2: write_through 策略 —— 节点尚未备份, 无 Host 副本可降级, 整叶删除 ──
+                # write_through 本是"命中即备份"的 eager 策略 (write_through_threshold=1,
+                # 见 init :771)。此处 not backuped 表示该节点从未触发该备份:
+                # 新插入叶子 / 命中次数不足 / 异步 backup 仍 pending / 备份失败等。
+                # 因 Full KV 无 host_value (backuped 定义见 :126), _evict_to_host 无副本可降级复用;
+                # 且 write_through 语义是"备份应在写入/命中时完成", 驱逐时补做会违背策略
+                # (对比分支 1 write_back: 其契约允许驱逐时补做 write_backup)。故直接级联驱逐
+                # 所有组件 device KV + 从树中整叶删除 + 级联清理祖先 tombstone。
                 self._record_remove_event(node, medium=StorageMedium.GPU)
                 for comp in self._components_tuple:
                     self._evict_component_and_detach_lru(
@@ -2054,7 +2084,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self._update_evictable_leaf_sets(parent)
                 self._iteratively_delete_tombstone_leaf(node, tracker)  # 级联清理祖先
                 return
+
         # ── 分支 3: 已 backup → 直接降级到 Host ──
+        # 降级就要把device indices释放掉
         self._evict_to_host(node, tracker)
 
     def _evict_host_leaf(
@@ -3009,6 +3041,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if cc is None:
             return
 
+        # 阻塞所有D->H通信完成，然后标记特定的ongoing完成
         if write_back:
             # Blocking: wait for all pending write-backs
             while self.ongoing_write_through:

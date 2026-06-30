@@ -68,12 +68,58 @@ def free_swa_out_of_window_slots(
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
 ) -> None:
+    """🚚 回收滑出滑动窗口的 SWA KV slot —— 把窗口外、且未被 radix tree 复用区间的 SWA pool 索引归还。
+
+    ╔════════════════════════════════════════════════════════════════════════════════════╗
+    ║  🔗 调用链 (两条入口汇聚到此)                                                          ║
+    ╠════════════════════════════════════════════════════════════════════════════════════╣
+    ║                                                                                      ║
+    ║  路径 A: decode / chunked-extend 周期性回收 (按 eviction_interval 触发)              ║
+    ║    ScheduleBatch.maybe_evict_swa()            (schedule_batch.py:2965)              ║
+    ║      └─ ScheduleBatch._evict_swa(req, pre_len) (schedule_batch.py:3038)             ║
+    ║           └─ → free_swa_out_of_window_slots()  ← 本函数                              ║
+    ║                └─ → SWATokenToKVPoolAllocator.free_swa() (allocator/swa.py:341)      ║
+    ║                                                                                      ║
+    ║  路径 B: cache_finished/unfinished_req 插入树前回收                                   ║
+    ║    UnifiedRadixCache.cache_finished_req / cache_unfinished_req (:891)               ║
+    ║      └─ SWAComponent.free_out_of_window_slots() (swa_component.py:955)              ║
+    ║           └─ → free_swa_out_of_window_slots()  ← 本函数                              ║
+    ╚════════════════════════════════════════════════════════════════════════════════════╝
+
+    📥 req: 请求对象, 含单调递增的 `swa_evicted_seqlen` (已回收前沿) 与
+            `cache_protected_len` (radix tree 复用区间下界, 该区间 KV 不可被 SWA 回收)。
+    📥 pre_len: 本次回收的参考长度。decode 模式为 `seqlen - 1`; chunked extend 模式
+                为上一轮 chunk 的 prefix_len (overlap 模式下需回退一个 chunk 大小)。
+    📥 sliding_window_size: SWA 层只需保留窗口内 KV, 窗口外可回收。
+    📥 page_size: 分页粒度, 回收边界需 page 对齐。
+    📥 req_to_token_pool: 通过 `req_to_token[req_pool_idx, :]` 取出 full pool 的 slot 索引。
+    📥 token_to_kv_pool_allocator: 应为 SWATokenToKVPoolAllocator; 其 `free_swa()` 内部
+            按 full→swa 映射表查到真正的 swa slot 并归还 (swa.py:341)。
+    📤 返回: 无。副作用是把 [swa_evicted_seqlen, new_swa_evicted_seqlen) 区间内
+            full slot 对应的 swa slot 归还, 并把 `req.swa_evicted_seqlen` 前推。
+
+    ⚙️ 核心思想:
+        evict_threshold = pre_len - sliding_window_size - page_size
+        • 减 `sliding_window_size`: 窗口外 KV 不再被 SWA attention 使用 → 可回收。
+        • 再减一个 `page_size` 安全缓冲: 让 radix tree 叶子节点始终保留至少一页
+          非 tombstone 的 SWA value, 避免多轮对话中 cache reuse 被破坏
+          (不减则叶子变 tombstone → SWA 内存泄漏)。
+
+    ⚠️ 注意:
+        • `req.swa_evicted_seqlen` 单调递增, 只回收 [旧前沿, 新前沿) 区间, 不重复 free。
+        • cache_protected_len 区间 (radix tree 复用) 永不回收。
+    """
     from sglang.srt.environ import envs
 
     # For swa radix cache, we need to evict the tokens that are not in the tree cache and also not in the sliding window
+    # ↑ 英文原注保留。中文补充: 本函数只回收"既不在 radix tree 复用区间、又不在滑动窗口内"的 SWA token。
+    # cache_protected_len 必须页对齐 —— 该区间 [0, cache_protected_len) 由 radix tree 管理复用,
+    # 回收边界依赖 page 对齐才能与 tree insert 边界 (page_floor(seq_len)) 协调一致。
     assert (
         req.cache_protected_len % page_size == 0
     ), "cache_protected_len must be page aligned"
+    # 把已回收前沿抬到 cache_protected_len 之上: radix tree 复用区间内 KV 绝不能被 SWA 回收,
+    # 否则破坏 prefix cache 复用。max 保证单调性 —— 已回收的位置不再动。
     req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, req.cache_protected_len)
 
     # Subtract an extra page_size so the eviction frontier never reaches the
@@ -82,23 +128,36 @@ def free_swa_out_of_window_slots(
     # preserving cache reuse in multi-turn scenarios. Without this, leaf nodes
     # may become tombstoned, causing SWA memory leak.
     # See also: _insert_helper case 3 in swa_radix_cache.py (defensive counterpart).
+    # ↑ 英文原注保留, 中文补充:
+    # 减一个 page_size 的安全缓冲, 让驱逐前沿始终落后 tree insert 边界一页。
+    # 防御兜底: unified_radix_cache.py:_insert_helper 中 `should_skip_leaf_creation`
+    # 会在 `swa_evicted_seqlen >= total_prefix_len + key_len` (整叶 tombstone) 时跳过建叶
+    # 并释放已分配 value —— 正常因本页缓冲保护不触发, 仅 disagg PD / 开关启用等边缘场景兜底。
     if envs.SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN.get():
+        # 优化开关: 去掉 -page_size 缓冲, 适用于 disagg PD 分离等不在意 tree reuse 的场景
         evict_threshold = pre_len - sliding_window_size
     else:
+        # 默认路径: 多保留一页, 防止叶子变 tombstone 造成 SWA 内存泄漏
         evict_threshold = pre_len - sliding_window_size - page_size
+    # 取 max 保证前沿单调递增: 不会回收已经在 swa_evicted_seqlen 以下的旧区间
     new_swa_evicted_seqlen = max(
         req.swa_evicted_seqlen,
         evict_threshold,
     )
 
+    # page 对齐回收边界 (向下取整): 保证与 free_swa 内部 _expand_to_full_pages 按整页展开一致
     if page_size > 1:
         new_swa_evicted_seqlen = (new_swa_evicted_seqlen // page_size) * page_size
 
+    # 只在有新前沿推进时才回收, 避免对空区间做无意义的 free 调用
     if new_swa_evicted_seqlen > req.swa_evicted_seqlen:
+        # 取出 [旧前沿, 新前沿) 区间内 full pool 的 slot 索引 (req_to_token 行视图)
         free_slots = req_to_token_pool.req_to_token[
             req.req_pool_idx, req.swa_evicted_seqlen : new_swa_evicted_seqlen
         ]
+        # 委托给 allocator: 内部 swa_indices = mapping[free_slots] → free swa slot → 清映射
         token_to_kv_pool_allocator.free_swa(free_slots)
+        # 前沿前推: 下次从新前沿开始回收, 不重复 free
         req.swa_evicted_seqlen = new_swa_evicted_seqlen
 
 

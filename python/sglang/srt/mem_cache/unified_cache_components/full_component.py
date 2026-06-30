@@ -300,6 +300,7 @@ class FullComponent(TreeComponent):
            原因: Full 是树拓扑基础, 内部 Full 驱逐意味着路径断裂, 辅组件数据失去依附。"""
         return 0 if is_leaf else 2
 
+    # 不同的删除链
     def drive_eviction(
         self, params: EvictParams, tracker: dict[ComponentType, int]
     ) -> None:
@@ -328,7 +329,9 @@ class FullComponent(TreeComponent):
             _, x = heapq.heappop(heap)
             if x not in self.cache.evictable_device_leaves:
                 continue
+            # cache删除叶子节点会触发write back
             self.cache._evict_device_leaf(x, tracker)
+
             if x.parent is not None and x.parent in self.cache.evictable_device_leaves:
                 heapq.heappush(
                     heap,

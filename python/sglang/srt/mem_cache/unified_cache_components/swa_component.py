@@ -758,12 +758,15 @@ class SWAComponent(TreeComponent):
         request = params.swa_num_tokens    # SWA 池需要释放的目标 token 数
         ct = self.component_type
         lru = self.cache.lru_lists[ct]
+        # LRU节点
         x = lru.get_lru_no_lock()          # LRU 尾 (最久未被刷新的节点)
         while tracker[ct] < request and x is not None and lru.in_list(x):
             assert x.component_data[ct].value is not None
             if x in self.cache.evictable_device_leaves:
                 # 🌿 可驱逐叶子: 原子驱逐所有组件 (整叶删除, 包括 Full KV)
+                # 删除后往前走
                 x_next = lru.get_prev_no_lock(x)
+                # 删除叶子节点
                 self.cache._evict_device_leaf(x, tracker)
                 # 叶驱逐可能影响 x_next 的 LRU 状态, 安全回退
                 if not lru.in_list(x_next):
@@ -772,6 +775,7 @@ class SWAComponent(TreeComponent):
             else:
                 # 🪦 内部节点: tombstone SWA + 级联驱逐 Mamba
                 #   SWA priority(1) > Mamba(0) → 驱逐 SWA 时级联清理 Mamba
+                # 不是叶子节点不能删，往前找
                 x_next = lru.get_prev_no_lock(x)
                 self.cache._evict_component_and_detach_lru(
                     x, self, target=EvictLayer.DEVICE, tracker=tracker
