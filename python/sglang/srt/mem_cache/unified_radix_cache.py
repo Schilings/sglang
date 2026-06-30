@@ -1135,6 +1135,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
+            # 如果是finished请求，记录 SWA 窗口驱逐边界swa_evicted_seqlen → insert 时判断 tombstone 重叠
+            # full/swa正常prefill什么也不做
             cl = comp.prepare_for_caching_req(
                 req=req,
                 insert_params=insert_params,
@@ -1312,7 +1314,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if prefix_len < len(child.key):
                 # 部分匹配: key 与 child.key 只重合了 prefix_len → split 后停止
                 node = self._split_node(child.key, child, prefix_len)
-                # value就按照device的情况匹配
+                # value对应的是device上的可用indices，只考虑Full情况，没删就是有
                 if not node.evicted:
                     value.append(node.component_data[BASE_COMPONENT_TYPE].value)
                 #

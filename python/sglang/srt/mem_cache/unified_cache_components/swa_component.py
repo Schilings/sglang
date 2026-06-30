@@ -840,6 +840,7 @@ class SWAComponent(TreeComponent):
             else:
                 comp.lock_ref = ref + 1
 
+            # 边界之外不就lock了
             # 累计锁定的 SWA token 数
             swa_lock_size += len(value)
             # 达到窗口大小时: 设置 UUID 边界 (release 时的终止标记)
