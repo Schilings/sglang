@@ -1522,20 +1522,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         """📝 Insert 核心引擎 —— 递归匹配+插入, 处理 overlap/unevict/split/叶子创建。
 
         🔗 insert() 直接调用 (:705)。
-
-        ⚙️ 三重循环:
-            ① 遍历已有节点 (while child_key in children):
-                 - partial match → _split_node()
-                 - node.evicted → _unevict_node_on_insert() + component.recover_after_unevict()
-                 - 否则 → component.update_component_on_insert_overlap() 处理重叠 KV
-                 - free 重复的旧 KV slot (dup_start:consumed_from)
-                 - _inc_hit_count() 计数
-            ② 若有剩余 key:
-                 - component.should_skip_leaf_creation() 检查 (SWA 全在窗口外则跳过)
-                 - 否则 _add_new_node() 创建叶子
-            ③ Finalize:
-                 - component.commit_insert_component_data() (SWA: 分配 value + split)
-                 - component.refresh_lru(INSERT_END) 刷新辅组件 LRU
+        主要几个核心：
+        1️⃣ 匹配链遇到device indices删除了的节点，怎么恢复
+        2️⃣ 匹配链遇到device indices存在的节点，怎么选择，复用还是替换
 
         📥 node: 起始节点 (通常 root)。
         📥 key: page-aligned RadixKey。
@@ -1586,12 +1575,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 # insert 路径上的已有节点与新 key 重叠: 不同组件处理怎么释放自己多余的部分
                 # ⚠️ 不一定多余，可能这个node就是自己匹配的prefix的一部分
                 # 各组件实现:
-                #   Full/Mamba: 不 override, 基类默认返回prefix_len，全释放
-                #   SWA:        override, 三分支:
-                # 例如SWA的话就要考虑窗口边界：
-                # 1. node完全在窗口外（total_prefix_len < swa_evicted_seqlen）: swa这部分的数据本来就是不要的，返回prefix_len，全释放
-                # 2. node完全在窗口内 (total_prefix_len >= swa_evicted_seqlen)：释放，对swa component对应的value赋值
-                # 3. node部分在窗口内(total_prefix_len + prefix_len > swa_evicted_seqlen)，释放，切分node，对另一半释放，swa_value赋值
+                #   ⭕️ Full/Mamba: 不 override, 基类默认返回prefix_len，全释放
+                #   ⭕️ SWA: 就要考虑窗口边界：
+                #       1️⃣ node完全在窗口外（total_prefix_len < swa_evicted_seqlen）
+                #             ==> swa这部分的数据本来就是不要的，返回prefix_len，选择原本，释放新的
+                #        2️⃣ node完全在窗口内 (total_prefix_len >= swa_evicted_seqlen)
+                #              ==> swa要选择丢掉数据，选择丢掉原本的，使用自己的新的，返回0，因为替换成自己的了，不删
+                #              ==> ⚠️为什么是替换：a.swa value不一定存活； b. 替换成自己的swa value，且要把full value一同替换成新的，保留full→swa映射关系
+                #       3️⃣ node部分在窗口内(total_prefix_len + prefix_len > swa_evicted_seqlen)
+                #              ==> 释放，切分node，对另一半选择丢掉原本的，使用自己的新的,返回上一半的长度，上一半是要丢掉的，下一半是替换
                 value_slice = value[:prefix_len]
                 consumed_from = prefix_len  # 默认: 整段被复用, 无重复 slot 需释放
                 for component in self._components_tuple:
@@ -1625,14 +1617,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # ② 处理剩余 key 后缀: 可能创建新叶子
         is_new_leaf = False
         if len(key):
-            # 任一组件拒绝叶子创建 → 放弃 (free value 后返回)
-            # 实现: 仅 SWAComponent override (Full/Mamba 用基类默认 return False)
-            #
-            # swa_evicted_seqlen: 请求序列中 SWA KV 已释放的前缀长度 ([0, swa_evicted_seqlen)
-            #   的 SWA KV 已因滑出窗口被释放回 pool)。随 decode 单调递增,
-            #   由 maybe_evict_swa() 更新: evict_threshold = pre_len - sliding_window_size - page_size
-            #
-            # SWA 跳过条件: swa_evicted_seqlen >= total_prefix_len + key_len
+            # ⭕️ Full：不会跳过新节点的创建
+            # ⚠️req.swa_evicted_seqlen: 请求序列中 SWA KV 已释放的前缀长度 ([0, swa_evicted_seqlen)的 SWA KV 已因滑出窗口被释放回 pool)。
+            #   随 decode 单调递增,由 maybe_evict_swa() 更新: evict_threshold = pre_len - sliding_window_size - page_size
+            #   所以其实会多-page_size 缓冲保护尾部
+            # ⭕️ SWA : swa_evicted_seqlen >= total_prefix_len + key_len
             #   → 整叶在滑动窗口左边界之外 → 对 SWA 是纯 tombstone → 跳过
             #   正常情况不会触发 (-page_size 缓冲保护尾部), 仅为防御性检查。
             #   可能的边缘场景: disagg PD 分离 / 开启 SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN
@@ -1646,22 +1635,27 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             ):
                 self.token_to_kv_pool_allocator.free(value)  # 释放已分配但未使用的 KV slot
                 return InsertResult(prefix_len=total_prefix_length)
+
+            # 添加新的叶子节点为child
             target_node = self._add_new_node(node, key, value, priority=priority)
             is_new_leaf = True
         else:
             target_node = node  # 完整匹配已有节点, 不需要创建叶子
 
         # ③ Finalize: 各组件在目标节点上提交自己的数据。
-        #
         # 🔗 解耦: _insert_helper 负责通用树操作 (遍历/split/创建叶子),
         #    Full value 已由 _add_new_node 写入。辅组件需要在此 hook 中
         #    分配/附加自己的数据 (SWA value / Mamba state)。
         #
         # 各组件实现:
-        #   Full:  不 override (基类 pass) — value 已由 _add_new_node 写入, 无需额外操作
-        #   Mamba: override — 在叶子节点上设置 mamba_value + 插入 Mamba LRU
-        #   SWA:   override — 从 Full value 翻译 SWA value, 按窗口边界 split, 插入 SWA LRU
-        #          + _maybe_split_leaf_for_swa_lock 裁剪叶子到窗口大小
+        #   ⭕️ Full:  不 override (基类 pass) — value 已由 _add_new_node 写入, 无需额外操作
+        #   ⭕️ SWA: 就要考虑窗口边界：
+        #       1️⃣ 新node完全在窗口外（result.prefix_len < swa_evicted_seqlen）
+        #             ==> 保持 tombstone (无 SWA value)
+        #       2️⃣ node完全在窗口内 (result.prefix_len >= swa_evicted_seqlen)
+        #              ==> 新节点swa value得有值，还没赋值，从full value映射得到，且swa 新node需要加入swa device LRU + 增加可驱逐计数
+        #       3️⃣ node部分在窗口内(result.prefix_len + len(node.key) > swa_evicted_seqlen)
+        #              ==> 释放，切分node，对一半赋值swa value，从full value映射得到，且swa 新node需要加入swa device LRU + 增加可驱逐计数
         result = InsertResult(prefix_len=total_prefix_length)
         for component in self._components_tuple:
             component.commit_insert_component_data(
@@ -1672,12 +1666,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
 
         # ④ 刷新辅组件 LRU (INSERT_END 阶段)。
-        # Full 跳过 (用 last_access_time, 不走 LRU)。
-        #
-        # 各组件实现:
-        #   Mamba: reset_node_and_parents_mru — 沿父链全部刷新为 MRU
-        #   SWA:   reset_node_and_window_ancestors_mru — 仅刷新窗口内祖先
-        #          (sliding_window_size + page_size 范围, 窗口外祖先保持可驱逐)
+        # ⭕️ Full 跳过 (用 last_access_time, 不走 LRU)。
+        # ⭕️ SWA:   从 node 向上走, 只刷新 sliding_window_size+page_size 范围内的、有 SWA value 的祖先。
+        #            这个范围上限=窗口大小+1个 page 的缓冲 (因为驱逐边界是 page 对齐的)。
         if target_node is not self.root_node:
             for component in self._components_tuple:
                 if component.component_type == BASE_COMPONENT_TYPE:
@@ -1686,6 +1677,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     LRURefreshPhase.INSERT_END, target_node, self.root_node
                 )
 
+        # ⚠️ 击中统计：会触发write through
         if is_new_leaf:
             self._inc_hit_count(target_node, params.chunked)
         return result

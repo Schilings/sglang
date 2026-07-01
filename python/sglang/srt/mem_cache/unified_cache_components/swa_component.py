@@ -409,29 +409,27 @@ class SWAComponent(TreeComponent):
             swa_evicted_seqlen % self.cache.page_size == 0
         ), f"{self.component_type}: swa_evicted_seqlen must be page-aligned, {swa_evicted_seqlen=}"
 
+        # 2️⃣ node完全在窗口内 (total_prefix_len >= swa_evicted_seqlen)
+        #       ==> swa要选择丢掉数据，选择丢掉原本的，使用自己的新的，返回0，因为替换成自己的了，不删
+        #       ==> ⚠️为什么是替换：a.swa value不一定存活； b. 替换成自己的swa value，且要把full value一同替换成新的，保留full→swa映射关系
         if swa_evicted_seqlen <= total_prefix_len:
-            # ── Branch 1: 整节点在窗口内 → 全恢复 ──
-            # 释放旧的 Full value, 用新的 value_slice 替换
             self.cache.token_to_kv_pool_allocator.free(
                 node.component_data[BASE_COMPONENT_TYPE].value
             )
             node.component_data[BASE_COMPONENT_TYPE].value = value_slice.clone()
-            # 从新 Full value 翻译出 SWA value
             swa_value = self._translate_full_to_swa(
                 node.component_data[BASE_COMPONENT_TYPE].value
             )
             self._restore_device_value(node, swa_value)
-            return 0  # 消费了整个节点的旧数据
+            return 0
 
+        # 3️⃣ node部分在窗口内(total_prefix_len + prefix_len > swa_evicted_seqlen)
+        #       ==> 释放，切分node，对另一半选择丢掉原本的，使用自己的新的,返回上一半的长度，上一半是要丢掉的，下一半是替换
         elif swa_evicted_seqlen < total_prefix_len + prefix_len:
-            # ── Branch 2: 节点骑跨窗口边界 → 部分恢复 ──
-            # 窗口左边界落在节点中间, 只恢复边界右边的部分
             start_idx = swa_evicted_seqlen - total_prefix_len
-            # 释放旧节点的 [start_idx:] 部分
             self.cache.token_to_kv_pool_allocator.free(
                 node.component_data[BASE_COMPONENT_TYPE].value[start_idx:]
             )
-            # 分裂: 左边做 tombstone parent, 右边做有 SWA 的 child (node 变成 child)
             self.cache._split_node(node.key, node, start_idx)
             node.component_data[BASE_COMPONENT_TYPE].value = value_slice[
                 start_idx:
@@ -442,8 +440,9 @@ class SWAComponent(TreeComponent):
             self._restore_device_value(node, swa_value)
             return start_idx  # 只消费了 start_idx 之前的旧数据
 
+        # 1️⃣ node完全在窗口外（total_prefix_len < swa_evicted_seqlen）
+        #       ==> swa这部分的数据本来就是不要的，返回prefix_len，选择原本，释放新的
         else:
-            # ── Branch 3: node在窗口外，swa这部分的数据本来就是不要的，返回prefix_len，全释放
             return prefix_len
 
     def should_skip_leaf_creation(
@@ -495,17 +494,18 @@ class SWAComponent(TreeComponent):
         ), f"{ct}: swa_evicted_seqlen must be page-aligned, {swa_evicted_seqlen=}"
 
         full_value = node.component_data[BASE_COMPONENT_TYPE].value
+        # 1. 整节点在窗口内，整个节点都要恢复device indices
         if swa_evicted_seqlen <= total_prefix_len:
-            # 整节点在窗口内: 从完整 Full value 翻译 SWA
             swa_value = self._translate_full_to_swa(full_value)
+        # 2. 半个节点在窗口内，拆分节点，恢复一半
         elif swa_evicted_seqlen < total_prefix_len + prefix_len:
-            # 骑跨窗口边界: 先 split 再翻译右半
             start_idx = swa_evicted_seqlen - total_prefix_len
             self.cache._split_node(node.key, node, start_idx)
             full_value = node.component_data[BASE_COMPONENT_TYPE].value
             swa_value = self._translate_full_to_swa(full_value)
+        # 3. 整个节点在窗口外，不恢复
         else:
-            # 整节点在窗口外: 保持 tombstone
+
             return
 
         # SWA Component的value赋值
@@ -525,12 +525,7 @@ class SWAComponent(TreeComponent):
             Full 的 value 已由 _add_new_node 写入, 但 SWA value 需要在此处从 Full value 翻译并分配。
             每次 insert 仅调用一次。
 
-        ⚙️ 对非新叶节点无操作 (SWA 已在 overlap/unevict 步骤处理)。对新叶节点:
-            ① 计算 split_pos = swa_evicted_seqlen - node_start (窗口边界在节点内的位置)
-            ② split_pos <= 0: 整叶在窗口内 → 翻译 SWA, 插入 LRU
-            ③ 0 < split_pos < len(key): 骑跨边界 → split, child 有 SWA, parent tombstone
-            ④ split_pos >= len(key): 整叶在窗口外 → 保持 tombstone
-            ⑤ _maybe_split_leaf_for_swa_lock 裁剪尾部到窗口大小"""
+        """
         if not is_new_leaf:
             # 非新叶节点: SWA 数据已在之前的 overlap/unevict 步骤处理完
             return
@@ -538,20 +533,20 @@ class SWAComponent(TreeComponent):
         node_start = result.prefix_len        # 本节点开始的全局 token 位置
         split_pos = params.swa_evicted_seqlen - node_start  # 窗口左边界在节点内的偏移
 
+
+        # 2️⃣ node完全在窗口内 (result.prefix_len >= swa_evicted_seqlen)
+        #     ==> 新节点swa value得有值，还没赋值，从full value映射得到，且swa 新node需要加入swa device LRU + 增加可驱逐计数
         if split_pos <= 0:
-            # ── 整叶在窗口内 → 分配 SWA value ──
             swa_value = self._translate_full_to_swa(
                 node.component_data[BASE_COMPONENT_TYPE].value
             )
             node.component_data[self.component_type].value = swa_value
-            # 加入 LRU + 增加可驱逐计数
             self.cache.lru_lists[self.component_type].insert_mru(node)
             self.cache.component_evictable_size_[self.component_type] += len(swa_value)
+
+        # 3️⃣ node部分在窗口内(result.prefix_len + len(node.key) > swa_evicted_seqlen)
+        #     ==> 释放，切分node，对一半赋值swa value，从full value映射得到，且swa 新node需要加入swa device LRU + 增加可驱逐计数
         elif split_pos < len(node.key):
-            # ── 骑跨边界: split 为 parent(tombstone) + child(SWA) ──
-            # Node straddles the SWA eviction boundary
-            # Split into parent (tombstone, no SWA) and child (with SWA)
-            # After _split_node, `node` becomes the child
             self.cache._split_node(node.key, node, split_pos)
             swa_value = self._translate_full_to_swa(
                 node.component_data[BASE_COMPONENT_TYPE].value
@@ -559,13 +554,18 @@ class SWAComponent(TreeComponent):
             node.component_data[self.component_type].value = swa_value
             self.cache.lru_lists[self.component_type].insert_mru(node)
             self.cache.component_evictable_size_[self.component_type] += len(swa_value)
+
+        # 1️⃣ 新node完全在窗口外（result.prefix_len < swa_evicted_seqlen）
+        #     ==> 保持 tombstone (无 SWA value)
         else:
-            # ── 整叶在窗口外 → 保持 tombstone (无 SWA value) ──
-            # Entire leaf is outside the SWA window — left as a tombstone.
             return
 
-        # 裁剪叶子尾部: 长 prefill 叶子可能远大于窗口, lock 时只需锁一个窗口
+        # ⚠️ 裁剪叶子尾部: 长 prefill 叶子可能远大于窗口, lock 时只需锁一个窗口
+        # 只在 case 2️⃣ + swa_evicted_seqlen == 0
+        # （首次长 prefill，整个节点都在"窗口内"，但节点长度可达几百 token，远超 sliding_window_size）时触发尾部裁剪。
+        # 此时split 根本没执行，二者不重叠。
         self._maybe_split_leaf_for_swa_lock(node)
+
 
     def _maybe_split_leaf_for_swa_lock(self, leaf: UnifiedTreeNode) -> None:
         """✂️ 裁剪新 SWA 叶子的尾部 —— lock 时只锁一个窗口的 SWA pool, 不锁整个长叶子。
