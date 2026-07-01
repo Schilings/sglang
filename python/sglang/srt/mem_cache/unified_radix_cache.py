@@ -2129,6 +2129,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if self.write_backup(node.parent) <= 0:
                 return 0  # 父节点备份失败 → 放弃
 
+
+        # =================================== 1️⃣ L1 -> L2 ===================================
         # ② 构造 Full KV 传输描述符
         device_value = node.component_data[BASE_COMPONENT_TYPE].value
         kv_xfer = PoolTransfer(name=PoolName.KV, device_indices=device_value)
@@ -2136,11 +2138,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # ③ 各辅组件构造各自的 BACKUP_HOST 传输 (如 SWA 的 host_indices)
         comp_xfers: dict[ComponentType, list] = {}
         for comp in self._components_tuple:
+            # ⭕️ 跳过FULL
             if comp.component_type == BASE_COMPONENT_TYPE:
                 continue
+            # ⭕️ SWA：BACKUP_HOST模式，如果node有的swa component value(就是swa value)有值，
+            #         那就返回 [ PoolTransfer(name=PoolName.SWA,device_indices=cd.value.to(torch.int64),) ]
+            #         返回的是 list ！！
             t = comp.build_hicache_transfers(node, CacheTransferPhase.BACKUP_HOST)
             if t:
                 comp_xfers[comp.component_type] = t
+
+        # ⚠️ 多个非FULL的PoolTransfer 与 FULL的PoolTransfer 进行构建 一个另外的 List[PoolTransfer]
         sidecar_xfers = self._build_sidecar_transfers(
             CacheTransferPhase.BACKUP_HOST, kv_xfer, comp_xfers
         )
@@ -2157,12 +2165,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # ⑤ 合并所有传输, 执行 D→H 拷贝
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
+        # ⚠️
         host_indices = self.cache_controller.write(
             device_value, node_id=node.id, extra_pools=aux_xfers or None
         )
         if host_indices is None:
             return 0  # 拷贝失败
 
+        # =================================== 2️⃣ L2 -> L3 ===================================
         # ⑥ 各组件 commit: 将 host_indices 记录到 component_data.host_value
         kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=host_indices)
         self.components[BASE_COMPONENT_TYPE].commit_hicache_transfer(
@@ -2176,6 +2186,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 CacheTransferPhase.BACKUP_HOST,
                 transfers=xfers,
             )
+
 
         # ⑦ write_through 策略: 备份后 lock 路径 (防止被驱逐)
         lock_params = None
