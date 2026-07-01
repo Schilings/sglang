@@ -1564,12 +1564,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
             if node.evicted:
                 # ── 分支 A: 节点曾被驱逐 (evicted=True) ──
-                # 用新 KV 恢复 Full device value; 辅组件可能有 tombstone 需重建
-                # 解耦了"unevict 后的辅组件重建"与"Full 恢复逻辑"：
-                # _unevict_node_on_insert 只负责恢复 Full（通用操作）
+                # _unevict_node_on_insert 只负责恢复 Full（通用操作），
+                # 简单对full component对应的value 克隆赋值，从叶子节点集合中取出
+                self._unevict_node_on_insert(node, value[:prefix_len])
                 # 各辅组件自己决定恢复后要不要重建、怎么重建（组件特定逻辑）
-                # 没有这个 hook 的话，SWA 的 tombstone 重建逻辑会硬编码在 _insert_helper 里（if has_swa: translate_full_to_swa...），与 Full/Mamba 逻辑混在一起。
-                self._unevict_node_on_insert(node, value[:prefix_len]) 
+                # 例如SWA的话就要考虑窗口边界：
+                # 1. node在窗口外，不重建
+                # 2. node窗口内，重建，对swa component对应的value赋值
+                # 3. node部分在窗口内，重建，切分node，对另一半重建，swa_value赋值
                 for component in self._components_tuple:
                     if component.component_type == BASE_COMPONENT_TYPE:
                         continue
@@ -1581,17 +1583,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     )
             else:
                 # ── 分支 B: 节点存活 (not evicted) ──
-                # insert 路径上的已有节点与新 key 重叠: 各组件声明对重叠 KV slot 的所有权。
-                #
-                # 🔗 解耦: _insert_helper 只做通用树遍历 (匹配/split/创建叶子),
-                #    重叠时各组件如何处理自己的数据由组件 hook 决定, 互不干扰。
-                #
+                # insert 路径上的已有节点与新 key 重叠: 不同组件处理怎么释放自己多余的部分
+                # ⚠️ 不一定多余，可能这个node就是自己匹配的prefix的一部分
                 # 各组件实现:
-                #   Full/Mamba: 不 override, 基类默认 return prefix_len (不消费, 直接复用)
+                #   Full/Mamba: 不 override, 基类默认返回prefix_len，全释放
                 #   SWA:        override, 三分支:
-                #     - 窗口内 tombstone → 复活 (return 0=全消费, 不释放旧 slot)
-                #     - 骑跨窗口边界   → 部分复活 (return start_idx=部分消费)
-                #     - 窗口外 tombstone → 不消费 (return prefix_len, 保持 tombstone)
+                # 例如SWA的话就要考虑窗口边界：
+                # 1. node完全在窗口外（total_prefix_len < swa_evicted_seqlen）: swa这部分的数据本来就是不要的，返回prefix_len，全释放
+                # 2. node完全在窗口内 (total_prefix_len >= swa_evicted_seqlen)：释放，对swa component对应的value赋值
+                # 3. node部分在窗口内(total_prefix_len + prefix_len > swa_evicted_seqlen)，释放，切分node，对另一半释放，swa_value赋值
                 value_slice = value[:prefix_len]
                 consumed_from = prefix_len  # 默认: 整段被复用, 无重复 slot 需释放
                 for component in self._components_tuple:
@@ -1605,12 +1605,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     # 取最小值: 任一组件消费了某个前缀位置 → 该位置之前的 slot 已被复用, 不可释放
                     consumed_from = min(consumed_from, comp_consumed_from)
 
-                # 释放重复 KV: [dup_start, consumed_from) 范围的 slot
-                #   - 既有节点已有这些 KV, 新 insert 又分配了相同位置的 slot → 重复
-                #   - dup_start: 不受 prev_prefix_len 保护的重叠起点
-                #     (prev_prefix_len 之前的 slot 已被上次 insert 保护, 不能 free)
-                #   - consumed_from 之后的 slot 被某组件消费 (复用), 也不能 free
-                #   - 仅 [dup_start, consumed_from) 之间的 slot 是"重复且无人消费" → 可释放
+                # ⚠️ 不一定多余，可能这个node就是自己匹配的prefix的一部分
+                # dup_start：
+                # 1. prev_prefix_len >= total_prefix_length: 在原本的prefix范围内，不释放，就是自己的prefix的一部分
+                # 2. prev_prefix_len < total_prefix_length:  不是自己prefix的一部分，那就是复用，释放自己多余的部分
                 dup_start = max(0, params.prev_prefix_len - total_prefix_length)
                 if dup_start < consumed_from:
                     self.token_to_kv_pool_allocator.free(

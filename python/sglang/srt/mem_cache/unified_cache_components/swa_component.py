@@ -443,8 +443,7 @@ class SWAComponent(TreeComponent):
             return start_idx  # 只消费了 start_idx 之前的旧数据
 
         else:
-            # ── Branch 3: 整节点在窗口外 → 不消费 ──
-            # 旧 SWA 数据完全被窗口前移淘汰, 保持 tombstone
+            # ── Branch 3: node在窗口外，swa这部分的数据本来就是不要的，返回prefix_len，全释放
             return prefix_len
 
     def should_skip_leaf_creation(
@@ -489,6 +488,7 @@ class SWAComponent(TreeComponent):
         assert (
             node.component_data[ct].lock_ref == 0
         ), f"tombstone {ct} lock_ref should be 0 on unevict, node {node.id}"
+        # req.swa_evicted_seqlen 是窗口左边界, page 对齐
         swa_evicted_seqlen = params.swa_evicted_seqlen
         assert (
             swa_evicted_seqlen % self.cache.page_size == 0
@@ -507,6 +507,9 @@ class SWAComponent(TreeComponent):
         else:
             # 整节点在窗口外: 保持 tombstone
             return
+
+        # SWA Component的value赋值
+        # 如果backuped了，从host的lru取出放到device的lru
         self._restore_device_value(node, swa_value)
 
     def commit_insert_component_data(

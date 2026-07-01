@@ -150,7 +150,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         alloc_swa_indices = self.swa_attn_allocator.alloc(need_size)
         assert alloc_full_indices is not None
         assert alloc_swa_indices is not None
-
+        # 在alloc的时候，Full于SWA就会绑定映射关系了！
         self.set_full_to_swa_mapping(alloc_full_indices, alloc_swa_indices)
         return alloc_full_indices
 
@@ -172,13 +172,14 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         extend_num_tokens: int,
     ):
         assert self.page_size > 1
-
+        # alloc是按page对齐的，所有请求所需的新页数之和
         num_new_pages = get_num_new_pages(
             seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
         )
         if not self.new_pages_available(num_new_pages, num_new_pages):
             return None
 
+        # 在alloc的时候，Full于SWA就会绑定映射关系了
         swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
 
         alloc_full_indices = self.full_attn_allocator.alloc_extend(
@@ -201,7 +202,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         assert alloc_full_indices is not None
         assert alloc_swa_indices is not None
-
+        # 在alloc的时候，Full于SWA就会绑定映射关系了
         self.set_full_to_swa_mapping(alloc_full_indices, alloc_swa_indices)
 
         return alloc_full_indices
@@ -281,6 +282,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,  # last_loc for full layers
     ):
+        """为 decode 步骤分配 FULL + SWA 各 1 个 token slot。
+
+        与 alloc_extend 的关键区别：
+        - decode 每次只分配 1 token/请求，核函数内动态判断是否跨 page 边界
+          （未跨页 → last_loc+1；跨页 → 新 page 第一个 slot），无需预计算 num_new_pages
+        - last_loc 用于判断上一格位置；FULL 和 SWA 的索引空间不同，需要 translate 转换
+        """
         assert self.page_size > 1
         swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
 
@@ -302,6 +310,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 alloc_swa_indices.to(torch.int64),
             )
         else:
+            # 在alloc的时候，Full于SWA就会绑定映射关系了
             self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
 
         return alloc_full_indices
@@ -312,7 +321,21 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         # NOTE: the API is not idempotent.
         if self.is_not_in_free_group:
+            # 因为传入的full的index，所以full可以直接free.
+            # Free 是按 page 释放的吗？
+            #   -> 是的。PagedTokenToKVPoolAllocator.free 内部做 free_index // page_size
+            #      转 page 索引，再 torch.unique 去重后释放整 page。
+            #      TokenToKVPoolAllocator(page_size=1) 则是逐 token 释放。
+            #   -> 无论哪种，调用方传 token 级索引即可，allocator 内部自动处理粒度。
+            # 为什么不会误释放同一 page 内其他还在用的 token？
+            #   -> 框架三级保护：
+            #      1. 树节点 key 由 RadixKey.page_aligned() 对齐，长度是 page_size 整数倍
+            #      2. node.value 与 key 等长 -> slot 索引也恰好覆盖完整 page
+            #      3. unaligned tail（不满整 page 的尾巴）独属于当前 req，不共享
+            #      因此 node.value 中的索引要么覆盖整 page、要么是独占的 tail，
+            #      不会出现同一个 page 内部分在用、部分要 free 的场景.
             self.full_attn_allocator.free(free_index)
+            # 但是SWA的话需要转换一下index
             self.free_swa(free_index)
         else:
             self.free_group.append(free_index)
@@ -339,18 +362,32 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.full_to_swa_index_mapping[full_indices] = swa_indices
 
     def free_swa(self, free_index: torch.Tensor):
+        """释放 FULL 对应到 SWA 的 slot。
+
+        SWA free 本身也是按 page 粒度（swa_attn_allocator.free 内部 // page_size），
+        即使不扩展，传入 page 内部分 token 也能正确释放整 page。
+
+        _expand_to_full_pages 的真正目的：防止 full_to_swa_index_mapping 残留。
+        free_index=[5,6,7] 时 FULL page 1（tokens 4-7）整体被释放，
+        但若只清理 [5,6,7] 的映射，token 4 的映射会残留为 dangling reference，
+        指向已释放的 SWA page，后续 token 4 被重新分配时将错误命中。
+        扩展为 [4,5,6,7] 确保整 page 的映射全量清零。
+        """
         if free_index.numel() == 0:
             return
 
+        # page_size == 1：每个 token 即一个 page，无需扩展
+        # page_size > 1：扩展到整 page 的全部 token，保证映射全量清理
         if self.page_size == 1:
             mapping_indices = free_index
         else:
             mapping_indices = self._expand_to_full_pages(free_index)
 
+        # 从映射表查出对应的 SWA slot 索引，过滤掉未映射的（> 0）
         swa_indices = self.full_to_swa_index_mapping[mapping_indices]
         swa_indices = swa_indices[swa_indices > 0]
-        self.swa_attn_allocator.free(swa_indices)
-        self.full_to_swa_index_mapping[mapping_indices] = 0
+        self.swa_attn_allocator.free(swa_indices)       # 释放 SWA 端 slot
+        self.full_to_swa_index_mapping[mapping_indices] = 0  # 清除映射
 
     def _expand_to_full_pages(self, indices: torch.Tensor) -> torch.Tensor:
         pages = torch.unique(indices // self.page_size)
