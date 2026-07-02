@@ -2126,6 +2126,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if not write_back and (
             node.parent is not self.root_node and not node.parent.backuped
         ):
+            # parent 必须先备份 (递归向上)
             if self.write_backup(node.parent) <= 0:
                 return 0  # 父节点备份失败 → 放弃
 
@@ -2149,6 +2150,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 comp_xfers[comp.component_type] = t
 
         # ⚠️ 多个非FULL的PoolTransfer 与 FULL的PoolTransfer 进行构建 一个另外的 List[PoolTransfer]
+        # sidecar pool 是附加的存储池 (如 disagg 场景的传输 buffer)
         sidecar_xfers = self._build_sidecar_transfers(
             CacheTransferPhase.BACKUP_HOST, kv_xfer, comp_xfers
         )
@@ -2394,6 +2396,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             根据 spec.indices_from_pool 找到源 pool 的传输 (kv_xfer 或 comp_xfers),
             复用其 keys + hit_policy 构造 sidecar 的 PoolTransfer。"""
         transfers: list[PoolTransfer] = []
+        # self.sidecar_pool_specs是
         for spec in self.sidecar_pool_specs:
             # 确定索引来源: KV 主 pool 或辅组件 pool (SWA/MAMBA)
             if spec.indices_from_pool == PoolName.KV:

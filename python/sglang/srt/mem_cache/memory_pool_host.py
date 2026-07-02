@@ -3291,6 +3291,30 @@ class DeepSeekV4StateHostPool(HostKVCache):
 
 @dataclass
 class PoolEntry:
+    """💾 单一 Host 池条目 —— HostPoolGroup 中的一个成员子池。
+
+    ╔══════════════════════════════════════════════════════════════════════════════════╗
+    ║  🧩 成员属性说明                                                                   ║
+    ╠══════════════════════════════════════════════════════════════════════════════════╣
+    ║  name                  : PoolName 枚举, 标识池的类型 (KV / SWA / Mamba / ...)      ║
+    ║  host_pool             : 本池的 Host 端物理内存 (HostKVCache 子类)                  ║
+    ║  device_pool           : 本池的 GPU 端物理内存 (KVCache 子类)                       ║
+    ║  layer_mapper          : 全局 layer_id → 本池局部 layer_id 的映射函数              ║
+    ║                          (None = 本池不管理该层, DMA 时跳过)                        ║
+    ║  is_primary_index_anchor : True → 本池是 HostPoolGroup 的"锚定池"                  ║
+    ║                          HostPoolGroup.alloc/free/available_size 都委托给锚定池    ║
+    ║                          锚定池的 page_size / layout 决定整个 HostPoolGroup 的属性 ║
+    ║  host_evict_fn         : Host 端驱逐回调 (HybridCacheController 自动分配时用)       ║
+    ║  device_evict_fn       : Device 端驱逐回调 (_resolve_pool_transfers_allocation)    ║
+    ║  device_alloc_fn       : Device 端专用分配函数 (SWA/Mamba 用独立 allocator)         ║
+    ║  device_free_fn        : Device 端专用释放函数 (与 alloc_fn 配对)                    ║
+    ╚══════════════════════════════════════════════════════════════════════════════════╝
+
+    💡 为什么 SWA 需要独立的 device_alloc_fn？
+       SWA pool 的 device 端是原始 KV layout (不是 allocator 对象),
+       其 allocate/free 由 swa_attn_allocator 管理。
+       如果 device_alloc_fn=None, 则回退到 entry.device_pool.alloc/free。
+    """
     name: PoolName
     host_pool: Any
     device_pool: Any
@@ -3311,16 +3335,106 @@ class PoolEntry:
 
 
 class HostPoolGroup:
+    """💾 多子池 Host 内存组 —— 将 N 个独立 Host 池 (KV + SWA + Mamba + ...) 统一管理。
+
+    ╔══════════════════════════════════════════════════════════════════════════════════╗
+    ║  🧬 设计要点：一个 HostPoolGroup = 一个锚定池 (KV) + 若干辅池 (SWA/Mamba/... )     ║
+    ╠══════════════════════════════════════════════════════════════════════════════════╣
+    ║                                                                                  ║
+    ║  HostPoolGroup                                                                    ║
+    ║  ├── anchor_entry: is_primary_index_anchor=True → PoolName.KV                   ║
+    ║  │    └─ host_pool:   KV HostPool  (主池, 管理 FULL KV 的 CPU 缓存)              ║
+    ║  │    └─ device_pool: KV DevicePool (FULL KV 的 GPU 缓存)                        ║
+    ║  ├── entry_map[PoolName.SWA] → PoolEntry(SWA)                                   ║
+    ║  │    └─ host_pool:   SWA HostPool  (辅池, 管理 SWA 的 CPU 缓存)                  ║
+    ║  │    └─ device_pool: SWA DevicePool (SWA 的 GPU 缓存)                            ║
+    ║  │    └─ device_alloc_fn: swa_attn_allocator.alloc (SWA 专用独立分配器)            ║
+    ║  └── entry_map[PoolName.Mamba] → PoolEntry(Mamba)                                ║
+    ║       └─ ...                                                                     ║
+    ║                                                                                  ║
+    ║  🎯 为什么用锚定池 ？                                                               ║
+    ║  锚定池 (KV) 的 page_size / layout / size 决定了整个 HostPoolGroup 的属性,          ║
+    ║  因为 HiCache 的主流程 (alloc / free / available_size) 以 FULL KV 的 token 数为     ║
+    ║  单位。辅池 (SWA 等) 的分配不经过 HostPoolGroup.alloc, 而是通过                     ║
+    ║  _resolve_pool_transfers_allocation 直接调用 entry.host_pool.alloc。               ║
+    ╚══════════════════════════════════════════════════════════════════════════════════╝
+
+    ╔══════════════════════════════════════════════════════════════════════════════════╗
+    ║  🔗 宏观调用链（HiCache D↔H 传输时的子池调度）                                       ║
+    ╠══════════════════════════════════════════════════════════════════════════════════╣
+    ║                                                                                  ║
+    ║  ════════ ① 创建 ─────────                                                       ║
+    ║  hybrid_pool_assembler.build_kv_swa_stack / build_kv_only_stack / ...             ║
+    ║    → PoolEntry(KV, is_anchor=True) + PoolEntry(SWA, ...) + PoolEntry(Mamba, ...) ║
+    ║    → HostPoolGroup(entries=[KV, SWA, ...])  ← 本类                               ║
+    ║    → HybridCacheController(..., mem_pool_host=host_pool_group)                   ║
+    ║                                                                                  ║
+    ║  ════════ ② D→H 写 (BACKUP_HOST) ─────────                                        ║
+    ║  UnifiedRadixCache.write_backup()                                                ║
+    ║    → host_avail = cache_controller.mem_pool_host.available_size()  (→锚定池)      ║
+    ║    → host_indices = cache_controller.mem_pool_host.alloc(device_len)  (→锚定池)   ║
+    ║    → cache_controller.write(device_value, extra_pools=[SWA transfers, ...])      ║
+    ║      → _resolve_pool_transfers_allocation:                                       ║
+    ║          对 SWA PoolTransfer → entry_map[SWA].host_pool.alloc(...)  (→辅池)      ║
+    ║      → backup_from_device_all_layer:                                             ║
+    ║          ① anchor_entry.host_pool.backup_from_device_all_layer(...)  ← KV 主池    ║
+    ║          ② for each pool_transfer:                                               ║
+    ║               entry.host_pool.backup_from_device_all_layer(...)  ← SWA 辅池      ║
+    ║                                                                                  ║
+    ║  ════════ ③ H→D 读 (LOAD_BACK) ─────────                                          ║
+    ║  UnifiedRadixCache.load_back() → cache_controller.load(...)                      ║
+    ║    → load_to_device_per_layer (逐层执行):                                         ║
+    ║        ① anchor_entry (KV) 逐层 DMA: Host KV → Device KV                          ║
+    ║        ② 各辅池 pool_transfer 逐层 DMA: Host SWA → Device SWA                    ║
+    ╚══════════════════════════════════════════════════════════════════════════════════╝
+
+    ╔══════════════════════════════════════════════════════════════════════════════════╗
+    ║  🔑 与单一 HostKVCache 的关键区别                                                  ║
+    ╠══════════════════════════════════════════════════════════════════════════════════╣
+    ║                                                                                  ║
+    ║  模式          │  alloc 语义                  │ DMA 行为                           ║
+    ║  ─────────────┼────────────────────────────┼───────────────────────────────── ║
+    ║  单池 (KV only) │  alloc(n) → KV 池分配       │  一次 DMA 拷贝 KV 数据              ║
+    ║  多池 (KV+SWA)  │  alloc(n) → 锚定(KV)池分配  │  两次独立 DMA: KV + SWA,            ║
+    ║                │  SWA 分配走 entry_map 直接调  │  各自从不同 Device pool → 不同 Host  pool ║
+    ║                                                                                  ║
+    ║  💡 关键约束：锚定池和辅池的 slot 索引是独立管理的。                                     ║
+    ║  KV 的 host_indices 和 SWA 的 host_indices 指向不同的物理内存,                         ║
+    ║  长度也不同 (KV=N tokens, SWA=SWA window tokens)。                                  ║
+    ║  但"驱逐粒度"以锚定池为准：evict_host(N) 驱逐的是 KV Host 池的 N tokens。              ║
+    ╚══════════════════════════════════════════════════════════════════════════════════╝
+    """
     def __init__(self, entries: list[PoolEntry]):
+        """💾 初始化多子池 Host 内存组。
+
+        ━━━━━━━━━━━━━━ 调用链 ━━━━━━━━━━━━━━
+        hybrid_pool_assembler.build_kv_swa_stack / build_kv_only_stack / ...
+          → HostPoolGroup(entries=[PoolEntry(KV, is_anchor=True), PoolEntry(SWA), ...])
+            → HybridCacheController(..., mem_pool_host=self)  ← HostPoolGroup 被注入为 mem_pool_host
+
+        ⚙️ 行为:
+        ① entry_map: PoolName → PoolEntry 索引, 供 _resolve_pool_transfers_allocation
+           和 backup/load 时快速定位辅池。
+        ② anchor_entry: 选 is_primary_index_anchor=True 的条目作锚定池,
+           若无标记则回退到 entries[0] (KV 池)。
+
+        💡 锚定池决定全局属性:
+           整个 HostPoolGroup 的 page_size / layout / size 都取自锚定池,
+           因为 HiCache 主流程以 FULL KV token 数为单位, 辅池只在 sidecar
+           transfer 路径中被按名访问。
+        """
         if not entries:
             raise ValueError("HostPoolGroup requires at least one pool entry.")
         self.entries = entries
+        # PoolName → PoolEntry 快速索引, 辅池 (SWA/Mamba) 的 DMA/分配 通过此映射定位
         self.entry_map = {entry.name: entry for entry in entries}
+        # 选锚定池: is_primary_index_anchor=True 的条目优先, 否则取 entries[0]
         self.anchor_entry = next(
             (entry for entry in entries if entry.is_primary_index_anchor),
             entries[0],
         )
 
+        # ═════════ 锚定池属性即为 HostPoolGroup 的全局属性 ═════
         self.layout = self.anchor_entry.host_pool.layout
         self.page_size = self.anchor_entry.host_pool.page_size
         self.device = self.anchor_entry.host_pool.device
@@ -3364,12 +3478,27 @@ class HostPoolGroup:
             entry.host_pool.clear()
 
     def available_size(self):
+        """📖 返回锚定池 (KV Host 池) 的可用 slot 数。
+
+        💡 只查锚定池：HiCache 主流程 (write_backup 等) 以 FULL KV token 数为单位
+        判断 Host 空间是否够用, 辅池不在这个维度统计。
+        """
         return self.anchor_entry.host_pool.available_size()
 
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
+        """💾 从锚定池 (KV Host 池) 分配 need_size 个连续 slot。
+
+        💡 只从锚定池分配：HiCache 主流程需要为 FULL KV 申请 Host 空间,
+        辅池 (SWA/Mamba) 的分配不经过这里, 而是由
+        _resolve_pool_transfers_allocation 直接调 entry.host_pool.alloc。
+        """
         return self.anchor_entry.host_pool.alloc(need_size)
 
     def free(self, indices: torch.Tensor) -> int:
+        """🗑️ 释放锚定池 (KV Host 池) 的 slot。
+
+        💡 同理, 辅池的 free 走各自 entry.host_pool.free。
+        """
         return self.anchor_entry.host_pool.free(indices)
 
     def get_data_page(self, index, flat: bool = True):
@@ -3390,10 +3519,35 @@ class HostPoolGroup:
         io_backend,
         pool_transfers: Optional[list] = None,
     ) -> None:
-        # 1. Anchor (KV) transfer
+        """📖 逐层 Host→GPU DMA (LOAD_BACK 的每层执行体)。
+
+        ━━━━━━━━━━━━━━ 调用链 (逐层 DMA) ━━━━━━━━━━━━━━
+        UnifiedRadixCache.load_back() → cache_controller.load()
+          → cache_controller.start_loading() 逐层调用
+            → load_to_device_per_layer(layer_id=N)  ← 当前函数 (每层执行一次)
+              ① 锚定池 (KV): Host KV → Device KV (逐层拷贝)
+              ② 辅池 (SWA):  Host SWA → Device SWA (逐层拷贝, 有 layer_mapper 过滤)
+
+        ⚙️ 行为:
+        ① 先检查锚定池 (KV) 的 layer_mapper: 若当前 layer_id 归本锚定池管理
+           → 执行 anchor_entry.host_pool → anchor_entry.device_pool 的 DMA。
+        ② 对每个 pool_transfer (如 SWA 的 PoolTransfer):
+           → entry_map[name] 查找对应 PoolEntry
+           → 检查 layer_mapper: 只有该辅池管理当前层才执行 DMA
+           → entry.host_pool → entry.device_pool 逐层拷贝
+
+        💡 为什么 load 是逐层而 backup 是全层？
+          backup (D→H): GPU KV 已完整, 一次 backup_from_device_all_layer 全层拷贝,
+            不依赖计算流, 可在独立 CUDA stream 上做。
+          load (H→D): GPU 逐层 forward, 每一层计算完就马上需要该层 KV。
+            逐层加载可以让第一层加载完立即开始计算, 不用等所有层都加载完毕,
+            实现 compute↔DMA 流水线重叠。
+        """
+        # ① 锚定池 (KV) 逐层 DMA: Host KV → Device KV
         anchor = self.anchor_entry
         local_layer_id = anchor.layer_mapper(layer_id)
         if local_layer_id is not None and host_indices.numel() > 0:
+            # 当前层归锚定池管理 → 执行逐层拷贝
             anchor.host_pool.load_to_device_per_layer(
                 anchor.device_pool,
                 host_indices,
@@ -3402,14 +3556,15 @@ class HostPoolGroup:
                 io_backend,
             )
 
-        # 2. Extra pool transfers
+        # ② 辅池逐层 DMA: 如 Host SWA → Device SWA
         for transfer in pool_transfers or []:
             entry = self.entry_map.get(transfer.name)
+            # 跳过不存在的池或没有 Host 数据的 transfer
             if entry is None or transfer.host_indices is None:
                 continue
             local_layer_id = entry.layer_mapper(layer_id)
             if local_layer_id is None:
-                continue
+                continue  # 当前层不归该辅池管理 → 跳过
             entry.host_pool.load_to_device_per_layer(
                 entry.device_pool,
                 transfer.host_indices,
@@ -3426,18 +3581,50 @@ class HostPoolGroup:
         io_backend,
         pool_transfers: Optional[list] = None,
     ) -> None:
-        # 1. Anchor (KV) backup
+        """✍️ 全层 GPU→Host DMA (BACKUP_HOST 的执行体)。
+
+        ━━━━━━━━━━━━━━ 1️⃣ 调用链 ━━━━━━━━━━━━━━
+        UnifiedRadixCache.write_backup()
+          → cache_controller.write(device_value, extra_pools=[SWA transfers, ...])
+            → start_writing()
+              → ① 分配: mem_pool_host.alloc(n)           (锚定池, KV)
+                     + _resolve_pool_transfers_allocation  (辅池, SWA host_indices)
+              → ② DMA:  backup_from_device_all_layer(...)  ← 当前函数
+                 ├─ 锚定池 (KV): Device KV → Host KV (全层一次拷贝)
+                 └─ 各辅池:         Device SWA → Host SWA (全层一次拷贝)
+
+        ━━━━━━━━━━━━━━ 2️⃣ 数据流 ━━━━━━━━━━━━━━
+        GPU                                      Host (CPU)
+        ┌──────────────────┐                    ┌──────────────────────────┐
+        │ anchor_entry      │                    │ anchor_entry              │
+        │  .device_pool     │ ──DMA 全层拷贝──▶  │  .host_pool               │
+        │  (FULL KV on GPU) │    host_indices    │  (FULL KV on CPU)         │
+        ├──────────────────┤                    ├──────────────────────────┤
+        │ entry_map[SWA]   │                    │ entry_map[SWA]            │
+        │  .device_pool     │ ──DMA 全层拷贝──▶  │  .host_pool               │
+        │  (SWA KV on GPU)  │    transfer.       │  (SWA KV on CPU)          │
+        │                    │    host_indices    │                           │
+        └──────────────────┘                    └──────────────────────────┘
+
+        💡 为什么 backup 是全层而 load 是逐层？
+          backup: GPU 所有层的 KV 都完整, 无需依赖计算流,
+            一次 backup_from_device_all_layer 全层拷贝最省事。
+          load: 逐层是为了让第一层加载完立即开始 forward 计算,
+            compute↔DMA 重叠, 减少总延迟 (见 load_to_device_per_layer 注释)。
+        """
+        # ① 锚定池 (KV) 全层 DMA: Device KV → Host KV
+        #    所有层一次拷贝, 不依赖 GPU 计算流
         self.anchor_entry.host_pool.backup_from_device_all_layer(
             self.anchor_entry.device_pool,
             host_indices,
             device_indices,
             io_backend,
         )
-        # 2. Extra pool backup
+        # ② 辅池全层 DMA: 每个辅池独立拷贝自己的数据
         for transfer in pool_transfers or []:
             entry = self.entry_map.get(transfer.name)
             if entry is None or transfer.host_indices is None:
-                continue
+                continue  # 池不存在或无数据 → 跳过
             entry.host_pool.backup_from_device_all_layer(
                 entry.device_pool,
                 transfer.host_indices,

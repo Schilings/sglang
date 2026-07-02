@@ -1005,33 +1005,6 @@ class SWAComponent(TreeComponent):
         🔗 UnifiedRadixCache._backup_to_host() / _load_back_from_host() / _backup_to_storage() / _prefetch_from_storage()
             在各个阶段遍历所有 component 调用 (:1622, :1747)。
 
-        ⚙️ 四阶段行为:
-            ┌─ BACKUP_HOST (Device→Host) ─┐
-            │ 将节点 SWA value (Device pool 索引) 封装为 PoolTransfer(device_indices=...)  │
-            │ 供 HostPoolGroup 执行 D→H 拷贝。                                          │
-            │ cd.value 已是 SWA pool 索引 (insert 时已 translate), 转为 int64 给 host。   │
-            │ cd.value=None (tombstone) 时返回 None (无需备份)。                        │
-            └──────────────────────────────┘
-
-            ┌─ LOAD_BACK (Host→Device) ─┐
-            │ `node` = best_match_node; SWA validator 保证窗口内每个有效祖先都有 value 或 host_value.│
-            │ 从 node 向上走, 收集仅有 host_value 的 tombstone 节点的 host_indices。               │
-            │ 跳到 device 已有 value 的节点时只累加 n_swa 但不收集 (device 已够)。                  │
-            │ 拼接所有 host_indices → PoolTransfer(host_indices=cat(...), nodes_to_load=[...])    │
-            └─────────────────────────────┘
-
-            ┌─ BACKUP_STORAGE (Host→Storage) ─┐
-            │ 将 host_value 尾部配以 hash keys 写入存储 (page 对齐)。                           │
-            │ hit_policy=TRAILING_PAGES: 查询时匹配尾页 hash, 命中则返回匹配到的页。              │
-            └─────────────────────────────────┘
-
-            ┌─ PREFETCH (Storage→Host) ─┐
-            │ 申请 host pool 缓冲区 (一个完整 SWA 窗口大小), 构造 placeholder transfer。         │
-            │ 内存不足时先触发 host eviction。                                                │
-            │ 返回池 (alloc 失败 → 返回空列表让 caller 放弃 prefetch)。                         │
-            │ 实际数据由 storage backend 根据 placeholder keys 异步加载。                       │
-            └────────────────────────────┘
-
         📥 node: 操作目标节点 (BACKUP_HOST/STORAGE: 单一节点; LOAD_BACK: match 节点)。
         📥 phase: 传输阶段 (BACKUP_HOST | LOAD_BACK | BACKUP_STORAGE | PREFETCH)。
         📥 req: 请求对象 (LOAD_BACK 用; PREFETCH 用 token_ids)。
@@ -1041,6 +1014,13 @@ class SWAComponent(TreeComponent):
         📤 Optional[list[PoolTransfer]]: None=无传输, [] = 放弃, 或含传输描述符的列表。"""
         ct = self.component_type
 
+
+        # ┌─ BACKUP_HOST (Device→Host) ─┐
+        # │ 将节点 SWA value (Device pool 索引) 封装为 PoolTransfer(device_indices=...)  │
+        # │ 供 HostPoolGroup 执行 D→H 拷贝。                                          │
+        # │ cd.value 已是 SWA pool 索引 (insert 时已 translate), 转为 int64 给 host。   │
+        # │ cd.value=None (tombstone) 时返回 None (无需备份)。                        │
+        # └──────────────────────────────┘
         if phase == CacheTransferPhase.BACKUP_HOST:
             cd = node.component_data[ct]
             if cd.value is None:
@@ -1055,6 +1035,12 @@ class SWAComponent(TreeComponent):
                 )
             ]
 
+        # ┌─ LOAD_BACK (Host→Device) ─┐
+        # │ `node` = best_match_node; SWA validator 保证窗口内每个有效祖先都有 value 或 host_value.│
+        # │ 从 node 向上走, 收集仅有 host_value 的 tombstone 节点的 host_indices。               │
+        # │ 跳到 device 已有 value 的节点时只累加 n_swa 但不收集 (device 已够)。                  │
+        # │ 拼接所有 host_indices → PoolTransfer(host_indices=cat(...), nodes_to_load=[...])    │
+        # └─────────────────────────────┘
         if phase == CacheTransferPhase.LOAD_BACK:
             # `node` is best_match_node; the SWA validator guarantees every
             # ancestor within `sliding_window_size` has value or host_value.
@@ -1092,6 +1078,10 @@ class SWAComponent(TreeComponent):
                 )
             ]
 
+        # ┌─ BACKUP_STORAGE (Host→Storage) ─┐
+        # │ 将 host_value 尾部配以 hash keys 写入存储 (page 对齐)。                           │
+        # │ hit_policy=TRAILING_PAGES: 查询时匹配尾页 hash, 命中则返回匹配到的页。              │
+        # └─────────────────────────────────┘
         if phase == CacheTransferPhase.BACKUP_STORAGE:
             cd = node.component_data[ct]
             if cd.host_value is None or not node.hash_value:
@@ -1108,6 +1098,12 @@ class SWAComponent(TreeComponent):
                 )
             ]
 
+        # ┌─ PREFETCH (Storage→Host) ─┐
+        # │ 申请 host pool 缓冲区 (一个完整 SWA 窗口大小), 构造 placeholder transfer。         │
+        # │ 内存不足时先触发 host eviction。                                                │
+        # │ 返回池 (alloc 失败 → 返回空列表让 caller 放弃 prefetch)。                         │
+        # │ 实际数据由 storage backend 根据 placeholder keys 异步加载。                       │
+        # └────────────────────────────┘
         if phase == CacheTransferPhase.PREFETCH:
             # Require a full sliding window.
             sw_pages = (

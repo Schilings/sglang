@@ -52,9 +52,53 @@ description: 按团队约定的"图文并茂 + 调用链"富注释风格为代�
 位置：函数 docstring，紧随 `def f(...):` 之下。必须覆盖：
 
 1. **一句话职责**（带 Emoji，如 ✍️ 写 / 📖 读 / 🚚 搬运）。
-2. **🔗 调用链定位**：本函数在整体调用链中的第几步、谁调用它、它又调用谁（用 `├─ └─ →` 小图）。
-3. **详解**：📥 参数、📤 返回、⚙️ 行为 / 关键分支、⚠️ 注意 / 副作用 / 边界。
-4. ⚠️ **docstring 之后，必须在函数体内部写入行间注释**（见下"③ 行间注释"）。 这不算"完了"，行间注释是 docstring 的延续，同样强制。
+2. **🔗 调用链定位**（必须按以下格式，参考 `hiradix_cache.py` 风格）：
+   - 用 `━━━━━━━━━━━━━━━ 1️⃣ 调用链 ━━━━━━━━━━━━━━` 做分隔标题。
+   - **从最外层调用方写起**（如 scheduler / ModelRunner），逐层 `→` 链到当前函数。
+   - 若有多种触发场景（如 write_through vs write_back），先放 `╔╗╚╝` box 分场景说明，内部各带调用链。
+   - **禁止简化为 `└─ 当前函数 ← 调用方` 的空洞形式**——必须给出完整的从外部到内部的多跳路径。
+3. **详解**：📥 参数（⚠️ 关键参数说明约束/语义，不只是列名字）、📤 返回、⚙️ 行为 / 关键分支、⚠️ 注意 / 副作用 / 边界。
+4. **💡 设计理由**（可选但推荐）：为什么这样设计、前置条件约束、与其他模式的差异。
+5. ⚠️ **docstring 之后，必须在函数体内部写入行间注释**（见下"③ 行间注释"）。 这不算"完了"，行间注释是 docstring 的延续，同样强制。
+
+### 调用链格式规范
+
+**必须从最外层调用方开始**，而非只写直接调用者。多用 `→` 箭头，少用 `└─ ` 单跳：
+
+```
+━━━━━━━━━━━━━━━ 1️⃣ 调用链 ━━━━━━━━━━━━━━
+scheduler 主循环
+  → check_hicache_events()          (每轮调度前统一收割异步事件)
+    → loading_check()               (收割 Host→GPU load_back DMA)
+      → cache_controller.load()     (入队 load 操作)
+        → start_loading()           (逐层 DMA)
+          → loading_check 轮询 ack_load_queue → 收割完成 → dec_lock_ref
+```
+
+**多场景时用 box 分列**（参考 `hiradix_cache.py:1082-1100`）：
+
+```
+╔══════════════════════════════════════════════════════════════════╗
+║  write_backup 的两种触发场景                                       ║
+╠══════════════════════════════════════════════════════════════════╣
+║  1. write_through 模式（write_back=False）：                      ║
+║     调用链：_inc_hit_count → write_backup(node) → inc_lock_ref     ║
+║            [DMA 飞行中] → writing_check → _finish_write_through_ack ║
+║                                                                            ║
+║  2. write_back 模式（write_back=True）：                         ║
+║     调用链：evict → write_backup(write_back=True) → _evict_backuped    ║
+╚══════════════════════════════════════════════════════════════════╝
+```
+
+**数据结构注释**（对类属性 / dict 等关键状态）使用生命周期格式：
+
+```
+# 完整调用链:
+#   创建: write_backup() → _track_write_through_node()
+#   更新: radix tree split → _replace_pending_write_through_node()
+#   清除: scheduler writing_check() → _finish_write_through_ack() → pop + dec_lock_ref
+self.ongoing_write_through = {}
+```
 
 ## ③ 行间注释
 
