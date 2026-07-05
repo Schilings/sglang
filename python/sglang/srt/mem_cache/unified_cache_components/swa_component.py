@@ -206,16 +206,6 @@ class SWAComponent(TreeComponent):
             ├─ _touch_node()         → phase=WALKDOWN       (:1130)
             ├─ _match_post_processor  → phase=MATCH_END     (:1050)
             └─ _insert_helper()       → phase=INSERT_END    (:1271)
-
-        ⚙️ 行为:
-            WALKDOWN (树遍历触碰): NO-OP —— SWA 窗口前移时, 大部分遍历到的祖先节点
-              已经滚出滑动窗口, 若将其设为 MRU 会错误地保护不再需要的旧 SWA 数据。
-              窗口边界内的刷新推迟到 MATCH_END / INSERT_END 做。
-
-            MATCH_END / INSERT_END: 调用 reset_node_and_window_ancestors_mru(),
-              从 node 向上走, 只刷新 sliding_window_size+page_size 范围内的、有 SWA value 的祖先。
-              这个范围上限=窗口大小+1个 page 的缓冲 (因为驱逐边界是 page 对齐的)。
-
         📥 phase: 触发阶段枚举 (WALKDOWN | MATCH_END | INSERT_END)。
         📥 node: 当前处理的树节点。
         📥 root_node: 根节点 (向上遍历的终止条件)。
@@ -226,8 +216,14 @@ class SWAComponent(TreeComponent):
                 # but most are outside the active sliding window and must
                 # stay evictable. Window-bounded refresh runs at
                 # MATCH_END / INSERT_END instead.
+                # WALKDOWN (树遍历触碰): NO-OP —— SWA 窗口前移时, 大部分遍历到的祖先节点
+                #   已经滚出滑动窗口, 若将其设为 MRU 会错误地保护不再需要的旧 SWA 数据。
+                #   窗口边界内的刷新推迟到 MATCH_END / INSERT_END 做。
                 return
             case LRURefreshPhase.MATCH_END | LRURefreshPhase.INSERT_END:
+                # MATCH_END / INSERT_END: 调用 reset_node_and_window_ancestors_mru(),
+                #   从 node 向上走, 只刷新 sliding_window_size+page_size 范围内的、有 SWA value 的祖先。
+                #   这个范围上限=窗口大小+1个 page 的缓冲 (因为驱逐边界是 page 对齐的)。
                 self.cache.lru_lists[
                     self.component_type
                 ].reset_node_and_window_ancestors_mru(
@@ -266,29 +262,24 @@ class SWAComponent(TreeComponent):
         self, match_device_only: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
         """🔍 创建状态化闭包 —— 在树遍历中累计连续非 tombstone token, >= sliding_window_size 才 True。
-
         🔗 UnifiedRadixCache._match_prefix_helper() 每轮 match 调用一次 (:977)。
-            match_device_only=True: HiCache 场景下的"纯设备匹配"判断, host tombstone 不能作为有效边界。
+        """
+        sliding_window_size = self.sliding_window_size
+        ct = self.component_type
 
+        # ⚠️ 初始 state["len"] = inf
+        # 表示 在第一次遇到tombstone前，前面匹配到的所有node都算数
+        state = {"len": float("inf")}
+        """
         ⚙️ 闭包行为:
             state["len"] 记录累计连续有效 SWA token 数。
             从根向叶遍历时逐节点调用:
               - 若 cd.value 是 None (tombstone) 且是纯设备匹配 → state["len"] 归零 (窗口断裂)
               - 若有有效 value → 累加 len(node.key)
               - 当累计 >= sliding_window_size 时返回 True (窗口已满, 可以在此处匹配)
-
             为什么用"累计"而非"单节点"?
               不同节点可能被 SWA LRU 驱逐了部分, 但连续有效的祖先加起来达到窗口大小, 路径仍然可用。
-
-        📥 match_device_only: True 时只有 device value 算有效 (host_value 不算), 用于 HiCache 的 separate_device_match 分支。
-        📤 返回闭包 validator(node) → bool。
-        ⚠️  初始 state["len"] = inf 使得第一个 tombstone 就归零。
-            tombstone 断点之前的节点不能作为匹配边界, 保证匹配路径的 SWA 连贯性。"""
-        sliding_window_size = self.sliding_window_size
-        ct = self.component_type
-        # inf 初始化使遇到第一个 tombstone 就归零, 保证"从根开始累计"语义
-        state = {"len": float("inf")}
-
+        """
         def validator(node: UnifiedTreeNode) -> bool:
             cd = node.component_data[ct]
             # HiCache: a host-only tombstone is a valid match boundary too
@@ -312,24 +303,19 @@ class SWAComponent(TreeComponent):
         best_value_len: int,
     ) -> MatchResult:
         """🔍 匹配后处理 —— 沿 best_match_node 向上统计 swa_host_hit_length。
-
         🔗 _match_post_processor() 在拼接 device_indices 后遍历所有 component 调用 (:1079)。
-
-        ⚙️ 行为: 从 best_match_node 向上走最多 sliding_window_size 个 token,
-            对每个祖先:
-              - 有 device value: 累加 len (device 已有数据)
-              - 有 host_value 但无 device value: 累加到 swa_host_hit 计数器
-                (HiCache 场景, 这些 host 数据需要 load_back 回 device)
-              - 都无 (tombstone both layers): 直接 break (窗口断裂)
-
-            然后将 swa_host_hit 写入 result.swa_host_hit_length,
-            供调度器据此预估 load_back 需要的 device 空间。
-
         📥 result: 当前匹配结果 (namedtuple MatchResult)。
         📥 params: MatchPrefixParams (含 request 上下文)。
         📥 value_chunks: 匹配路径上各节点 device value 的列表 (SWA 暂不直接使用)。
         📥 best_value_len: 已匹配的 token 总数。
-        📤 可能更新 swa_host_hit_length 字段的 MatchResult。"""
+
+        ⚙️ 行为: 从 best_match_node 向上走最多 sliding_window_size 个 token,
+            对每个祖先:
+              - 有 device value: 累加 len (device 已有数据)
+              - 有 host_value 但无 device value: 累加到 swa_host_hit 计数器(HiCache 场景, 这些 host 数据需要 load_back 回 device)
+              - 都无 (tombstone both layers): 直接 break (窗口断裂)
+            然后将 swa_host_hit 写入 result.swa_host_hit_length,供调度器据此预估 load_back 需要的 device 空间。
+        """
         ct = self.component_type
         n_swa = 0      # 累计连续有效 SWA token
         swa_host_hit = 0  # 其中需要从 host load_back 的
@@ -520,11 +506,9 @@ class SWAComponent(TreeComponent):
         result: InsertResult,
     ) -> None:
         """📝 Insert 完成后在目标节点上提交 SWA 数据 —— 分配 SWA value 并按窗口边界 split。
-
         🔗 调用场景: _insert_helper 遍历完所有重叠节点 + 创建新叶子后, 末尾调用各组件 commit。
             Full 的 value 已由 _add_new_node 写入, 但 SWA value 需要在此处从 Full value 翻译并分配。
             每次 insert 仅调用一次。
-
         """
         if not is_new_leaf:
             # 非新叶节点: SWA 数据已在之前的 overlap/unevict 步骤处理完
@@ -532,7 +516,6 @@ class SWAComponent(TreeComponent):
 
         node_start = result.prefix_len        # 本节点开始的全局 token 位置
         split_pos = params.swa_evicted_seqlen - node_start  # 窗口左边界在节点内的偏移
-
 
         # 2️⃣ node完全在窗口内 (result.prefix_len >= swa_evicted_seqlen)
         #     ==> 新节点swa value得有值，还没赋值，从full value映射得到，且swa 新node需要加入swa device LRU + 增加可驱逐计数
@@ -669,27 +652,20 @@ class SWAComponent(TreeComponent):
         """🗑️ 释放节点的 SWA KV 资源 —— 变 tombstone (value→None), 返回释放的 token 数。
 
         🔗 调用场景: 驱逐流水线中的原子步骤, 被以下路径调用:
-            ① drive_eviction → _evict_component_and_detach_lru
-               (SWA LRU 主动驱逐内部节点 → tombstone)
-            ② _cascade_evict → _evict_component_and_detach_lru
-               (Full 驱逐时级联清理 SWA, 因 Full(2) > SWA(1))
-            ③ _evict_device_leaf / _evict_host_leaf → ALL 层
-               (整叶删除时清理 SWA)
-            ④ _evict_to_host → DEVICE 层
-               (HiCache D→H 降级时 tombstone SWA device, 保留 host)
-
-        ⚙️ DEVICE 层: free_swa(full_indices) + value→None (tombstone)。
-            ⚠️ 用 full_indices 而非 swa_value: 无 SWA 映射的 slot 指向同一 sentinel,
-            直接 free swa_value 会 double-free。
-            若有残留 host_value → 插入 Host LRU (HiCache: Host 侧仍可用)。
-        HOST 层: free host pool + host_value→None, 从 Host LRU 移除。
-        ALL: 同时执行 DEVICE + HOST (整叶删除场景)。"""
+            ① drive_eviction → _evict_component_and_detach_lru  (SWA LRU 主动驱逐内部节点 → tombstone)
+            ② _cascade_evict → _evict_component_and_detach_lru  (Full 驱逐时级联清理 SWA, 因 Full(2) > SWA(1))
+            ③ _evict_device_leaf / _evict_host_leaf → ALL 层   (整叶删除时清理 SWA)
+            ④ _evict_to_host → DEVICE 层  (HiCache D→H 降级时 tombstone SWA device, 保留 host)
+        """
         ct = self.component_type
         cd = node.component_data[ct]
         freed = 0
         host_freed = 0
 
         # ── Device layer ──
+        # ⚙️ DEVICE 层: free_swa(full_indices) + value→None (tombstone)。
+        #  ⚠️ 用 full_indices 而非 swa_value: 无 SWA 映射的 slot 指向同一 sentinel, 直接 free swa_value 会 double-free。
+        #  若有残留 host_value → 插入 Host LRU (HiCache: Host 侧仍可用)。
         if EvictLayer.DEVICE in target and cd.value is not None:
             # Pass full indices to free_swa so slots with no SWA pair are
             # skipped. Freeing swa_value directly would double free those
@@ -702,6 +678,7 @@ class SWAComponent(TreeComponent):
             cd.value = None  # → tombstone
 
         # ── Host layer ──
+        #  HOST 层: free host pool + host_value→None, 从 Host LRU 移除。
         host_lru = self.cache.host_lru_lists[ct]
         if EvictLayer.HOST in target and cd.host_value is not None:
             host_freed = len(cd.host_value)
@@ -739,6 +716,9 @@ class SWAComponent(TreeComponent):
         self, params: EvictParams, tracker: dict[ComponentType, int]
     ) -> None:
         """🗑️ 从 SWA LRU 尾遍历驱逐 —— 直到满足 swa_num_tokens 请求。
+        📥 params: EvictParams, 含 swa_num_tokens (SWA 需要释放的 token 数)。
+        📥 tracker: 跨组件共享的驱逐计数 (ComponentType → 已驱逐 token 数)。
+        ⚠️  每个 cycle 前先检查 x_next 是否仍在 LRU (可能被级联驱逐先移除了)。
 
         🔗 调用场景: SWA pool 空闲空间不足时, alloc_token_slots → evict_from_tree_cache
             → UnifiedRadixCache.evict() → 遍历组件调 drive_eviction。
@@ -754,10 +734,7 @@ class SWAComponent(TreeComponent):
 
             为什么叶子走整叶删除? 叶子上的 Full 数据也需要释放 KV slot; tombstone
             只适用于内部节点 (树结构保留)。
-
-        📥 params: EvictParams, 含 swa_num_tokens (SWA 需要释放的 token 数)。
-        📥 tracker: 跨组件共享的驱逐计数 (ComponentType → 已驱逐 token 数)。
-        ⚠️  每个 cycle 前先检查 x_next 是否仍在 LRU (可能被级联驱逐先移除了)。"""
+        """
         request = params.swa_num_tokens    # SWA 池需要释放的目标 token 数
         ct = self.component_type
         lru = self.cache.lru_lists[ct]
@@ -797,6 +774,11 @@ class SWAComponent(TreeComponent):
         🔗 UnifiedRadixCache.inc_lock_ref(node) → 遍历 component 调用 (:738)。
             每个 request 在开始处理前获取 lock, 保护其 SWA 窗口不被驱逐。
 
+        📥 node: 请求插入/匹配的节点 (锁从此节点开始向上)。
+        📥 result: IncLockRefResult, 含 skip_lock_node_ids / swa_uuid_for_lock 等字段。
+        📥 lock_host: True 时锁 Host 侧 (HiCache 场景)。
+        📤 更新后的 result (含 swa_uuid_for_lock 或 swa_uuid_for_host_lock)。
+
         ⚙️ 不同于 Full 的 path-lock (沿树向上锁全部祖先), SWA 是"窗口累计锁":
             ① 从 node 向上走, 累计每个非 tombstone 祖先的 SWA value 长度。
             ② 遇到 tombstone (cd.value=None) 跳过并标记到 skip_lock_node_ids。
@@ -806,10 +788,7 @@ class SWAComponent(TreeComponent):
             为什么累计而不是锁全部? 滑动窗口大小固定, 只需保护恰好一个窗口的 SWA KV,
             多余的祖先即使被驱逐也不影响当前 request 的窗口连续性。
 
-        📥 node: 请求插入/匹配的节点 (锁从此节点开始向上)。
-        📥 result: IncLockRefResult, 含 skip_lock_node_ids / swa_uuid_for_lock 等字段。
-        📥 lock_host: True 时锁 Host 侧 (HiCache 场景)。
-        📤 更新后的 result (含 swa_uuid_for_lock 或 swa_uuid_for_host_lock)。"""
+        """
         ct = self.component_type
         root = self.cache.root_node
         sliding_window_size = self.sliding_window_size
@@ -1013,7 +992,6 @@ class SWAComponent(TreeComponent):
         📥 last_hash: 请求最后 page 的 hash (PREFETCH 阶段 range 查询的终点)。
         📤 Optional[list[PoolTransfer]]: None=无传输, [] = 放弃, 或含传输描述符的列表。"""
         ct = self.component_type
-
 
         # ┌─ BACKUP_HOST (Device→Host) ─┐
         # │ 将节点 SWA value (Device pool 索引) 封装为 PoolTransfer(device_indices=...)  │

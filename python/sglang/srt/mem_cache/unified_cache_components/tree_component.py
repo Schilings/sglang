@@ -158,23 +158,22 @@ class TreeComponent(ABC):
         root_node: UnifiedTreeNode,
     ) -> None:
         """🕐 按阶段刷新组件 LRU。
-
         🔗 UnifiedRadixCache._touch_node (WALKDOWN) / _match_post_processor (MATCH_END) / _insert_helper (INSERT_END) 回调。
-
-        ⚙️ WALKDOWN: 单节点 reset_node_mru (仅当有 value)。
-           MATCH_END: 匹配路径全部提升到 MRU (子节点比父节点更 MRU)。
-           INSERT_END: WALKDOWN 已刷新过, 跳过。"""
+           """
         ct = self.component_type
         match phase:
             case LRURefreshPhase.WALKDOWN:
                 if node.component_data[ct].value is None:
                     return
+                # WALKDOWN: 单节点 reset_node_mru (仅当有 value)。
                 self.cache.lru_lists[ct].reset_node_mru(node)
             case LRURefreshPhase.MATCH_END:
+                # MATCH_END: 匹配路径全部提升到 MRU (子节点比父节点更 MRU)。
                 self.cache.lru_lists[ct].reset_node_and_parents_mru(
                     node, root_node, self.node_has_component_data
                 )
             case LRURefreshPhase.INSERT_END:
+                # INSERT_END: WALKDOWN 已刷新过, 跳过。
                 # WALKDOWN already refreshed every node on the insert path
                 # (including the new leaf), so there is nothing more to do.
                 return

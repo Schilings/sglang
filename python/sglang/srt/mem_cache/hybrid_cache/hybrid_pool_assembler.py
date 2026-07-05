@@ -1277,7 +1277,6 @@ def attach_hybrid_pool_to_unified_cache(
 
     ━━━━━━━━━━━━━━ 2️⃣ SWA 分支详解 ━━━━━━━━━━━━━━
     当 kvcache 是 SWAKVPool (有 full + swa 双 GPU 池) 且 cache 有 FULL + SWA 组件:
-
     ┌──────────────────────────────────────────────────────────────────┐
     │  ① 拆 layer_mapping                                              │
     │     layers_mapping: {global_id: (local_id, is_swa)}              │

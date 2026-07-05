@@ -307,7 +307,6 @@ class UnifiedLRUList:
 
         🔗 SWAComponent.refresh_lru(MATCH_END/INSERT_END) 专用。
             SWA 只需保护滑动窗口内的祖先, 之外的祖先应保持可驱逐。
-
         ⚙️ 与 reset_node_and_parents_mru 的唯一差别:
             额外累加 len(node.key), 达到 window_size 时停止向上 (避免刷新窗口外的祖先)。
 
@@ -792,7 +791,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """🔍 前缀匹配 —— 在 radix tree 中查找 key 的最长公共前缀。
-
         🔗 Scheduler.get_next_batch_to_run() → Req.init_batch_info() → match_prefix(key)。
             这是每个请求最先调用的入口之一。
 
@@ -868,40 +866,34 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def evict(self, params: EvictParams) -> EvictResult:
         """🗑️ 驱逐 KV 缓存 —— 各组件按自己策略从 LRU 驱逐节点直到满足空间需求。
-
         🔗 alloc_token_slots() / alloc_paged_token_slots_extend() (:307 / :363 在 common.py)
             当 KV pool 空闲空间不足时调 tree_cache.evict()。
-
-        ⚙️ 流程:
-            ① 初始化 tracker {ComponentType → 0}, 跨组件共享驱逐计数。
-            ② 遍历每个 component.drive_eviction(params, tracker):
-                 - Full: 从叶子集合堆驱逐 (last_access_time 排序)
-                 - SWA:  从 SWA LRU 驱逐 (叶子全删 / 内部 tombstone)
-                 - Mamba: 从 Full LRU 驱逐
-                各组件内部调用 _cascade_evict 级联清理低优先级组件。
-            ③ write_back 策略下触发 writing_check (确保驱逐的节点 D→H 已备份)。
-            ④ 收集指标。
-
         📥 params: EvictParams (含 num_tokens, swa_num_tokens, mamba_num)。
         📤 EvictResult: 各组件驱逐的 token 数。"""
         if self.disable:
             return EvictResult()
         start_time = time.perf_counter()
+
+        # ① 初始化 tracker {ComponentType → 0}, 跨组件共享驱逐计数。
         # tracker: 跨组件共享的驱逐计数 {ComponentType → 已驱逐 token 数}
         tracker = {ct: 0 for ct in self.tree_components}
 
-        # ① 各组件独立驱动驱逐: Full 从叶子集合, SWA/Mamba 从各自 LRU
+        # ② 遍历每个 component.drive_eviction(params, tracker):
+        #  - Full: 从叶子集合堆驱逐 (last_access_time 排序)
+        #  - SWA:  从 SWA LRU 驱逐 (叶子全删 / 内部 tombstone)
+        #  - Mamba: 从 Full LRU 驱逐
+        # 各组件内部调用 _cascade_evict 级联清理低优先级组件。
         for component in self._components_tuple:
             component.drive_eviction(params=params, tracker=tracker)
 
-        # ② write_back 策略: 驱逐后检查是否有 pending D→H 写回需要完成
+        # ③ write_back 策略下触发 writing_check (确保驱逐的节点 D→H 已备份)。
         if (
             self.cache_controller is not None
             and self.cache_controller.write_policy == "write_back"
         ):
             self.writing_check(write_back=True)
 
-        # ③ 指标收集
+        # ④ 收集指标。
         self.update_eviction_metrics(sum(tracker.values()), start_time)
         return EvictResult(
             num_tokens_evicted=tracker[BASE_COMPONENT_TYPE],
@@ -1232,21 +1224,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         """🔍 从 root 遍历 radix tree 做前缀匹配 —— 核心匹配引擎。
 
         🔗 match_prefix() 内部调用 (:678)。
-
-        ⚙️ 行为:
-            ① 创建 validators: 遍历每个 component.create_match_validator()。
-                HiCache 模式 (separate_device_match=True): 创建两套 validator
-                  - validators: 允许 host_value 作为有效匹配 (用于 best_match_node)
-                  - device_validators: 只认 device value (用于 best_match_device_node)
-            ② 从 root 向下遍历, 逐个 child 匹配 prefix:
-                  - 部分匹配 → split node → 停止
-                  - 完全匹配 → 收集 Full value + _update_best_if_valid
-                  - 遇 evicted+not backuped 节点 → 停止 (HiCache 断点)
-            ③ 返回 (value_list, best_match_node, best_match_device_node, best_match_device_value_len)。
-
         📥 key: page-aligned 的 RadixKey。
-        📤 四元组: Full value chunks 列表, 最佳匹配节点 (含 Host),
-                   最佳设备匹配节点, 设备端匹配长度。"""
+        📤 四元组: Full value chunks 列表, 最佳匹配节点 (含 Host),最佳设备匹配节点, 设备端匹配长度。"""
         # Non-HiCache mode has only device-resident matches, so the scheduler
         # device anchor follows the best match. In HiCache mode, host-backed
         # nodes can also match, so we separately track the best device-resident
@@ -1346,21 +1325,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         best_match_device_value_len: int,
     ) -> MatchResult:
         """🔍 匹配后处理 —— 刷新 LRU / last_access_time / 构造 MatchResult。
+        🔗 _match_prefix_helper() 返回值直接传入, match_prefix() 末尾调用 (:684)。"""
 
-        🔗 _match_prefix_helper() 返回值直接传入, match_prefix() 末尾调用 (:684)。
-
-        ⚙️ 流程:
-            ① LRU 刷新: 辅组件 (SWA/Mamba) 刷新 MATCH_END; Full 用 last_access_time。
-            ② last_access_time: 沿匹配路径向上更新, 每级递减 0.00001 (确保祖先比后代"更旧")。
-            ③ last_host_node: HiCache 模式下向上找到最近的 backuped 节点; 否则用 device node。
-            ④ 拼接 device_indices = cat(value[:best_match_device_value_len])。
-            ⑤ 构造 MatchResult + 遍历 component.finalize_match_result() (如 SWA 统计 host_hit_length)。"""
+        # ① LRU 刷新: 辅组件 (SWA/Mamba) 刷新 MATCH_END; Full 用 last_access_time。
         node_update = best_match_node
         for comp in self._components_tuple:
             if comp.component_type == BASE_COMPONENT_TYPE:
                 continue  # Full uses last_access_time, not LRU
             comp.refresh_lru(LRURefreshPhase.MATCH_END, node_update, self.root_node)
 
+        #  ② last_access_time: 沿匹配路径向上更新, 每级递减 0.00001 (确保祖先比后代"更旧")。
         # 沿路径向上更新 last_access_time: 子孙比祖先更"新"
         cur_time = get_and_increase_time_counter()
         while node_update:
@@ -1368,6 +1342,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             cur_time -= 0.00001  # 递减保证拓扑序
             node_update = node_update.parent
 
+        # ③ last_host_node: HiCache 模式下向上找到最近的 backuped 节点; 否则用 device node。
         # Walk up to find last_host_node for full component.
         if self.cache_controller is None:
             last_host_node = best_match_device_node
@@ -1377,11 +1352,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             while last_host_node is not self.root_node and not last_host_node.backuped:
                 last_host_node = last_host_node.parent
 
+        # ④ 拼接 device_indices = cat(value[:best_match_device_value_len])。
         # 拼接设备端 value chunks 为连续 tensor
         if best_match_device_value_len > 0:
             device_indices = torch.cat(value[:best_match_device_value_len])
         else:
             device_indices = self._empty_match_result.device_indices
+
+        # ⑤ 构造 MatchResult + 遍历 component.finalize_match_result() (如 SWA 统计 host_hit_length)。
         result = MatchResult(
             device_indices=device_indices,
             last_device_node=best_match_device_node,
@@ -1389,7 +1367,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_match_node=best_match_node,
             host_hit_length=0,
         )
-
         # Full: 标记host_hit_length
         # SWA: 标记 swa_host_hit_length
         for component in self._components_tuple:
@@ -1460,7 +1437,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def _touch_node(self, node: UnifiedTreeNode):
         """👆 触碰节点 —— 更新 last_access_time + 刷新辅组件 LRU (WALKDOWN)。
-
         🔗 _insert_helper() 和 _match_prefix_helper() 遍历树时在每个节点调用。"""
         node.last_access_time = get_and_increase_time_counter()
         if node != self.root_node:
@@ -1520,21 +1496,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         params: InsertParams,
     ) -> InsertResult:
         """📝 Insert 核心引擎 —— 递归匹配+插入, 处理 overlap/unevict/split/叶子创建。
-
-        🔗 insert() 直接调用 (:705)。
-        主要几个核心：
-        1️⃣ 匹配链遇到device indices删除了的节点，怎么恢复
-        2️⃣ 匹配链遇到device indices存在的节点，怎么选择，复用还是替换
-
         📥 node: 起始节点 (通常 root)。
         📥 key: page-aligned RadixKey。
         📥 value: KV pool 索引。
         📥 params: InsertParams (含 prev_prefix_len, chunked, swa_evicted_seqlen)。
-        📤 InsertResult: prefix_len=总匹配长度。"""
+        📤 InsertResult: prefix_len=总匹配长度。
+
+        1️⃣ 匹配链遇到device indices删除了的节点，怎么恢复
+        2️⃣ 匹配链遇到device indices存在的节点，怎么选择，复用还是替换
+        """
         priority = params.priority
         if priority is None:
             priority = 0
-        self._touch_node(node)  # 更新当前节点的访问时间
+        # 更新 last_access_time + 刷新辅组件 LRU (WALKDOWN)。
+        self._touch_node(node)
         node.priority = max(node.priority, priority)
         if len(key) == 0:
             return InsertResult(prefix_len=0, mamba_exist=True)
@@ -1646,7 +1621,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # 🔗 解耦: _insert_helper 负责通用树操作 (遍历/split/创建叶子),
         #    Full value 已由 _add_new_node 写入。辅组件需要在此 hook 中
         #    分配/附加自己的数据 (SWA value / Mamba state)。
-        #
         # 各组件实现:
         #   ⭕️ Full:  不 override (基类 pass) — value 已由 _add_new_node 写入, 无需额外操作
         #   ⭕️ SWA: 就要考虑窗口边界：
@@ -1755,18 +1729,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         target: EvictLayer = EvictLayer.DEVICE,
     ):
         """⛓️ 级联驱逐 —— 驱逐 trigger 组件时同步清理 ≤ 其优先级的其他组件数据。
-
         🔗 各 component 的 drive_eviction() 在驱逐后调用本方法。
-
-        ⚙️ 优先级体系: Full(2) > SWA(1) > Mamba(0)
-            触发时把同节点上优先级 ≤ trigger 的其他组件也驱逐。
-            例如: 驱逐 SWA(1) 时级联驱逐 Mamba(0), 但不动 Full(2)。
-            叶子节点优先级均为 0, 任一组件的 leaf eviction 都级联到所有组件。
-
-        ⚠️ Full 驱逐的特殊延迟: free_swa() 需要 Full.value 做索引映射,
-            所以 Full.value 的 tombstone (→ None) 延迟到级联驱逐之后执行。"""
+        """
         # Cascade eviction from trigger to lower-or-equal priority components.
-
         is_leaf = False
         if target == EvictLayer.DEVICE:
             is_leaf = node in self.evictable_device_leaves
@@ -1776,6 +1741,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         trigger_priority = trigger.eviction_priority(is_leaf)
 
         # 遍历组件, 驱逐优先级 ≤ trigger 的
+        # ⚙️ 优先级体系: Full(2) > SWA(1) > Mamba(0)
+        #    触发时把同节点上优先级 ≤ trigger 的其他组件也驱逐。
+        #    例如: 驱逐 SWA(1) 时级联驱逐 Mamba(0), 但不动 Full(2)。
+        #    叶子节点优先级均为 0, 任一组件的 leaf eviction 都级联到所有组件。
         for comp in self._components_tuple:
             if comp.eviction_priority(is_leaf) <= trigger_priority:
                 if comp is not trigger and comp.node_has_component_data(node, target):
@@ -1791,6 +1760,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # Now that all components (including SWA which depends on Full.value)
         # have been freed, we can safely tombstone Full.value.
         # This is deferred from evict_component because free_swa needs it.
+        # ⚠️ Full 驱逐的特殊延迟: free_swa() 需要 Full.value 做索引映射,
+        #    所以 Full.value 的 tombstone (→ None) 延迟到级联驱逐之后执行。
         if (
             target is EvictLayer.DEVICE
             and trigger.component_type == BASE_COMPONENT_TYPE
@@ -1812,9 +1783,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         tracker: Optional[dict[ComponentType, int]] = None,
     ) -> tuple[int, int]:
         """🗑️ 驱逐单组件数据 + 从 LRU 移除 —— 驱逐流水线的原子步骤。
-
         🔗 _cascade_evict / _evict_device_leaf / _evict_host_leaf 调用。
-
         ⚙️ ① comp.evict_component() 释放 KV pool slot (返回 freed token 数)。
             ② 累加到 tracker (跨组件共享计数)。
             ③ 从对应 LRU 链表移除 (device LRU 或 host LRU)。"""
@@ -2012,12 +1981,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         assert not node.evicted and node.backuped
 
         # ① 驱逐 Full device value (Full 是 trigger, 优先级最高)
+        # comp.evict_component + 从 LRU 移除 —— 驱逐流水线的原子步骤。
         trigger = self.components[BASE_COMPONENT_TYPE]
         self._evict_component_and_detach_lru(
             node, trigger, target=EvictLayer.DEVICE, tracker=tracker
         )
 
         # ② 级联驱逐辅组件 device 数据 (SWA/Mamba)
+        #  驱逐 trigger 组件时同步清理 ≤ 其优先级的其他组件数据。级联调用_evict_component_and_detach_lru
         self._cascade_evict(node, trigger, tracker)
         self._record_remove_event(node, medium=StorageMedium.GPU)
 

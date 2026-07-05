@@ -197,7 +197,6 @@ class FullComponent(TreeComponent):
         best_value_len: int,
     ) -> MatchResult:
         """🔍 匹配后处理 —— 计算 Full KV 的 Host 命中长度 (host_hit_length)。
-
         🔗 调用场景: match_prefix → _match_post_processor → 遍历组件调用本方法。
             在 HiCache 场景下, 匹配路径可能跨越 device 和 host 两段:
               best_match_node (含 host) → ... → last_device_node (device 锚点)
@@ -253,7 +252,6 @@ class FullComponent(TreeComponent):
         target: EvictLayer = EvictLayer.DEVICE,
     ) -> tuple[int, int]:
         """🗑️ 驱逐节点上的 Full KV 资源。
-
         🔗 调用场景: 驱逐流水线中的原子步骤, 被以下路径调用:
             ① drive_eviction → _evict_device_leaf → _evict_component_and_detach_lru
                (Full 主动驱逐叶子时)
@@ -261,17 +259,16 @@ class FullComponent(TreeComponent):
                (其他组件触发级联, Full priority=2 最高, 通常不会被级联)
             ③ _evict_to_host / _evict_host_leaf
                (HiCache D→H 降级或 Host 叶子驱逐)
-
-        ⚙️ DEVICE 层: free_full + 更新 evictable_size。
-            ⚠️ value=None 不在此处设! 延迟到 _cascade_evict 末尾。
-            原因: SWA 的 free_swa(full_indices) 需要读 Full.value 做索引映射,
-            若提前置 None 会导致 SWA 无法正确释放。
-        HOST 层: free host pool + host_value=None (无延迟)。"""
+       """
         cd = node.component_data[self.component_type]
         freed = 0
         host_freed = 0
 
         # Device layer
+        # ⚙️ DEVICE 层: free_full + 更新 evictable_size。
+        #   ⚠️ value=None 不在此处设! 延迟到 _cascade_evict 末尾。
+        #   原因: SWA 的 free_swa(full_indices) 需要读 Full.value 做索引映射,
+        #   若提前置 None 会导致 SWA 无法正确释放。
         if EvictLayer.DEVICE in target and cd.value is not None:
             self._free_full(cd.value)
             freed = len(cd.value)
@@ -281,11 +278,13 @@ class FullComponent(TreeComponent):
             # cd.value = None
 
         # Host layer
+        #  HOST 层: free host pool + host_value=None (无延迟)。
         if EvictLayer.HOST in target and cd.host_value is not None:
             host_freed = len(cd.host_value)
             if self._full_kv_pool_host is not None:
                 self._full_kv_pool_host.free(cd.host_value)
             cd.host_value = None
+
         return freed, host_freed
 
     def eviction_priority(self, is_leaf: bool) -> int:
@@ -346,7 +345,6 @@ class FullComponent(TreeComponent):
         🔗 调用场景: HiCache 场景下 Host pool 空间不足时,
             write_backup / prefetch_from_storage → evict_host → drive_host_eviction。
             与 drive_eviction 结构对称, 操作 evictable_host_leaves 而非 device leaves。
-
         ⚙️ H-leaf = evicted + backuped + 无子节点 + 未锁的节点。
             驱逐 H-leaf 时 _evict_host_leaf 整叶删除 (Host 层 ALL)。"""
         heap = [
@@ -373,7 +371,6 @@ class FullComponent(TreeComponent):
         lock_host: bool = False,
     ) -> IncLockRefResult:
         """🔒 Path-lock: 从 node 沿 parent 一路锁到 root。
-
         🔗 调用场景:
             ① lock_host=False (device lock): 每个请求 match_prefix 后, Scheduler 调
                inc_lock_ref(last_device_node) 锁定匹配路径, 防止 KV 在使用中被驱逐。
@@ -484,7 +481,6 @@ class FullComponent(TreeComponent):
         last_hash: Optional[str] = None,
     ) -> Optional[list[PoolTransfer]]:
         """💿 构建 Full KV 的 HiCache 传输描述符。
-
         🔗 调用场景: HiCache D↔H↔Storage 传输时, UnifiedRadixCache 的以下方法调用:
             ① BACKUP_HOST (D→H): write_backup() → build_hicache_transfers(BACKUP_HOST)
                → Full KV 由主流程直接 cache_controller.write(device_value) 操作,
@@ -544,25 +540,24 @@ class FullComponent(TreeComponent):
         pool_storage_result: Optional[PoolTransferResult] = None,
     ) -> None:
         """💿 完成 HiCache 传输后的状态提交。
-
-        🔗 调用场景: DMA 拷贝完成后, UnifiedRadixCache 的以下方法回调:
-            ① BACKUP_HOST: write_backup() → cache_controller.write() 完成 D→H 拷贝后
-               → commit_hicache_transfer(BACKUP_HOST)
-               → 将返回的 host_indices clone 到 node.component_data[FULL].host_value。
-               此后 node.backuped=True, 可被 _evict_to_host 降级。
-            ② LOAD_BACK: load_back() → cache_controller.load() 完成 H→D 拷贝后
-               → commit_hicache_transfer(LOAD_BACK)
-               → 将 device_indices 按 token 段切片写入 nodes_to_load 中各节点的 value,
-                 更新 evictable_size + _update_evictable_leaf_sets (节点从 evicted 恢复)。
-
-        ⚙️ LOAD_BACK 切片: 按 nodes_to_load 顺序, 每个节点分得 len(host_value) 个 token,
-            从 device_indices[offset:offset+n_len] 切片写入 cd.value。"""
+        🔗 调用场景: DMA 拷贝完成后, UnifiedRadixCache 的以下方法回调
+        """
         ct = self.component_type
 
+        # ① BACKUP_HOST: write_backup() → cache_controller.write() 完成 D→H 拷贝后
+        #    → commit_hicache_transfer(BACKUP_HOST)
+        #    → 将返回的 host_indices clone 到 node.component_data[FULL].host_value。
+        #    此后 node.backuped=True, 可被 _evict_to_host 降级。
         if phase == CacheTransferPhase.BACKUP_HOST:
             if transfers and transfers[0].host_indices is not None:
                 node.component_data[ct].host_value = transfers[0].host_indices.clone()
 
+        # ② LOAD_BACK: load_back() → cache_controller.load() 完成 H→D 拷贝后
+        #    → commit_hicache_transfer(LOAD_BACK)
+        #    → 将 device_indices 按 token 段切片写入 nodes_to_load 中各节点的 value,
+        #      更新 evictable_size + _update_evictable_leaf_sets (节点从 evicted 恢复)。
+        # ⚙️ LOAD_BACK 切片: 按 nodes_to_load 顺序, 每个节点分得 len(host_value) 个 token,
+        #             从 device_indices[offset:offset+n_len] 切片写入 cd.value。
         elif phase == CacheTransferPhase.LOAD_BACK:
             if not transfers or transfers[0].device_indices is None:
                 self.cache._update_evictable_leaf_sets(node)

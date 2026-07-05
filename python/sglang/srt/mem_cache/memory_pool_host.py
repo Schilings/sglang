@@ -118,7 +118,6 @@ class HostTensorAllocator:
 
 class HiSparseHostPoolMixin:
     """HiSparse Host 端按页分配 Mixin —— 为 Host KV pool（L2 层）提供页粒度的稀疏分配能力。
-
     ╔══════════════════════════════════════════════════════════════════════╗
     ║  在 HiSparse 三层缓存架构中的位置                                       ║
     ╠══════════════════════════════════════════════════════════════════════╣
@@ -130,7 +129,6 @@ class HiSparseHostPoolMixin:
     ║  L3: Storage            ← 磁盘/远程, 最旧的 KV                        ║
     ║                                                                      ║
     ╚══════════════════════════════════════════════════════════════════════╝
-
     【为什么 MHA 不需要这个 Mixin？】
       MLA 模型（如 DeepSeek-V2/V3）通过低秩压缩将多头 KV 压成单个 latent 向量，
       单 token 的 KV 很小，Host 端可以存大量 token，按页稀疏分配收益大。
@@ -1511,9 +1509,7 @@ def get_mha_host_pool_cls(device_pool: MHATokenToKVPool) -> type:
 # ============================================================================
 # MLATokenToKVPoolHost — MLA (Multi-head Latent Attention) 的 Host KV 缓存池
 # ============================================================================
-#
 # 与 MHATokenToKVPoolHost 的核心区别:
-#
 #   1. KV 合并存储: MLA 通过低秩压缩将多头 KV 压缩为单个 latent 向量,
 #      因此 K 和 V 共用一个 kv_buffer (而非 MHA 的 k_buffer + v_buffer 分离)。
 #      维度: kv_cache_dim = kv_lora_rank + qk_rope_head_dim (而非 MHA 的 head_num × head_dim)
@@ -3292,7 +3288,6 @@ class DeepSeekV4StateHostPool(HostKVCache):
 @dataclass
 class PoolEntry:
     """💾 单一 Host 池条目 —— HostPoolGroup 中的一个成员子池。
-
     ╔══════════════════════════════════════════════════════════════════════════════════╗
     ║  🧩 成员属性说明                                                                   ║
     ╠══════════════════════════════════════════════════════════════════════════════════╣
@@ -3309,7 +3304,6 @@ class PoolEntry:
     ║  device_alloc_fn       : Device 端专用分配函数 (SWA/Mamba 用独立 allocator)         ║
     ║  device_free_fn        : Device 端专用释放函数 (与 alloc_fn 配对)                    ║
     ╚══════════════════════════════════════════════════════════════════════════════════╝
-
     💡 为什么 SWA 需要独立的 device_alloc_fn？
        SWA pool 的 device 端是原始 KV layout (不是 allocator 对象),
        其 allocate/free 由 swa_attn_allocator 管理。
@@ -3336,11 +3330,9 @@ class PoolEntry:
 
 class HostPoolGroup:
     """💾 多子池 Host 内存组 —— 将 N 个独立 Host 池 (KV + SWA + Mamba + ...) 统一管理。
-
     ╔══════════════════════════════════════════════════════════════════════════════════╗
     ║  🧬 设计要点：一个 HostPoolGroup = 一个锚定池 (KV) + 若干辅池 (SWA/Mamba/... )     ║
     ╠══════════════════════════════════════════════════════════════════════════════════╣
-    ║                                                                                  ║
     ║  HostPoolGroup                                                                    ║
     ║  ├── anchor_entry: is_primary_index_anchor=True → PoolName.KV                   ║
     ║  │    └─ host_pool:   KV HostPool  (主池, 管理 FULL KV 的 CPU 缓存)              ║
@@ -3387,7 +3379,6 @@ class HostPoolGroup:
     ║        ① anchor_entry (KV) 逐层 DMA: Host KV → Device KV                          ║
     ║        ② 各辅池 pool_transfer 逐层 DMA: Host SWA → Device SWA                    ║
     ╚══════════════════════════════════════════════════════════════════════════════════╝
-
     ╔══════════════════════════════════════════════════════════════════════════════════╗
     ║  🔑 与单一 HostKVCache 的关键区别                                                  ║
     ╠══════════════════════════════════════════════════════════════════════════════════╣
@@ -3582,7 +3573,6 @@ class HostPoolGroup:
         pool_transfers: Optional[list] = None,
     ) -> None:
         """✍️ 全层 GPU→Host DMA (BACKUP_HOST 的执行体)。
-
         ━━━━━━━━━━━━━━ 1️⃣ 调用链 ━━━━━━━━━━━━━━
         UnifiedRadixCache.write_backup()
           → cache_controller.write(device_value, extra_pools=[SWA transfers, ...])
@@ -3591,7 +3581,7 @@ class HostPoolGroup:
                      + _resolve_pool_transfers_allocation  (辅池, SWA host_indices)
               → ② DMA:  backup_from_device_all_layer(...)  ← 当前函数
                  ├─ 锚定池 (KV): Device KV → Host KV (全层一次拷贝)
-                 └─ 各辅池:         Device SWA → Host SWA (全层一次拷贝)
+                 └─ 各辅池:      Device SWA → Host SWA (全层一次拷贝)
 
         ━━━━━━━━━━━━━━ 2️⃣ 数据流 ━━━━━━━━━━━━━━
         GPU                                      Host (CPU)
@@ -3605,12 +3595,6 @@ class HostPoolGroup:
         │  (SWA KV on GPU)  │    transfer.       │  (SWA KV on CPU)          │
         │                    │    host_indices    │                           │
         └──────────────────┘                    └──────────────────────────┘
-
-        💡 为什么 backup 是全层而 load 是逐层？
-          backup: GPU 所有层的 KV 都完整, 无需依赖计算流,
-            一次 backup_from_device_all_layer 全层拷贝最省事。
-          load: 逐层是为了让第一层加载完立即开始 forward 计算,
-            compute↔DMA 重叠, 减少总延迟 (见 load_to_device_per_layer 注释)。
         """
         # ① 锚定池 (KV) 全层 DMA: Device KV → Host KV
         #    所有层一次拷贝, 不依赖 GPU 计算流
