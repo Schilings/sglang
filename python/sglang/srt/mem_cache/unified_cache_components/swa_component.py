@@ -925,7 +925,6 @@ class SWAComponent(TreeComponent):
         ⚙️ is_finished=True (请求完成, 整段 prefill KV 可缓存):
             把 req.swa_evicted_seqlen 写入 insert_params, 后续 insert 时据此判断 SWA 窗口边界。
             非完成请求只缓存部分, 不需要 SWA tombstone 判断 (窗口边界由 decoder 前移决定)。
-
             返回 None: 不截断缓存长度 (使用 full length)。
 
         📥 req: 请求对象 (含 swa_evicted_seqlen 字段)。
@@ -945,18 +944,15 @@ class SWAComponent(TreeComponent):
 
         🔗 UnifiedRadixCache.cache_finished_req / cache_unfinished_req (:891)。
             在树缓存 insert 之前调用, 把 decoder 前移产生的旧 SWA token 的 KV pool slot 归还。
-
-        ⚙️ 委托给 free_swa_out_of_window_slots() (common.py:62):
-            计算 evict_threshold = pre_len - sliding_window_size (- page_size 缓冲),
-            将 req.swa_evicted_seqlen 到 evict_threshold 之间的 SWA slot 释放。
-            (减去 page_size 是为了保留至少 1 页在窗口内, 避免叶子节点变 tombstone 导致 SWA 泄漏)
-
-            之后把 req.swa_evicted_seqlen 同步到 insert_params (供插入阶段判断边界)。
-
         📥 req: 请求对象。
         📥 pre_len: 本次缓存前的 token 长度 (prefix 匹配后的总长度)。
         📥 insert_params: 待更新的 InsertParams。"""
         if self.sliding_window_size is not None:
+            # ⚙️ 委托给 free_swa_out_of_window_slots() (common.py:62):
+            #      计算 evict_threshold = pre_len - sliding_window_size (- page_size 缓冲),
+            #      将 req.swa_evicted_seqlen 到 evict_threshold 之间的 SWA slot 释放。
+            #      (减去 page_size 是为了保留至少 1 页在窗口内, 避免叶子节点变 tombstone 导致 SWA 泄漏)
+            #      之后把 req.swa_evicted_seqlen 同步到 insert_params (供插入阶段判断边界)。
             free_swa_out_of_window_slots(
                 req,
                 pre_len,

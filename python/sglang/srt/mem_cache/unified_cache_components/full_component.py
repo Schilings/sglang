@@ -482,25 +482,25 @@ class FullComponent(TreeComponent):
     ) -> Optional[list[PoolTransfer]]:
         """💿 构建 Full KV 的 HiCache 传输描述符。
         🔗 调用场景: HiCache D↔H↔Storage 传输时, UnifiedRadixCache 的以下方法调用:
-            ① BACKUP_HOST (D→H): write_backup() → build_hicache_transfers(BACKUP_HOST)
-               → Full KV 由主流程直接 cache_controller.write(device_value) 操作,
-               不需要额外 PoolTransfer → 返回 None。
-            ② LOAD_BACK (H→D): load_back() → build_hicache_transfers(LOAD_BACK)
-               → 从 best_match_node 向上收集所有 evicted 节点的 host_value,
-               拼成 PoolTransfer(KV, host_indices=cat(...), nodes_to_load=[...])。
-               这些节点的 device value 已被驱逐, 需要 load 回来。
-            ③ BACKUP_STORAGE / PREFETCH: Full 不参与 (返回 None, 由辅组件处理)。
 
         ⚙️ LOAD_BACK 的向上遍历: Full 只驱逐叶子, 所以一旦遇到 device-on 节点
-            (value 非 None), 其上所有祖先也必然 device-on → 停止遍历。"""
+            (value 非 None), 其上所有祖先也必然 device-on → 停止遍历。
+        """
         ct = self.component_type
 
+        # ① BACKUP_HOST (D→H): write_backup() → build_hicache_transfers(BACKUP_HOST)
+        # → Full KV 由主流程直接 cache_controller.write(device_value) 操作,
+        # 不需要额外 PoolTransfer → 返回 None。
         if phase == CacheTransferPhase.BACKUP_HOST:
             # Full KV backup is handled by the main flow
             # (write_backup → cache_controller.write on host_value directly).
             # No extra PoolTransfer needed.
             return None
 
+        # ② LOAD_BACK (H→D): load_back() → build_hicache_transfers(LOAD_BACK)
+        #    → 从 best_match_node 向上收集所有 evicted 节点的 host_value,
+        #    拼成 PoolTransfer(KV, host_indices=cat(...), nodes_to_load=[...])。
+        #    这些节点的 device value 已被驱逐, 需要 load 回来。
         if phase == CacheTransferPhase.LOAD_BACK:
             # `node` is best_match_node. FULL device evict only from leaves,
             # so once we hit a device-on node, everything above is also device-on
@@ -528,6 +528,7 @@ class FullComponent(TreeComponent):
                 )
             ]
 
+        # ③ BACKUP_STORAGE / PREFETCH: Full 不参与 (返回 None, 由辅组件处理)。
         return None
 
     def commit_hicache_transfer(

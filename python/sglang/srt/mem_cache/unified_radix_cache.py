@@ -793,13 +793,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         """🔍 前缀匹配 —— 在 radix tree 中查找 key 的最长公共前缀。
         🔗 Scheduler.get_next_batch_to_run() → Req.init_batch_info() → match_prefix(key)。
             这是每个请求最先调用的入口之一。
-
-        ⚙️ 流程:
-            ① session.try_match_prefix() — 流式会话 shortcut (正在解码的 session)。
-            ② key 预处理: bigram 视图 (Eagle 模式) + page 对齐。
-            ③ _match_prefix_helper(key) — 从 root 遍历树, 逐 component validator 判定。
-            ④ _match_post_processor() — 刷新 LRU、last_access_time、构造 MatchResult。
-
         📥 params: MatchPrefixParams (含 key=RadixKey)。
         📤 MatchResult: 含 device_indices (匹配到的 KV slot 索引)、
                           last_device_node (设备端锚点)、last_host_node (Host 端锚点)、
@@ -986,16 +979,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         """💾 已完成请求的 KV 缓存 —— insert 入树 + 释放锁 + 清理组件。
 
         🔗 Scheduler.process_batch_result() 对每个完成的请求调用。
-
-        ⚙️ 流程:
-            ① session.try_cache_finished_req() — 流式会话 shortcut。
-            ② 若 is_insert=True:
-                 - 收集 token_ids + kv_indices
-                 - 遍历 component.prepare_for_caching_req() 收集 effective_cache_len
-                 - 按 page 对齐后 insert() 入树
-            ③ dec_lock_ref(last_node) 释放旧锁。
-            ④ 遍历 component.cleanup_after_caching_req() 清理各组件资源。
-
         📥 req: 已完成生成的请求。
         📥 is_insert: 是否将 KV 插入 radix tree (skip_radix_cache_insert 时为 False)。"""
         # ① 流式会话 shortcut
@@ -1087,18 +1070,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             ② scheduler.stash_chunked_request()
                — chunked prefill 暂存时调用, 传 chunked=True (不增 hit_count,
                防止同一请求在多个 chunk 中虚增)。
-
-        ⚙️ 流程:
-            ① 收集 token_ids + kv_indices。
-            ② 遍历 component.prepare_for_caching_req() (is_finished=False)。
-            ③ free_out_of_window_slots() 释放 SWA 窗口外的旧 slot。
-            ④ insert() 入树。
-            ⑤ 用相同的 key 做 match_prefix(), 获取新的匹配路径。
-            ⑥ 将新 indices 写回 req_to_token_pool。
-            ⑦ 锁交换: dec_lock_ref(old_node) + inc_lock_ref(new_node)。
-            ⑧ 更新 req.last_node, req.swa_uuid_for_lock 等字段。
-            ⑨ component.cleanup_after_caching_req() 清理。
-
         📥 req: 未完成的请求 (prefill 后但生成未结束)。
         📥 chunked: True=chunked prefill 暂存场景 (不增 hit_count)。"""
         # ① 流式会话 shortcut
@@ -2240,21 +2211,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     ) -> bool:
         """💿 H→D 加载 —— 将匹配节点的 Host KV 数据加载回 Device 池。
 
-        🔗 Scheduler 在 match 返回后, 若检测到 host_hit, 分配 token 前调用。
+        ━━━━━━━━━━━━━━ 1️⃣ 完整调用链（谁调用了 load_back）━━━━━━━━━━━━━━
+        📥 schedule_policy.py（prefill 调度阶段）
+          → req.needs_host_load_back() 检查 host_hit_length > 0
+          → tree_cache.init_load_back(InitLoadBackParams(best_match_node=req.best_match_node, ...))
+          → UnifiedRadixCache.init_load_back():
+              若 best_match_node.evicted 🔴 / host_hit_length>0 / SWA·Mamba host_hit
+                → load_back(best_match_node, mem_quota, req)  ← 你在这
+            （host 无命中 🟢 → 说明 KV 还在 Device，无需 load_back）
+        📥 decode_hicache_mixin.py（disaggregation decode 场景）
+          → tree_cache.init_load_back(...)（同上路径）
 
-        ⚙️ 流程:
-            ① inc_host_lock_ref(best_match_node) 锁定 Host 锚点。
-            ② build_hicache_transfers(LOAD_BACK) 构造传输 (仅需 load 的部分)。
-            ③ inc_lock_ref(best_match_node) 锁定设备路径 + pre-evict 腾空间。
-            ④ cache_controller.load() 执行 H→D 拷贝。
-            ⑤ 各 component.commit_hicache_transfer(LOAD_BACK) 回填 device value。
-            ⑥ dec_host_lock_ref 释放 Host 锁。
-            ⑦ 若 load 的 token 太小 (< load_back_threshold) 或无辅组件, 跳过。
-
-        📥 best_match_node: match 返回的最佳匹配节点。
-        📥 mem_quota: 可用设备内存上限。
-        📥 req: 请求对象 (传给组件, 用于 SWA LOAD_BACK)。
-        📤 True=加载成功, False=跳过 (太小或超配额)。"""
+        ━━━━━━━━━━━━━━ 2️⃣ load_back 只负责入队，异步 DMA 完整流程 ━━━━━━━━━━
+          load_back → cache_controller.load()  ← 🔑 只分配 device slot + 入 load_queue
+          scheduler → cache_controller.start_loading()  ← 🚀 真正逐层 DMA
+          scheduler 主循环 → loading_check()  ← 🔍 轮询收割完成事件
+            → ongoing_load_back.pop → dec_lock_ref + dec_host_lock_ref
+        """
         if self.cache_controller is None:
             return False
 
@@ -3082,15 +3055,42 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self,
         params: InitLoadBackParams,
     ) -> tuple[torch.Tensor, UnifiedTreeNode]:
-        """Prepare KV cache loading from host to device.
-        Returns (device_indices, last_node) tuple."""
+        """📥 Host→Device 加载入口 —— 由 scheduler 在 prefill 调度时调用。
+
+        ━━━━━━━━━━━━━━ 1️⃣ 调用链 ━━━━━━━━━━━━━━
+        schedule_policy.py（add_one_req 准入判断, line ~973）
+          → req.needs_host_load_back() 检查 host_hit_length > 0
+          → tree_cache.init_load_back(InitLoadBackParams(
+                best_match_node=req.best_match_node,
+                host_hit_length=req.host_hit_length,
+                mem_quota=...))
+          → UnifiedRadixCache.init_load_back():  ← 你在这
+              若 best_match_node.evicted 🔴 / host_hit_length>0
+                / SWA·Mamba host_hit_length>0
+                → load_back(best_match_node, mem_quota, req)
+        decode_hicache_mixin.py（disaggregation decode 场景）
+          → tree_cache.init_load_back(...)（同上路径）
+
+        ━━━━━━━━━━━━━━ 2️⃣ 两种返回值语义 ━━━━━━━━━━━━━━
+        🟢 load_back 成功:
+            return (new_device_indices, best_match_node)
+            new_device_indices = best_match_node 链上各节点 component_data.value
+            的拼接（从 last_best_match_device_node 之后到 best_match_node）
+            → 用于 inc_lock_ref + prefill 输入 prefix_indices
+        🔵 无需 / 失败 (无命中, GPU OOM, 或新 indices 为空):
+            return (empty_indices, last_best_match_device_node)
+            last_best_match_device_node = req.last_node（调度器侧原有的 GPU 节点）
+            → 仅使用已有 GPU prefix，不做 host 加载
+        """
         best_match_node = params.best_match_node
         mem_quota = params.mem_quota
         req = params.req
         assert req is not None
-        last_best_match_device_node = req.last_node
+        last_best_match_device_node = req.last_node  # 调度器侧已有的最深 GPU 节点
 
         def _collect_new_prefix_indices() -> torch.Tensor:
+            # 沿父链从 best_match_node 向上收集 component_data.value，
+            # 跳过 last_best_match_device_node 之前的部分（已在 GPU）
             prefix_chunks: list[torch.Tensor] = []
             node = best_match_node
             while node is not last_best_match_device_node:
@@ -3100,9 +3100,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 node = node.parent
             if not prefix_chunks:
                 return self._empty_match_result.device_indices
-            prefix_chunks.reverse()
+            prefix_chunks.reverse()  # 头插逆序 → 恢复从根到叶的正序
             return torch.cat(prefix_chunks)
 
+        # ① 触发判定: best_match_node 在 Host 不在 GPU, 或 host/SWA·Mamba 有命中
         if (
             best_match_node.evicted
             or params.host_hit_length > 0
@@ -3111,9 +3112,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 and (req.swa_host_hit_length > 0 or req.mamba_host_hit_length > 0)
             )
         ):
+            # ② load_back: 逐组件 build_transfers → evict 腾空间 → 入 load_queue
             if self.load_back(best_match_node, mem_quota, req=req):
                 new_indices = _collect_new_prefix_indices()
                 if new_indices.numel() == 0:
+                    # 🟡 load_back 成功但无可拼接 indices → 回退到原有 GPU 节点
                     return (
                         self._empty_match_result.device_indices,
                         last_best_match_device_node,
@@ -3124,8 +3127,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     len(new_indices),
                     best_match_node.id,
                 )
+                # 🟢 成功: 返回新拼接的 device_indices + 恢复后的最深节点
                 return new_indices, best_match_node
 
+        # ③ 无需 load_back (已在 GPU) 或 load_back 失败 → 保持原有 GPU prefix
         return (
             self._empty_match_result.device_indices,
             last_best_match_device_node,
