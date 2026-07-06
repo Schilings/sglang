@@ -620,6 +620,41 @@ class DeepseekV4AttnBackend(
         use_prefill_cuda_graph: bool = False,
         online_c128_state_slot_offset: int = 0,
     ) -> DSV4Metadata:
+        """📦 构造 prefill 阶段的 DSV4Metadata —— 整合 SWA / c4 / c128 三套 KV 索引。
+
+        ━━━━━━━━━━━━━━ 1️⃣ 调用链（谁调用了 init_forward_metadata_prefill）━━━━━━━━━━━━━━
+        📥 _build_forward_metadata（prefill / draft_extend_v2 主入口, line ~1167）
+          → 传入 forward_batch 的 seq_lens / extend_seq_lens / out_cache_loc
+          → init_forward_metadata_prefill(...)  ← 你在这
+        📥 init_forward_metadata_target_verify_old（target_verify 旧路径, line ~764）
+        📥 init_forward_metadata_draft_extend（draft extend, line ~881）
+          以上两条均复用本函数: 把 verify/extend 改写为等长 extend 后调用
+
+        ━━━━━━━━━━━━━━ 2️⃣ 四步流程 ━━━━━━━━━━━━━━
+        ① expand_prefill_casually: 把 batch 级 seq_lens/extend_lens 展开成
+           每个 query token 的 casual seq_len + req_pool_indices_repeated
+        ② make_core_attn_metadata: 基于 casual 序列构造 SWA page_indices、
+           positions、swa_topk_lengths 等核心 attention 元数据
+        ③ init_forward_metadata_indexer: 构造分页索引器元数据（仅 need_compress）
+        ④ create_paged_compressor_data × 2: 分别为 c4 / c128 构造压缩元数据
+           （need_compress=False 时退化为 dummy, 用于无压缩前向）
+
+        Args:
+            max_seq_len:                 本批最大序列长度（SWA page 索引上界）
+            req_pool_indices:            batch 级请求池索引 (bs,)
+            seq_lens / seq_lens_cpu:      每个 req 的总序列长度 (GPU / CPU)
+            out_cache_loc:               本批 token 的 KV 写入位置 (num_tokens,)
+            num_tokens:                  本批 token 总数（含 padding）
+            extend_seq_lens / _cpu:      每个 req 的 prefill 新增长度
+            extend_start_loc:            向量化路径用, 每个 req extend 的起始偏移
+            need_compress:               是否构造 c4/c128 压缩元数据（False=dummy）
+            use_prefill_cuda_graph:      是否走 cuda-graph 友好的 planner 路径
+            online_c128_state_slot_offset: online c128 planner 的状态槽偏移
+
+        Returns:
+            DSV4Metadata: 包含 core_attn / indexer / c4 / c128 四块元数据。
+        """
+        # ① 展开 casual seq_lens —— 把 batch 级长度广播到每个 query token
         seq_lens_casual, req_pool_indices_repeated = self.expand_prefill_casually(
             num_tokens=num_tokens,
             seq_lens=seq_lens_cpu,
@@ -630,6 +665,7 @@ class DeepseekV4AttnBackend(
             extend_seq_lens_tensor=extend_seq_lens,
             extend_start_loc=extend_start_loc,
         )
+        # ② 构造核心 attention 元数据 (SWA page_indices / positions / swa_topk_lengths)
         core_attn_metadata = self.make_core_attn_metadata(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices_repeated,
@@ -639,11 +675,13 @@ class DeepseekV4AttnBackend(
             need_compress=need_compress,
             is_prefill=True,
         )
+        # ③ 分页索引器元数据 —— 喂给 c4 sparse 索引阶段（无压缩则跳过）
         indexer_metadata = (
             self.init_forward_metadata_indexer(core_attn_metadata)
             if need_compress
             else None
         )
+        # ④ 构造 c4 / c128 压缩元数据 —— need_compress=False 时退化为 dummy
         if not need_compress:
             create = _create_dummy_paged_compress_data
         else:
@@ -652,10 +690,13 @@ class DeepseekV4AttnBackend(
                 # Online c128 uses a different planner that cannot be created in
                 # prefill cuda-graph mode. Keep c4 graph-friendly while matching
                 # c128's existing online path.
+                # → use_graph_plan=True 走 cuda-graph planner（不读 cpu list）；
+                #   =False 走标准 planner（需要 seq_lens_cpu / extend_lens_cpu）
                 use_graph_plan = use_prefill_cuda_graph and not (
                     compress_ratio == 128 and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
                 )
                 if use_graph_plan:
+                    # graph 路径: 不传 cpu list, 多传 num_q_tokens 供 graph 重放
                     return create_paged_compressor_data(
                         compress_ratio=compress_ratio,
                         is_prefill=True,
@@ -670,6 +711,7 @@ class DeepseekV4AttnBackend(
                         num_q_tokens=out_cache_loc.shape[0],
                         online_state_slot_offset=online_c128_state_slot_offset,
                     )
+                # 标准路径: 传 cpu list, use_prefill_cuda_graph 透传给 planner
                 return create_paged_compressor_data(
                     compress_ratio=compress_ratio,
                     is_prefill=True,
@@ -684,6 +726,7 @@ class DeepseekV4AttnBackend(
                     online_state_slot_offset=online_c128_state_slot_offset,
                 )
 
+        # c4=稀疏 top-4 压缩, c128=稀疏 top-128 压缩（两套独立的 planner 输出）
         c4_compress_metadata = create(compress_ratio=4)
         c128_compress_metadata = create(compress_ratio=128)
         return DSV4Metadata(
