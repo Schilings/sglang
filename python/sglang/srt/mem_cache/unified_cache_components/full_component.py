@@ -345,8 +345,7 @@ class FullComponent(TreeComponent):
         🔗 调用场景: HiCache 场景下 Host pool 空间不足时,
             write_backup / prefetch_from_storage → evict_host → drive_host_eviction。
             与 drive_eviction 结构对称, 操作 evictable_host_leaves 而非 device leaves。
-        ⚙️ H-leaf = evicted + backuped + 无子节点 + 未锁的节点。
-            驱逐 H-leaf 时 _evict_host_leaf 整叶删除 (Host 层 ALL)。"""
+        """
         heap = [
             (self.cache.eviction_strategy.get_priority(n), n)
             for n in self.cache.evictable_host_leaves
@@ -357,6 +356,8 @@ class FullComponent(TreeComponent):
             _, x = heapq.heappop(heap)
             if x not in self.cache.evictable_host_leaves:
                 continue
+            # ⚙️ H-leaf = evicted + backuped + 无子节点 + 未锁的节点。
+            #    驱逐 H-leaf 时 _evict_host_leaf 整叶删除 (Host 层 ALL)。
             self.cache._evict_host_leaf(x, tracker)
             if x.parent is not None and x.parent in self.cache.evictable_host_leaves:
                 heapq.heappush(

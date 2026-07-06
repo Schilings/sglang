@@ -1079,7 +1079,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         """🚧 未完成请求的 KV 缓存 —— insert + re-match + 锁交换。
-
+        📥 req: 未完成的请求 (prefill 后但生成未结束)。
+        📥 chunked: True=chunked prefill 暂存场景 (不增 hit_count)。
         🔗 两个调用点:
             ① batch_result_processor.process_batch_result_prefill()
                — 任何 prefill 完成后若请求未结束 (req.finished()==False) 就调用。
@@ -1088,19 +1089,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                — chunked prefill 暂存时调用, 传 chunked=True (不增 hit_count,
                防止同一请求在多个 chunk 中虚增)。
 
-        ⚙️ 流程:
-            ① 收集 token_ids + kv_indices。
-            ② 遍历 component.prepare_for_caching_req() (is_finished=False)。
-            ③ free_out_of_window_slots() 释放 SWA 窗口外的旧 slot。
-            ④ insert() 入树。
-            ⑤ 用相同的 key 做 match_prefix(), 获取新的匹配路径。
-            ⑥ 将新 indices 写回 req_to_token_pool。
-            ⑦ 锁交换: dec_lock_ref(old_node) + inc_lock_ref(new_node)。
-            ⑧ 更新 req.last_node, req.swa_uuid_for_lock 等字段。
-            ⑨ component.cleanup_after_caching_req() 清理。
-
-        📥 req: 未完成的请求 (prefill 后但生成未结束)。
-        📥 chunked: True=chunked prefill 暂存场景 (不增 hit_count)。"""
+        """
         # ① 流式会话 shortcut
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
@@ -1976,28 +1965,67 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def _evict_to_host(
         self, node: UnifiedTreeNode, tracker: Optional[dict[ComponentType, int]] = None
     ) -> None:
-        """GPU→CPU demotion: release all device resources, node stays in tree."""
+        """💿 降级: 释放节点所有 Device 资源 (GPU KV), 节点保留在树中 (仅剩 Host 数据)。
+        ━━━━━━━━━━━━━━ 1️⃣ 调用链 ━━━━━━━━━━━━━━
+        _evict_device_leaf(node) ← D-leaf 驱逐入口
+          ├─ Path A (write_back, 未 backup):
+          │     write_backup → writing_check → _evict_to_host(node)  ← 当前函数
+          ├─ Path B (write_through, 已 backuped):
+          │     _evict_to_host(node)  ← 当前函数
+          └─ Path C (write_through, 未 backup):
+                级联驱逐 ALL + 整叶删除 (不走 _evict_to_host)
+
+        ━━━━━━━━━━━━━━ 2️⃣ 执行流程 ━━━━━━━━━━━━━━
+        ① 驱逐 Full component (KV) 的 Device 数据
+           → _evict_component_and_detach_lru(trigger=FULL, target=DEVICE)
+           → node.evicted = True (FULL Device 释放后标记)
+        ② 级联驱逐辅组件 (SWA/Mamba) 的 Device 数据
+           → _cascade_evict(node, trigger, tracker)
+        ③ 辅组件的 host_value 仍在 → 插入 Host LRU (可被后续 host eviction 驱逐)
+        ④ _update_evictable_leaf_sets(node.parent)
+           → _is_host_leaf(node) == True (evicted=True, backuped=True, host_lock_ref=0)
+           → evictable_host_leaves.add(node)  ← 🎯 正式成为 H-leaf !
+
+        ━━━━━━━━━━━━━━ 3️⃣ 节点状态变化 ━━━━━━━━━━━━━━
+        降级前: node.evicted=False   device KV ✓  host KV ✓  (D-leaf, 可被 device eviction)
+        降级后: node.evicted=True    device KV ✗  host KV ✓  (H-leaf, 可被 host eviction)
+
+        ━━━━━━━━━━━━━━ 💡 为什么降级后 host_lock_ref == 0 ━━━━━━━━━━━━━━
+        host_lock_ref 是"使用锁"而非"存在锁" —— 只有 load_back / write_backup_storage /
+        prefetch_from_storage 这三种主动操作期间才 inc_host_lock_ref, 操作完立即释放。
+        降级后 Host 数据处于冷备份状态, 无人使用, 自然是 0。
+        如果降级后 host_lock_ref == 1, 该节点将永远卡在 evictable_host_leaves 之外,
+        Host 池只会涨不会降, 最终 OOM。
+        """
         # 前提: 节点未驱逐 + 已 backup (Host 有数据)
+        #   若 node.backuped=False, Host 没有数据, 降级后节点成空壳, 不如直接删除 (走 Path C)
         assert not node.evicted and node.backuped
 
-        # ① 驱逐 Full device value (Full 是 trigger, 优先级最高)
-        # comp.evict_component + 从 LRU 移除 —— 驱逐流水线的原子步骤。
+        # ① 驱逐 Full component (KV) 的 Device 数据
+        #   Full 是 trigger (优先级最高), 驱逐 device value → node.evicted = True
+        #   _evict_component_and_detach_lru: 执行 evict_component + 从 LRU 链表摘除 (原子操作)
         trigger = self.components[BASE_COMPONENT_TYPE]
         self._evict_component_and_detach_lru(
             node, trigger, target=EvictLayer.DEVICE, tracker=tracker
         )
 
-        # ② 级联驱逐辅组件 device 数据 (SWA/Mamba)
-        #  驱逐 trigger 组件时同步清理 ≤ 其优先级的其他组件数据。级联调用_evict_component_and_detach_lru
+        # ② 级联驱逐辅组件 (SWA/Mamba) 的 Device 数据
+        #   _cascade_evict: 驱逐优先级 ≤ trigger 的其他组件的 DEVICE 数据
+        #   辅组件 host_value 不动 —— device 释放后, host 副本仍可用于后续 host eviction
         self._cascade_evict(node, trigger, tracker)
+        # 通知下游: GPU 端 KV 已释放 (disagg / metrics 等消费者)
         self._record_remove_event(node, medium=StorageMedium.GPU)
 
-        # ③ device 驱逐后: 辅组件的 host_value 仍在 → 插入 Host LRU (可被 host eviction)
-        # after device eviction, insert aux components into host LRU.
+        # ③ Device 驱逐后: 辅组件的 host_value 仍在 → 插入 Host LRU (可被 host eviction)
+        #   Full component 不在 Host LRU 中 (Full 用 evictable_host_leaves 叶子集合驱动)
+        #   skip_existing=True: 已在 LRU 中的节点跳过, 避免重复插入
         self._for_each_component_lru(
             node, UnifiedLRUList.insert_mru, target=EvictLayer.HOST, skip_existing=True
         )
-        # parent 可能因 node 变成 evicted 而改变叶子状态
+        # ④ 更新父节点叶子状态: node 变成 evicted → parent 可能从"非叶子"变"叶子"
+        #   同时 _is_host_leaf(node) 检测 node 是否满足 H-leaf 条件
+        #   → evicted=True, backuped=True, host_lock_ref=0, no children
+        #   → evictable_host_leaves.add(node)
         self._update_evictable_leaf_sets(node.parent)
 
     def _evict_device_leaf(
@@ -2076,24 +2104,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def write_backup(self, node: UnifiedTreeNode, write_back: bool = False) -> int:
         """💿 D→H 备份 —— 将节点的 device KV + 辅组件数据复制到 Host 池。
-
         🔗 _evict_device_leaf() (write_back 策略), load_back 用, _finish_write_through_ack。
-
-        ⚙️ 流程:
-            ① write-through 不变式: parent 必须先备份 (递归 write_backup)。
-            ② 构造 PoolTransfer: Full KV + 各 component.build_hicache_transfers(BACKUP_HOST)。
-            ③ 若 Host pool 不够, 先 evict_host 腾空间。
-            ④ cache_controller.write() 执行 D→H 拷贝。
-            ⑤ 各 component.commit_hicache_transfer(BACKUP_HOST) 记录 host_value。
-            ⑥ 锁路径: 备份后 inc_lock_ref (write-through 保护)。
-
         📥 node: 待备份节点。
         📥 write_back: True=write-back 策略 (驱逐触发), False=write-through 策略。
         📤 备份的 host token 数 (0 表示失败)。"""
         if self.cache_controller is None:
             return 0
 
-        # ① write-through 不变式: parent 必须先备份 (递归向上)
+        # ① write-through 不变式: parent 必须先备份 (递归 write_backup)。
         if not write_back and (
             node.parent is not self.root_node and not node.parent.backuped
         ):
@@ -2103,7 +2121,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
 
         # =================================== 1️⃣ L1 -> L2 ===================================
-        # ② 构造 Full KV 传输描述符
+        # ② 构造 PoolTransfer: Full KV + 各 component.build_hicache_transfers(BACKUP_HOST)。
         device_value = node.component_data[BASE_COMPONENT_TYPE].value
         kv_xfer = PoolTransfer(name=PoolName.KV, device_indices=device_value)
 
@@ -2114,14 +2132,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if comp.component_type == BASE_COMPONENT_TYPE:
                 continue
             # ⭕️ SWA：BACKUP_HOST模式，如果node有的swa component value(就是swa value)有值，
-            #         那就返回 [ PoolTransfer(name=PoolName.SWA,device_indices=cd.value.to(torch.int64),) ]
-            #         返回的是 list ！！
+            #      [ PoolTransfer(name=PoolName.SWA,device_indices=cd.value.to(torch.int64),) ]
             t = comp.build_hicache_transfers(node, CacheTransferPhase.BACKUP_HOST)
             if t:
                 comp_xfers[comp.component_type] = t
 
-        # ⚠️ 多个非FULL的PoolTransfer 与 FULL的PoolTransfer 进行构建 一个另外的 List[PoolTransfer]
-        # sidecar pool 是附加的存储池 (如 disagg 场景的传输 buffer)
+        # ⚠️ sidecar pool 是附加的存储池，如DeepSeekV4的其他pool
         sidecar_xfers = self._build_sidecar_transfers(
             CacheTransferPhase.BACKUP_HOST, kv_xfer, comp_xfers
         )
@@ -2138,7 +2154,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # ⑤ 合并所有传输, 执行 D→H 拷贝
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
-        # ⚠️
+        # ⚠️ 在write中进行host mem alloc➕D->H拷贝
         host_indices = self.cache_controller.write(
             device_value, node_id=node.id, extra_pools=aux_xfers or None
         )
@@ -2239,22 +2255,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         req=None,
     ) -> bool:
         """💿 H→D 加载 —— 将匹配节点的 Host KV 数据加载回 Device 池。
-
         🔗 Scheduler 在 match 返回后, 若检测到 host_hit, 分配 token 前调用。
-
-        ⚙️ 流程:
-            ① inc_host_lock_ref(best_match_node) 锁定 Host 锚点。
-            ② build_hicache_transfers(LOAD_BACK) 构造传输 (仅需 load 的部分)。
-            ③ inc_lock_ref(best_match_node) 锁定设备路径 + pre-evict 腾空间。
-            ④ cache_controller.load() 执行 H→D 拷贝。
-            ⑤ 各 component.commit_hicache_transfer(LOAD_BACK) 回填 device value。
-            ⑥ dec_host_lock_ref 释放 Host 锁。
-            ⑦ 若 load 的 token 太小 (< load_back_threshold) 或无辅组件, 跳过。
-
         📥 best_match_node: match 返回的最佳匹配节点。
         📥 mem_quota: 可用设备内存上限。
         📥 req: 请求对象 (传给组件, 用于 SWA LOAD_BACK)。
-        📤 True=加载成功, False=跳过 (太小或超配额)。"""
+        📤 True=加载成功, False=跳过 (太小或超配额)。
+        """
         if self.cache_controller is None:
             return False
 
@@ -2360,10 +2366,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         comp_xfers: dict[ComponentType, list[PoolTransfer]],
     ) -> list[PoolTransfer]:
         """🔗 构造 sidecar pool 传输 —— 从 KV/SWA/MAMBA 主 pool 派生 sidecar 传输描述符。
-
         🔗 write_backup / load_back / write_backup_storage / prefetch_from_storage 调用。
 
-        ⚙️ sidecar pool 是附加的存储池 (如 disagg 场景的传输 buffer):
+        ⚙️ sidecar pool 是附加的存储池 (如DeepSeekV4的其他pool，和 disagg 场景的传输 buffer):
             根据 spec.indices_from_pool 找到源 pool 的传输 (kv_xfer 或 comp_xfers),
             复用其 keys + hit_policy 构造 sidecar 的 PoolTransfer。"""
         transfers: list[PoolTransfer] = []

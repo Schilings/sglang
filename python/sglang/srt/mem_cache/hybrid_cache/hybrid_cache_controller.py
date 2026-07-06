@@ -678,20 +678,19 @@ class HybridCacheController(BaseHiCacheController):
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> Optional[torch.Tensor]:
         """✍️ GPU→Host 多池备份 —— 分配 KV + 辅池 Host slot, 入队并立即 DMA。
+        📥 参数：
+          device_indices : KV 主池 GPU slot 索引 (node.value)
+          extra_pools    : 辅池搬运描述; None=纯 KV (退化为基类)
+        📤 返回：host_indices (KV 主池 Host slot); None=Host 内存不足或辅池 alloc 失败
+        ⚠️ 辅池 alloc 失败时会回滚已分配的 KV host slot (原子性保证)
 
-        ━━━━━━━━━━━━━━ 1️⃣ 调用链 ━━━━━━━━━━━━━━
+        ━━━━━━━━━━━━━━  调用链 ━━━━━━━━━━━━━━
         scheduler → HiRadixCache / UnifiedRadixCache / HiMambaRadixCache.write_backup(node)
           → controller.write(device_indices=node.value, node_id=node.id,
                              extra_pools=[PoolTransfer(SWA/Mamba/...)])
             → start_writing()  ← 立即合并 + DMA
                → ack_write_queue
           → scheduler → writing_check() → 收割 ack → dec_lock_ref
-
-        📥 参数：
-          device_indices : KV 主池 GPU slot 索引 (node.value)
-          extra_pools    : 辅池搬运描述; None=纯 KV (退化为基类)
-        📤 返回：host_indices (KV 主池 Host slot); None=Host 内存不足或辅池 alloc 失败
-        ⚠️ 辅池 alloc 失败时会回滚已分配的 KV host slot (原子性保证)
         """
         # ① KV 主池: 在锚定 Host 池分配 slot
         host_indices = self.mem_pool_host.alloc(len(device_indices))
@@ -1276,24 +1275,16 @@ class HybridCacheController(BaseHiCacheController):
         kv_host_indices: Optional[torch.Tensor] = None,
     ) -> Optional[list[PoolTransfer]]:
         """🔧 为 pool_transfers 中 indices=None 的项自动分配 host 或 device slot。
-
-        ━━━━━━━━━━━━━━ 1️⃣ 调用链 ━━━━━━━━━━━━━━
-        write() → _resolve_pool_transfers_allocation(alloc_host=True)   ← 分配 Host slot
-        load()  → _resolve_pool_transfers_allocation(alloc_host=False)  ← 分配 Device slot
-
-        ⚙️ 行为：
-          ① 遍历 extra_pools, 跳过已有 indices 的项和派生池 (indices_from_pool)
-          ② 查 entry_map 取该池的 alloc/free/evict 函数
-          ③ alloc 失败 → 调 evict_fn 腾空间后重试
-          ④ 仍失败 → 原子回滚 (free 所有已分配的) + 返回 None
-          ⑤ 派生池: 从源池 (KV 或其他辅池) 复制 indices
-
         📥 参数：
           alloc_host        : True=分配 Host slot (write 路径) / False=分配 Device slot (load 路径)
           kv_device_indices : KV 主池 device indices (派生自 KV 的辅池复用)
           kv_host_indices   : KV 主池 host indices (同上)
         📤 返回：填充好 indices 的 extra_pools; None=分配失败 (调用方应回滚 KV slot)
         ⚠️ 原子性: 任一辅池 alloc 失败, 已成功分配的全部回滚, 保证不泄漏
+
+        ━━━━━━━━━━━━━━ 调用链 ━━━━━━━━━━━━━━
+        write() → _resolve_pool_transfers_allocation(alloc_host=True)   ← 分配 Host slot
+        load()  → _resolve_pool_transfers_allocation(alloc_host=False)  ← 分配 Device slot
         """
         if not extra_pools:
             return None
@@ -1311,11 +1302,14 @@ class HybridCacheController(BaseHiCacheController):
                 else:
                     prev_pool.device_indices = None
 
+        # ① 遍历 extra_pools, 跳过已有 indices 的项和派生池 (indices_from_pool)
         for pool in extra_pools:
             # 派生池延后处理 (等源池 indices 填好再复制)
             if pool.indices_from_pool is not None:
                 derived_transfers.append(pool)
                 continue
+
+            # ② 查 entry_map 取该池的 alloc/free/evict 函数
             entry = self.mem_pool_host.entry_map.get(pool.name)
             if entry is None:
                 continue
@@ -1338,16 +1332,17 @@ class HybridCacheController(BaseHiCacheController):
                 free_fn = entry.device_free_fn or entry.device_pool.free
                 evict_fn = entry.device_evict_fn
                 size = len(pool.host_indices)
-            # ① 尝试分配
+            # 尝试分配
             indices = alloc_fn(size)
+            # ③ alloc 失败 → 调 evict_fn 腾空间后重试
             if indices is None and evict_fn:
-                # ② 分配失败: 调 evict_fn 腾出空间后重试
                 evict_fn(size)
                 indices = alloc_fn(size)
+            # ④ 仍失败 → 原子回滚 (free 所有已分配的) + 返回 None
             if indices is None:
-                # ③ 仍失败: 原子回滚已分配的, 返回 None
                 rollback_allocated()
                 return None
+
             if alloc_host:
                 pool.host_indices = indices
             else:
@@ -1355,6 +1350,7 @@ class HybridCacheController(BaseHiCacheController):
             newly_allocated.append((pool, free_fn, indices))
 
         # Assign indices to deferred pools from their source.
+        # ⑤ 派生池: 从源池 (KV 或其他辅池) 复制 indices
         # 派生池: 从源池复制 indices (源池已在上面分配好)
         for pool in derived_transfers:
             if pool.indices_from_pool == PoolName.KV:
