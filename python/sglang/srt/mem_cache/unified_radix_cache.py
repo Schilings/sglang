@@ -1062,7 +1062,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         """🚧 未完成请求的 KV 缓存 —— insert + re-match + 锁交换。
-
+        📥 req: 未完成的请求 (prefill 后但生成未结束)。
+        📥 chunked: True=chunked prefill 暂存场景 (不增 hit_count)。
         🔗 两个调用点:
             ① batch_result_processor.process_batch_result_prefill()
                — 任何 prefill 完成后若请求未结束 (req.finished()==False) 就调用。
@@ -1070,8 +1071,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             ② scheduler.stash_chunked_request()
                — chunked prefill 暂存时调用, 传 chunked=True (不增 hit_count,
                防止同一请求在多个 chunk 中虚增)。
-        📥 req: 未完成的请求 (prefill 后但生成未结束)。
-        📥 chunked: True=chunked prefill 暂存场景 (不增 hit_count)。"""
+        """
         # ① 流式会话 shortcut
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
@@ -2047,24 +2047,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     def write_backup(self, node: UnifiedTreeNode, write_back: bool = False) -> int:
         """💿 D→H 备份 —— 将节点的 device KV + 辅组件数据复制到 Host 池。
-
         🔗 _evict_device_leaf() (write_back 策略), load_back 用, _finish_write_through_ack。
-
-        ⚙️ 流程:
-            ① write-through 不变式: parent 必须先备份 (递归 write_backup)。
-            ② 构造 PoolTransfer: Full KV + 各 component.build_hicache_transfers(BACKUP_HOST)。
-            ③ 若 Host pool 不够, 先 evict_host 腾空间。
-            ④ cache_controller.write() 执行 D→H 拷贝。
-            ⑤ 各 component.commit_hicache_transfer(BACKUP_HOST) 记录 host_value。
-            ⑥ 锁路径: 备份后 inc_lock_ref (write-through 保护)。
-
         📥 node: 待备份节点。
         📥 write_back: True=write-back 策略 (驱逐触发), False=write-through 策略。
         📤 备份的 host token 数 (0 表示失败)。"""
         if self.cache_controller is None:
             return 0
 
-        # ① write-through 不变式: parent 必须先备份 (递归向上)
+        # ① write-through 不变式: parent 必须先备份 (递归 write_backup)。
         if not write_back and (
             node.parent is not self.root_node and not node.parent.backuped
         ):
@@ -2074,7 +2064,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
 
         # =================================== 1️⃣ L1 -> L2 ===================================
-        # ② 构造 Full KV 传输描述符
+        # ② 构造 PoolTransfer: Full KV + 各 component.build_hicache_transfers(BACKUP_HOST)。
         device_value = node.component_data[BASE_COMPONENT_TYPE].value
         kv_xfer = PoolTransfer(name=PoolName.KV, device_indices=device_value)
 
@@ -2085,14 +2075,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if comp.component_type == BASE_COMPONENT_TYPE:
                 continue
             # ⭕️ SWA：BACKUP_HOST模式，如果node有的swa component value(就是swa value)有值，
-            #         那就返回 [ PoolTransfer(name=PoolName.SWA,device_indices=cd.value.to(torch.int64),) ]
-            #         返回的是 list ！！
+            #      [ PoolTransfer(name=PoolName.SWA,device_indices=cd.value.to(torch.int64),) ]
             t = comp.build_hicache_transfers(node, CacheTransferPhase.BACKUP_HOST)
             if t:
                 comp_xfers[comp.component_type] = t
 
-        # ⚠️ 多个非FULL的PoolTransfer 与 FULL的PoolTransfer 进行构建 一个另外的 List[PoolTransfer]
-        # sidecar pool 是附加的存储池 (如 disagg 场景的传输 buffer)
+        # ⚠️ sidecar pool 是附加的存储池，如DeepSeekV4的其他pool
         sidecar_xfers = self._build_sidecar_transfers(
             CacheTransferPhase.BACKUP_HOST, kv_xfer, comp_xfers
         )
@@ -2109,7 +2097,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # ⑤ 合并所有传输, 执行 D→H 拷贝
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
-        # ⚠️
+        # ⚠️ 在write中进行host mem alloc➕D->H拷贝
         host_indices = self.cache_controller.write(
             device_value, node_id=node.id, extra_pools=aux_xfers or None
         )
@@ -2333,10 +2321,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         comp_xfers: dict[ComponentType, list[PoolTransfer]],
     ) -> list[PoolTransfer]:
         """🔗 构造 sidecar pool 传输 —— 从 KV/SWA/MAMBA 主 pool 派生 sidecar 传输描述符。
-
         🔗 write_backup / load_back / write_backup_storage / prefetch_from_storage 调用。
 
-        ⚙️ sidecar pool 是附加的存储池 (如 disagg 场景的传输 buffer):
+        ⚙️ sidecar pool 是附加的存储池 (如DeepSeekV4的其他pool，和 disagg 场景的传输 buffer):
             根据 spec.indices_from_pool 找到源 pool 的传输 (kv_xfer 或 comp_xfers),
             复用其 keys + hit_policy 构造 sidecar 的 PoolTransfer。"""
         transfers: list[PoolTransfer] = []

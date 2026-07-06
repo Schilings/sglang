@@ -1121,16 +1121,10 @@ class SWAComponent(TreeComponent):
         🔗 UnifiedRadixCache._backup_to_host() / _load_back_from_host() / _backup_to_storage() / _prefetch_from_storage()
             在各阶段的数据传输完成后调用 (:1654, :1794)。
 
-        ⚙️ 四阶段行为:
-            BACKUP_HOST: 将 D→H 复制后的 host_indices 写入 cd.host_value。
-            LOAD_BACK: 遍历 nodes_to_load, 对每个节点:
-                         ① 从 device_indices 切片出对应 SWA chunk
-                         ② 调用 _restore_device_value 复活 tombstone
-                         ③ 调用 set_full_to_swa_mapping 重建 Full↔SWA index 映射
-            BACKUP_STORAGE: (当前无 SWA 特定操作, 基类处理)
-            PREFETCH: 委托给 _commit_prefetch() (复杂逻辑: 填 tombstone / 释放多余 slice)。"""
+        """
         ct = self.component_type
 
+        # BACKUP_HOST: 将 D→H 复制后的 host_indices 写入 cd.host_value。
         if phase == CacheTransferPhase.BACKUP_HOST:
             # D→H 完成后: 记录 host pool 索引
             if transfers and transfers[0].host_indices is not None:
@@ -1139,6 +1133,10 @@ class SWAComponent(TreeComponent):
                     cd.host_value = transfers[0].host_indices.clone()
             return
 
+        # LOAD_BACK: 遍历 nodes_to_load, 对每个节点:
+        #  ① 从 device_indices 切片出对应 SWA chunk
+        #  ② 调用 _restore_device_value 复活 tombstone
+        #  ③ 调用 set_full_to_swa_mapping 重建 Full↔SWA index 映射
         if phase == CacheTransferPhase.LOAD_BACK:
             assert transfers and transfers[0].device_indices is not None
             xfer = transfers[0]
@@ -1162,6 +1160,8 @@ class SWAComponent(TreeComponent):
             assert offset == len(xfer.host_indices)  # 所有 host 数据都 load 完了
             return
 
+        # BACKUP_STORAGE: (当前无 SWA 特定操作, 基类处理)
+        # PREFETCH: 委托给 _commit_prefetch() (复杂逻辑: 填 tombstone / 释放多余 slice)。
         if phase == CacheTransferPhase.PREFETCH:
             self._commit_prefetch(
                 node,
@@ -1295,14 +1295,13 @@ class SWAComponent(TreeComponent):
         self, num_tokens: int, tracker: dict[ComponentType, int]
     ) -> None:
         """🗑️ SWA Host 层驱逐 —— 遍历 Host LRU, 叶子全删, 内部 tombstone + 级联。
-
         🔗 HostPoolGroup → cache.evict_host() → 遍历 component 调用 (:715)。
 
         ⚙️ 类似 drive_eviction 但操作 Host 层:
             叶子 (evictable_host_leaves): _evict_host_leaf(x, tracker) 原子驱逐所有组件
             内部节点: _evict_component_and_detach_lru(x, SWA, HOST) + _cascade_evict
-
-            内部节点 device 可能是 tombstone (仅有 host_value), 此时 host_value 被释放。"""
+            内部节点 device 可能是 tombstone (仅有 host_value), 此时 host_value 被释放。
+        """
         # Evict SWA host resources.
         # Internal nodes: private tombstone (free SWA host only).
         # Host leaves: atomic eviction via _evict_host_leaf.
