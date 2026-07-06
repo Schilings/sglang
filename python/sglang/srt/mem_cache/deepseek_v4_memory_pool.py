@@ -114,16 +114,6 @@ class DeepSeekV4SingleKVPool(KVCache):
     ║    └─ DeepSeekV4TokenToKVPool.get_swa_key_buffer(:857) / get_extra_key_buffer(:876)     ║
     ║       └─ DeepSeekV4SingleKVPool.get_key_buffer  ← 当前类📖                              ║
     ╚══════════════════════════════════════════════════════════════════════════════════╝
-
-    ⚠️ 注意（仅注释，未改代码）：
-      1. get_key_buffer 的 fp8 分支用 [layer_id - start_layer]，而 set_key_buffer /
-         set_key_buffer_fused / 以及 get_key_buffer 的非 fp8 分支都用裸 [layer_id]。
-         实际不冲突：DeepSeekV4TokenToKVPool 创建本类时不传 start_layer(默认 0)，且调用前
-         已用 _swa_local_layer_id / layer_mapping 换成本地层号，故 start_layer 恒为 0。
-      2. set_kv_buffer / get_value_buffer / get_kv_buffer 显式 NotImplementedError：
-         DSV4 走 MLA latent 路径，V 折叠进 K（无独立 V buffer），统一用 get_key_buffer。
-      3. bytes_per_token 固定 584(nope=448/rope=128/scale=7/pad=1)，create_buffer 中有
-         assert 锁死该布局；若改 head_dim / block_size 需同步更新 assert 与布局说明。
     """
 
     def __init__(
